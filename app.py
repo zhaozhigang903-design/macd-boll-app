@@ -3284,18 +3284,128 @@ def recent_analyses(limit=12):
     conn.close()
     return df
 
+def _research_month_end_trade_dates(years):
+    end=pd.Timestamp.today().normalize()
+    start=(end-pd.DateOffset(years=int(years))-pd.DateOffset(months=1)).normalize()
+    rs=bs.query_trade_dates(
+        start_date=start.strftime("%Y-%m-%d"),
+        end_date=end.strftime("%Y-%m-%d")
+    )
+    df=_rs_to_df(rs)
+    if df.empty:
+        return [end.strftime("%Y-%m-%d")]
+    df=df[df["is_trading_day"].astype(str)=="1"].copy()
+    df["calendar_date"]=pd.to_datetime(df["calendar_date"],errors="coerce")
+    df=df.dropna(subset=["calendar_date"])
+    dates=(
+        df.groupby(df["calendar_date"].dt.to_period("M"))["calendar_date"]
+          .max().sort_values().tolist()
+    )
+    return [pd.Timestamp(x).strftime("%Y-%m-%d") for x in dates]
+
+def _fetch_universe_at_date(kind,day):
+    if kind=="港股主板":
+        hk=hk_universe_snapshot()
+        return hk[["code","code_name"]].drop_duplicates("code").reset_index(drop=True)
+
+    if kind=="沪深300":
+        rs=bs.query_hs300_stocks(date=day)
+        df=_rs_to_df(rs)
+    elif kind=="中证500":
+        rs=bs.query_zz500_stocks(date=day)
+        df=_rs_to_df(rs)
+    elif kind=="上证50":
+        rs=bs.query_sz50_stocks(date=day)
+        df=_rs_to_df(rs)
+    else:
+        rs=bs.query_all_stock(day=day)
+        df=_rs_to_df(rs)
+        if not df.empty:
+            code_col="code" if "code" in df.columns else df.columns[0]
+            df=df[df[code_col].astype(str).str.match(r"^(sh\.6|sz\.[03])")]
+
+    if df.empty:
+        return pd.DataFrame(columns=["code","code_name"])
+    code_col="code" if "code" in df.columns else df.columns[0]
+    name_col="code_name" if "code_name" in df.columns else ("codeName" if "codeName" in df.columns else None)
+    out=pd.DataFrame({"code":df[code_col].astype(str)})
+    out["code_name"]=df[name_col].astype(str) if name_col else out["code"]
+    out=out[~out["code_name"].astype(str).str.upper().str.contains(r"(^ST|\*ST)",regex=True,na=False)]
+    return out.drop_duplicates("code").reset_index(drop=True)
+
+def _build_historical_membership(universe,years):
+    market="港股" if universe=="港股主板" else "A股"
+    end=pd.Timestamp.today().normalize()
+
+    if market=="港股":
+        # 公开免费数据源目前没有稳定的港股历史主板成分快照。
+        pool=_fetch_universe_at_date(universe,end.strftime("%Y-%m-%d"))
+        start=(end-pd.DateOffset(years=int(years))).normalize()
+        rows=[
+            {
+                "period_start":start.strftime("%Y-%m-%d"),
+                "period_end":end.strftime("%Y-%m-%d"),
+                "code":str(r["code"]),"name":str(r["code_name"]),"market":"港股"
+            }
+            for _,r in pool.iterrows()
+        ]
+        return pd.DataFrame(rows),pool,"current_only"
+
+    snap_dates=_research_month_end_trade_dates(years)
+    if len(snap_dates)<2:
+        pool=_fetch_universe_at_date(universe,end.strftime("%Y-%m-%d"))
+        start=(end-pd.DateOffset(years=int(years))).normalize()
+        rows=[
+            {
+                "period_start":start.strftime("%Y-%m-%d"),
+                "period_end":end.strftime("%Y-%m-%d"),
+                "code":str(r["code"]),"name":str(r["code_name"]),"market":"A股"
+            }
+            for _,r in pool.iterrows()
+        ]
+        return pd.DataFrame(rows),pool,"fallback_current"
+
+    membership=[]
+    union={}
+    for idx,snap in enumerate(snap_dates):
+        pool=_fetch_universe_at_date(universe,snap)
+        if pool.empty:
+            continue
+        snap_ts=pd.Timestamp(snap)
+        period_start=(snap_ts+pd.Timedelta(days=1)).normalize()
+        next_snap=pd.Timestamp(snap_dates[idx+1]) if idx+1<len(snap_dates) else end
+        period_end=next_snap.normalize()
+        for _,r in pool.iterrows():
+            code=str(r["code"]); name=str(r["code_name"])
+            union[code]=name
+            membership.append({
+                "period_start":period_start.strftime("%Y-%m-%d"),
+                "period_end":period_end.strftime("%Y-%m-%d"),
+                "code":code,"name":name,"market":"A股"
+            })
+
+    mem=pd.DataFrame(membership)
+    union_df=pd.DataFrame(
+        [{"code":code,"code_name":name} for code,name in union.items()]
+    ).drop_duplicates("code")
+    return mem,union_df,"historical_monthly"
+
 def create_research_run(universe,years):
-    pool=fetch_universe(universe).copy()
-    if universe!="港股主板" and not pool.empty:
-        pool=pool[~pool["code_name"].astype(str).str.upper().str.contains(r"(^ST|\\*ST)",regex=True,na=False)]
-    pool=pool.drop_duplicates("code").reset_index(drop=True)
-    if pool.empty:
+    membership,pool,membership_mode=_build_historical_membership(universe,years)
+    if pool is None or pool.empty:
         raise RuntimeError("研究股票池为空，无法创建任务。")
 
+    pool=pool.drop_duplicates("code").reset_index(drop=True)
     run_id=datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((universe,int(years),RULE_VERSION)))%10000).zfill(4)
     market="港股" if universe=="港股主板" else "A股"
     benchmark_name="恒生指数" if market=="港股" else "沪深300"
     now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    note=(
+        "历史股票池：按月使用BaoStock历史成分/历史在市股票，显著降低幸存者偏差。"
+        if membership_mode=="historical_monthly"
+        else "港股免费数据源暂使用当前主板股票池回溯，仍存在幸存者偏差。"
+    )
+
     conn=sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO research_runs(
@@ -3303,8 +3413,7 @@ def create_research_run(universe,years):
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (
             run_id,now,now,universe,int(years),"running",0,len(pool),
-            RULE_VERSION,benchmark_name,
-            "股票池在任务创建时冻结；指数/全市场股票池为当前可取得成分，存在幸存者偏差。"
+            RULE_VERSION,benchmark_name,note
         )
     )
     members=[
@@ -3315,6 +3424,19 @@ def create_research_run(universe,years):
         """INSERT INTO research_members(run_id,seq,code,name,market)
            VALUES(?,?,?,?,?)""",members
     )
+    if membership is not None and not membership.empty:
+        mrows=[
+            (
+                run_id,str(r["period_start"]),str(r["period_end"]),
+                str(r["code"]),str(r["name"]),str(r["market"])
+            )
+            for _,r in membership.iterrows()
+        ]
+        conn.executemany(
+            """INSERT OR REPLACE INTO research_membership(
+               run_id,period_start,period_end,code,name,market
+            ) VALUES(?,?,?,?,?,?)""",mrows
+        )
     conn.commit(); conn.close()
     return run_id,len(pool)
 
