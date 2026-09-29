@@ -4825,9 +4825,49 @@ def history(limit=300):
 
 init_db()
 
+def sync_shared_light_safe(force=False):
+    if not shared_db_enabled():
+        return {"enabled":False,"pushed":0,"pulled":0,"errors":[]}
+    now_ts=time.time()
+    last=float(st.session_state.get("_shared_sync_ts",0) or 0)
+    if not force and now_ts-last<60:
+        return st.session_state.get("_shared_sync_result",{"enabled":True,"pushed":0,"pulled":0,"errors":[]})
+    try:
+        result=shared_sync_light(DB_PATH)
+        st.session_state["_shared_sync_ts"]=now_ts
+        st.session_state["_shared_sync_result"]=result
+        return result
+    except Exception as e:
+        result={"enabled":True,"pushed":0,"pulled":0,"errors":[str(e)]}
+        st.session_state["_shared_sync_result"]=result
+        return result
+
+def sync_shared_research_safe(run_id,mode="both"):
+    if not shared_db_enabled() or not run_id:
+        return {"enabled":False,"pushed":0,"pulled":0,"errors":[]}
+    try:
+        return shared_sync_research_run(DB_PATH,run_id,mode=mode)
+    except Exception as e:
+        return {"enabled":True,"pushed":0,"pulled":0,"errors":[str(e)]}
+
+def sync_shared_experiment_safe(experiment_id,research_run_id=None,mode="both"):
+    if not shared_db_enabled() or not experiment_id:
+        return {"enabled":False,"pushed":0,"pulled":0,"errors":[]}
+    try:
+        return shared_sync_experiment(
+            DB_PATH,experiment_id,research_run_id=research_run_id,mode=mode
+        )
+    except Exception as e:
+        return {"enabled":True,"pushed":0,"pulled":0,"errors":[str(e)]}
+
+# 轻量共享状态自动双向同步；行情K线/EV缓存始终留在每台机器本地。
+_shared_boot=sync_shared_light_safe(force=False)
+
 st.markdown("<div style='height:.15rem'></div>", unsafe_allow_html=True)
 st.title("📈 日线 × 周线 中长线决策引擎")
-st.caption("数据驱动版 · 机会发现 → 买点评估 → 持仓管理 → 回测验证。")
+_runtime_label="Windows计算端" if RUNTIME_MODE=="windows" else ("云端访问端" if RUNTIME_MODE=="cloud" else "本地运行")
+_shared_label="共享数据已连接" if shared_db_enabled() else "本地数据模式"
+st.caption(f"数据驱动版 · {_runtime_label} · {_shared_label} · 机会发现 → 买点评估 → 持仓管理 → 回测验证。")
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 分析", "🔎 选股", "💼 持仓", "🧪 回测", "📚 历史", "🧠 方法", "⚙️ 设置", "🧬 研究"])
 
