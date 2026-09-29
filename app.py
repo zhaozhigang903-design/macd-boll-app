@@ -645,13 +645,13 @@ def render_cockpit(report):
       <div class="cockpit-state">{signal_color(score)} {_safe(report.get("rating"))} · {_safe(report.get("stage"))}</div>
       <div class="cockpit-stage">{_safe(compare_text) if compare_text else "当前结构"}</div>
     </div>
-    <div class="cockpit-score"><b>{score:.0f}</b><span>技术分</span></div>
+    <div class="cockpit-score"><b>{score:.0f}</b><span>技术分 /100</span></div>
   </div>
   <div class="kpi-grid">
-    <div class="kpi kpi-trend"><b>{report.get("trend",0):.0f}</b><span>趋势</span></div>
-    <div class="kpi kpi-momentum"><b>{report.get("momentum",0):.0f}</b><span>动能</span></div>
-    <div class="kpi kpi-weekly"><b>{weekly_txt}</b><span>周线</span></div>
-    <div class="kpi kpi-volume"><b>{report.get("confirm",0):.0f}</b><span>量能</span></div>
+    <div class="kpi kpi-trend"><b>{report.get("trend",0):.0f}/100</b><span>趋势分</span></div>
+    <div class="kpi kpi-momentum"><b>{report.get("momentum",0):.0f}/100</b><span>动能分</span></div>
+    <div class="kpi kpi-weekly"><b>{weekly_txt}{"" if weekly_txt=="—" else "/100"}</b><span>周线分</span></div>
+    <div class="kpi kpi-volume"><b>{report.get("confirm",0):.0f}/100</b><span>量能分</span></div>
   </div>
   <div class="cockpit-note">{_safe(essence)}</div>
   <div class="level-grid">
@@ -695,6 +695,10 @@ def render_cockpit(report):
         if report.get("resonance"):
             st.caption("共振：" + report.get("resonance",""))
 
+    if weekly is None:
+        st.caption("总技术分 = 趋势50% + 动能35% + 量能15%；各分项满分100。")
+    else:
+        st.caption("总技术分 = 趋势38% + 动能30% + 周线22% + 量能10%；各分项满分100。")
     st.caption(f"置信度 {report.get('confidence',0)}% · 同一组截图复用同一识别结果；技术分不是上涨概率。")
 
 
@@ -858,8 +862,8 @@ def screen_codes(pro, codes, name_map):
             if score >= 62 and (weekly is None or weekly >= 50):
                 rows.append({
                     "代码":code, "名称":name_map.get(code,code),
-                    "总分":score, "趋势":trend, "动能":momentum,
-                    "周线":weekly, "量能":confirm,
+                    "技术分/100":score, "趋势/100":trend, "动能/100":momentum,
+                    "周线/100":weekly, "量能/100":confirm,
                     "收盘":round(float(lr["close"]),2),
                     "中轨":round(float(lr["boll_mid"]),2) if pd.notna(lr["boll_mid"]) else np.nan
                 })
@@ -867,7 +871,7 @@ def screen_codes(pro, codes, name_map):
             continue
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["总分","周线"], ascending=False).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["技术分/100","周线/100"], ascending=False).reset_index(drop=True)
 
 def run_backtest(df, entry_score=78, exit_score=48, fee_bps=8):
     d = add_indicators(df)
@@ -966,12 +970,16 @@ with tab6:
 with tab5:
     st.subheader("这套系统怎么做决策")
     st.markdown("""
-**核心框架：四层证据，而不是指标堆砌。**
+**核心框架：四层证据，而不是指标堆砌。每一项都是100分制。**
 
-1. **趋势层（40%左右）**：BOLL中轨方向、价格相对中轨、带宽状态。  
-2. **动能层（30%左右）**：MACD零轴、DIF方向、金叉/死叉、柱体加减速。  
-3. **周期层（约20%）**：周线确认日线。中长线若没有周线确认，强信号会被降级。  
-4. **确认层（约10%）**：成交量与背离，只做加减分，不抢主导权。成交量固定读取 **VOL柱 + MA5 + MA10**，不要求MA20。  
+1. **趋势分（满分100）**：BOLL中轨方向、价格相对中轨、带宽状态。  
+2. **动能分（满分100）**：MACD零轴、DIF方向、金叉/死叉、柱体加减速。  
+3. **周线分（满分100）**：周线确认日线；没有周线时不显示该项。  
+4. **量能分（满分100）**：成交量与背离，只做确认，不抢主导权。成交量读取 **VOL柱 + MA5 + MA10**。  
+
+**总技术分也是100分制：**
+- 有周线：趋势38% + 动能30% + 周线22% + 量能10%
+- 无周线：趋势50% + 动能35% + 量能15%  
 
 **关键原则**
 - 零轴下金叉 = 先看修复，不把反弹当反转。
