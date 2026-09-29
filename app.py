@@ -14,7 +14,8 @@ from openai import OpenAI
 from engine import (
     ACTION_CN, backtest, confidence_score, decision, evidence_rows,
     normalize_tf, rating, risk_position_reference, score_breakdown,
-    stage, technical_score, transition_conditions, validate_extraction
+    stage, technical_score, transition_conditions, validate_extraction,
+    extraction_consensus
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -396,13 +397,16 @@ with tab_decision:
 
         client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
 
-        def call_ds(tokens, retry=False):
+        def call_ds(tokens, retry=False, verify=False):
             msg = content.copy()
             if retry:
                 msg.append({"type":"text","text":"上一次JSON可能不完整。重新输出更短、更完整的合法JSON，确保括号全部闭合。"})
+            if verify:
+                msg.append({"type":"text","text":"这是独立第二次复核。请重新读取图片，重点核对BOLL中轨方向、价格相对中轨、MACD零轴、DIF方向、柱体和金叉死叉；不要参考任何第一次结果。"})
             return client.chat.completions.create(
                 model="deepseek-flash",
                 reasoning_effort="low",
+                temperature=0,
                 max_tokens=tokens,
                 response_format={"type":"json_object"},
                 messages=[
@@ -433,10 +437,49 @@ with tab_decision:
         if not weekly_img:
             weekly["visible"] = False
 
+        prelim_score, _, _ = technical_score(daily, weekly)
+        prelim_conf = confidence_score(daily, weekly)
+        prelim_issues, _ = validate_extraction(daily, weekly)
+
+        consistency_ratio = None
+        consistency_disagreements = []
+        verify_needed = (
+            mode == "精细模式" or
+            prelim_score >= 72 or
+            prelim_conf < 70 or
+            bool(prelim_issues)
+        )
+
+        if verify_needed:
+            try:
+                resp2 = call_ds(max_tokens, verify=True)
+                data2 = parse_json(resp2.choices[0].message.content or "")
+                if data2:
+                    data, consistency_ratio, consistency_disagreements = extraction_consensus(data, data2)
+            except Exception:
+                consistency_ratio = None
+
+        daily = normalize_tf(data.get("daily"), True)
+        weekly = normalize_tf(data.get("weekly"), False)
+        if not weekly_img:
+            weekly["visible"] = False
+
         score, dscore, wscore = technical_score(daily, weekly)
         conf = confidence_score(daily, weekly)
         extraction_issues, extraction_penalty = validate_extraction(daily, weekly)
         conf = max(0, conf - extraction_penalty)
+
+        if consistency_ratio is not None:
+            if consistency_ratio < 0.70:
+                conf = max(0, conf - 20)
+            elif consistency_ratio < 0.85:
+                conf = max(0, conf - 10)
+            if consistency_disagreements:
+                extraction_issues += ["双读存在分歧：" + x for x in consistency_disagreements[:3]]
+        elif verify_needed:
+            conf = max(0, conf - 8)
+            extraction_issues.append("双读复核未成功完成，置信度已下调")
+
         if data.get("global",{}).get("is_intraday_unclosed"):
             conf = max(0, conf - 10)
         rtg = rating(score)
@@ -467,6 +510,8 @@ with tab_decision:
         b.metric("评级",rtg)
         c.metric("行动",ACTION_CN.get(action,action))
         d.metric("证据置信度",f"{conf}%")
+        if consistency_ratio is not None:
+            st.caption(f"双读一致性：{consistency_ratio:.0%}（关键/低置信度场景自动复核）")
 
         st.markdown(f"<div class='decision-card'><b>阶段：</b>{stg}<br><b>核心结论：</b>{'；'.join(reasons)}</div>", unsafe_allow_html=True)
 
@@ -591,7 +636,8 @@ with tab_decision:
                 "confidence":conf,"rating":rtg,"stage":stg,"action":action,
                 "reasons":reasons,"compare":compare_text,"position_reference":pos_ref,
                 "upgrade_conditions":upgrades,"downgrade_conditions":downgrades,
-                "extraction_issues":extraction_issues
+                "extraction_issues":extraction_issues,
+                "double_read_consistency":consistency_ratio
             }
         }
         save_record(symbol.strip(), market, score, rtg, action, stg, dscore, wscore, conf, decision_text, payload)
