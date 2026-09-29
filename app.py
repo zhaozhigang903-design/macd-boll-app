@@ -364,6 +364,49 @@ def init_db():
       updated_at TEXT
     )
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS positions(
+      code TEXT PRIMARY KEY,
+      name TEXT,
+      entry_date TEXT NOT NULL,
+      entry_price REAL NOT NULL,
+      shares REAL NOT NULL DEFAULT 0,
+      initial_stop REAL,
+      entry_score REAL,
+      peak_score REAL,
+      last_score REAL,
+      last_price REAL,
+      last_market_score REAL,
+      last_action TEXT,
+      note TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS position_snapshots(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL,
+      snapshot_date TEXT NOT NULL,
+      price REAL,
+      technical_score REAL,
+      trend_score REAL,
+      momentum_score REAL,
+      weekly_score REAL,
+      confirm_score REAL,
+      market_score REAL,
+      pnl_pct REAL,
+      action TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(code, snapshot_date)
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_position_snapshots_code_date
+    ON position_snapshots(code, snapshot_date)
+    """)
     conn.commit()
     conn.close()
 
@@ -1743,6 +1786,234 @@ def run_backtest(
     }
     return m, metrics
 
+def position_action(
+    current_score, entry_score, peak_score, weekly_score,
+    market_score, close, initial_stop=None
+):
+    current_score = float(current_score or 0)
+    entry_score = float(entry_score) if entry_score is not None and pd.notna(entry_score) else current_score
+    peak_score = float(peak_score) if peak_score is not None and pd.notna(peak_score) else max(entry_score,current_score)
+    weekly_score = float(weekly_score) if weekly_score is not None and pd.notna(weekly_score) else 50.0
+    market_score = float(market_score) if market_score is not None and pd.notna(market_score) else 50.0
+
+    drop_from_peak = peak_score-current_score
+    drop_from_entry = entry_score-current_score
+
+    if initial_stop is not None and pd.notna(initial_stop) and float(initial_stop) > 0 and close <= float(initial_stop):
+        return "退出候选", "已跌破录入的技术失效价"
+
+    if current_score < 45:
+        return "退出候选", "技术分低于45，趋势与动能已明显弱化"
+
+    if current_score < 55:
+        action, reason = "减仓候选", "技术分进入45–54防守区"
+    elif current_score < 65:
+        action, reason = "谨慎持有", "技术分处于55–64观察区"
+    elif current_score < 78:
+        action, reason = "持有", "技术分处于65–77健康区"
+    else:
+        action, reason = "强势持有", "技术分≥78，结构仍处强势区"
+
+    # 分数从高点快速回落，比绝对分更早反映趋势退化
+    if drop_from_peak >= 15 or drop_from_entry >= 12:
+        if action == "强势持有":
+            action = "持有"
+        elif action == "持有":
+            action = "谨慎持有"
+        elif action == "谨慎持有":
+            action = "减仓候选"
+        reason += f"；技术分较峰值回落{drop_from_peak:.0f}分"
+
+    # 周线弱化与大盘逆风只做一级降档，不机械一票否决
+    if weekly_score < 45:
+        if action == "强势持有":
+            action = "持有"
+        elif action == "持有":
+            action = "谨慎持有"
+        elif action == "谨慎持有":
+            action = "减仓候选"
+        reason += "；周线已转弱"
+
+    if market_score < 35 and current_score < 68:
+        if action == "持有":
+            action = "谨慎持有"
+        elif action == "谨慎持有":
+            action = "减仓候选"
+        reason += "；大盘处于逆风区"
+
+    return action, reason
+
+def upsert_position(code, name, entry_date, entry_price, shares, initial_stop=None, note=""):
+    code = normalize_code(code)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    old = conn.execute(
+        "SELECT entry_score,peak_score,last_score,last_price,last_market_score,last_action,created_at FROM positions WHERE code=?",
+        (code,)
+    ).fetchone()
+    created_at = old[6] if old else now
+    conn.execute("""
+        INSERT INTO positions(
+          code,name,entry_date,entry_price,shares,initial_stop,
+          entry_score,peak_score,last_score,last_price,last_market_score,last_action,
+          note,active,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(code) DO UPDATE SET
+          name=excluded.name,
+          entry_date=excluded.entry_date,
+          entry_price=excluded.entry_price,
+          shares=excluded.shares,
+          initial_stop=excluded.initial_stop,
+          note=excluded.note,
+          active=1,
+          updated_at=excluded.updated_at
+    """,(
+        code,name,entry_date,float(entry_price),float(shares),
+        (float(initial_stop) if initial_stop is not None and initial_stop>0 else None),
+        (old[0] if old else None),(old[1] if old else None),(old[2] if old else None),
+        (old[3] if old else None),(old[4] if old else None),(old[5] if old else None),
+        note,1,created_at,now
+    ))
+    conn.commit()
+    conn.close()
+
+def close_position(code):
+    code = normalize_code(code)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE positions SET active=0,updated_at=? WHERE code=?",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),code)
+    )
+    conn.commit()
+    conn.close()
+
+def load_positions(active_only=True):
+    conn = sqlite3.connect(DB_PATH)
+    q = "SELECT * FROM positions"
+    if active_only:
+        q += " WHERE active=1"
+    q += " ORDER BY updated_at DESC"
+    df = pd.read_sql_query(q,conn)
+    conn.close()
+    return df
+
+def position_history(code, limit=120):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """SELECT snapshot_date,price,technical_score,trend_score,momentum_score,
+                  weekly_score,confirm_score,market_score,pnl_pct,action,reason
+           FROM position_snapshots
+           WHERE code=? ORDER BY snapshot_date DESC LIMIT ?""",
+        conn,params=(normalize_code(code),limit)
+    )
+    conn.close()
+    return df
+
+def refresh_positions():
+    pos = load_positions(True)
+    if pos.empty:
+        return pd.DataFrame()
+
+    benchmark_df = fetch_benchmark_daily(years=3)
+    mkt_score,mkt_regime = market_environment(benchmark_df)
+    rows = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for _,p in pos.iterrows():
+        code = p["code"]
+        try:
+            df = fetch_stock_daily(code,years=3)
+            if df.empty:
+                continue
+            name = p["name"] or stock_basic_name(code)
+            report = deterministic_report(
+                code,name,df,"中等25–50%",True,benchmark_df
+            )
+            current = float(report["score"])
+            current_price = float(report["latest_close"])
+            entry_score = p["entry_score"]
+            if entry_score is None or pd.isna(entry_score):
+                entry_score = current
+            peak_score = p["peak_score"]
+            if peak_score is None or pd.isna(peak_score):
+                peak_score = max(float(entry_score),current)
+            peak_score = max(float(peak_score),current)
+
+            pnl_pct = (
+                current_price/float(p["entry_price"])-1
+                if float(p["entry_price"])>0 else np.nan
+            )
+            action,reason = position_action(
+                current,float(entry_score),peak_score,
+                report.get("weekly_score"),mkt_score,current_price,p.get("initial_stop")
+            )
+
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("""
+                UPDATE positions SET
+                  name=?,entry_score=?,peak_score=?,last_score=?,last_price=?,
+                  last_market_score=?,last_action=?,updated_at=?
+                WHERE code=?
+            """,(name,float(entry_score),float(peak_score),current,current_price,
+                 float(mkt_score),action,now,code))
+            conn.execute("""
+                INSERT INTO position_snapshots(
+                  code,snapshot_date,price,technical_score,trend_score,momentum_score,
+                  weekly_score,confirm_score,market_score,pnl_pct,action,reason,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(code,snapshot_date) DO UPDATE SET
+                  price=excluded.price,
+                  technical_score=excluded.technical_score,
+                  trend_score=excluded.trend_score,
+                  momentum_score=excluded.momentum_score,
+                  weekly_score=excluded.weekly_score,
+                  confirm_score=excluded.confirm_score,
+                  market_score=excluded.market_score,
+                  pnl_pct=excluded.pnl_pct,
+                  action=excluded.action,
+                  reason=excluded.reason,
+                  created_at=excluded.created_at
+            """,(
+                code,report["latest_date"],current_price,current,
+                report.get("trend"),report.get("momentum"),report.get("weekly_score"),
+                report.get("confirm"),float(mkt_score),
+                (float(pnl_pct) if pd.notna(pnl_pct) else None),
+                action,reason,now
+            ))
+            conn.commit()
+            conn.close()
+
+            rows.append({
+                "代码":display_code(code),
+                "名称":name,
+                "管理状态":action,
+                "技术分/100":current,
+                "入场技术分":round(float(entry_score),1),
+                "峰值技术分":round(float(peak_score),1),
+                "较峰值":round(current-float(peak_score),1),
+                "周线/100":report.get("weekly_score"),
+                "大盘":f"{mkt_regime} {mkt_score}/100",
+                "成本":round(float(p["entry_price"]),2),
+                "现价":round(current_price,2),
+                "收益率":pnl_pct,
+                "持股":float(p["shares"]),
+                "市值":round(current_price*float(p["shares"]),2),
+                "失效价":p.get("initial_stop"),
+                "原因":reason
+            })
+        except Exception as e:
+            rows.append({
+                "代码":display_code(code),"名称":p["name"] or display_code(code),
+                "管理状态":"数据异常","原因":str(e)
+            })
+
+    if not rows:
+        return pd.DataFrame()
+    order = {"退出候选":0,"减仓候选":1,"谨慎持有":2,"持有":3,"强势持有":4,"数据异常":5}
+    out = pd.DataFrame(rows)
+    out["_ord"] = out["管理状态"].map(order).fillna(9)
+    return out.sort_values(["_ord","技术分/100"],ascending=[True,True],na_position="last").drop(columns="_ord").reset_index(drop=True)
+
 def history(limit=300):
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM analyses ORDER BY id DESC LIMIT ?", conn, params=(limit,))
@@ -1753,11 +2024,11 @@ init_db()
 
 st.markdown("<div style='height:.15rem'></div>", unsafe_allow_html=True)
 st.title("📈 日线 × 周线 中长线决策引擎")
-st.caption("数据驱动版 · 自动获取日K → 聚合周K → 统一计算BOLL/MACD/VOL → 规则评分。")
+st.caption("数据驱动版 · 机会发现 → 买点评估 → 持仓管理 → 回测验证。")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 分析", "🔎 选股", "🧪 回测", "📚 历史", "🧠 方法", "⚙️ 设置"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 分析", "🔎 选股", "💼 持仓", "🧪 回测", "📚 历史", "🧠 方法", "⚙️ 设置"])
 
-with tab6:
+with tab7:
     st.subheader("数据设置")
     st.success("A股行情使用 BaoStock，无需 Token 或会员。")
     st.info("统一使用前复权日线数据；周线由同一套日线聚合，分析、选股、回测使用相同数据口径和相同公式。")
@@ -1777,7 +2048,7 @@ with tab6:
     st.warning("当前缓存位于Render本机SQLite：日常重复扫描会明显加速，但服务重新部署/重建实例时可能被清空。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
 
-with tab5:
+with tab6:
     st.subheader("这套系统怎么做决策")
     st.markdown("""
 **核心框架：四层证据，而不是指标堆砌。每一项都是100分制。**
@@ -1802,6 +2073,7 @@ with tab5:
 - **相对强度**：比较个股与沪深300的20/60日表现，避免只买“随大盘被动上涨”的股票。
 - **历史统计**：同时看20/40/60日胜率、平均收益和样本量；样本不足时自动降低权重。
 - **回测**：采用下一交易日开盘执行，并且不把“未来才知道的历史胜率”用于过去信号，避免明显未来函数。
+- **持仓管理**：买入后“买点分”的意义下降，核心转为技术分及其变化。≥78强势持有、65–77持有、55–64谨慎持有、45–54减仓候选、<45退出候选；技术分较峰值快速回落、周线转弱或大盘逆风会降档。
 
 **关键原则**
 - 零轴下金叉 = 先看修复，不把反弹当反转。
@@ -2006,6 +2278,133 @@ with tab2:
             st.caption("机会分综合：技术25% + 买点25% + 盈亏比15% + 历史相似信号20% + 大盘10% + 相对强度5%。历史统计覆盖20/40/60日；样本少时会自动降低其影响。")
 
 with tab3:
+    st.subheader("持仓管理")
+    st.caption("买入后不再用“买点分”决定去留，核心改为跟踪技术分、技术分变化、周线和大盘环境。")
+
+    st.markdown("**管理分区**：≥78 强势持有｜65–77 持有｜55–64 谨慎持有｜45–54 减仓候选｜<45 退出候选。技术分从峰值快速回落、周线转弱或大盘逆风会进一步降档。")
+
+    with st.expander("➕ 新增 / 更新持仓", expanded=False):
+        candidates = st.session_state.get("scan_results")
+        candidate_opts = ["手动输入"]
+        candidate_map = {}
+        if isinstance(candidates,pd.DataFrame) and not candidates.empty and "代码" in candidates.columns:
+            for _,r in candidates.head(100).iterrows():
+                label = f"{r.get('代码','')} · {r.get('名称','')}"
+                candidate_opts.append(label)
+                candidate_map[label] = str(r.get("代码",""))
+
+        source_pick = st.selectbox("来源",candidate_opts,key="pos_source")
+        default_code = candidate_map.get(source_pick,"")
+        p1,p2,p3 = st.columns(3)
+        with p1:
+            pos_code = st.text_input("股票代码",value=default_code,placeholder="例如 600519",key="pos_code")
+        with p2:
+            pos_price = st.number_input("买入均价",min_value=0.0,value=0.0,step=0.01,key="pos_price")
+        with p3:
+            pos_shares = st.number_input("持股数量",min_value=0.0,value=0.0,step=100.0,key="pos_shares")
+
+        p4,p5 = st.columns(2)
+        with p4:
+            pos_date = st.date_input("买入日期",value=pd.Timestamp.today().date(),key="pos_date")
+        with p5:
+            pos_stop = st.number_input("技术失效价（可选）",min_value=0.0,value=0.0,step=0.01,key="pos_stop")
+        pos_note = st.text_input("备注（可选）",placeholder="例如：首仓/加仓后均价",key="pos_note")
+
+        if st.button("💾 保存到持仓",type="primary",use_container_width=True):
+            if not pos_code.strip() or pos_price<=0:
+                st.error("请填写股票代码和买入均价。")
+            else:
+                try:
+                    bs_login()
+                    code = normalize_code(pos_code)
+                    name = stock_basic_name(code)
+                    upsert_position(
+                        code,name,str(pos_date),pos_price,pos_shares,
+                        pos_stop if pos_stop>0 else None,pos_note
+                    )
+                    benchmark_df = fetch_benchmark_daily(years=3)
+                    df0 = fetch_stock_daily(code,years=3)
+                    r0 = deterministic_report(code,name,df0,"中等25–50%",True,benchmark_df)
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute(
+                        "UPDATE positions SET entry_score=?,peak_score=?,last_score=?,last_price=?,last_market_score=?,updated_at=? WHERE code=?",
+                        (r0["score"],r0["score"],r0["score"],r0["latest_close"],r0["market_score"],
+                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),code)
+                    )
+                    conn.commit(); conn.close()
+                    st.success(f"已加入持仓：{name} / {display_code(code)}，入场技术分 {r0['score']:.0f}/100")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存持仓失败：{e}")
+                finally:
+                    try: bs.logout()
+                    except Exception: pass
+
+    h1,h2 = st.columns(2)
+    refresh_holdings = h1.button("🔄 更新全部持仓",type="primary",use_container_width=True)
+    active_pos = load_positions(True)
+    close_opts = ["不操作"]
+    close_map = {}
+    if not active_pos.empty:
+        for _,p in active_pos.iterrows():
+            label = f"{display_code(p['code'])} · {p['name']}"
+            close_opts.append(label)
+            close_map[label] = p["code"]
+    close_pick = h2.selectbox("移出持仓",close_opts,key="close_pos_pick")
+    if close_pick != "不操作":
+        if st.button("确认移出持仓",use_container_width=True):
+            close_position(close_map[close_pick])
+            st.success("已移出持仓。")
+            st.rerun()
+
+    if refresh_holdings:
+        with st.spinner("正在更新全部持仓的最新技术分和管理状态..."):
+            try:
+                bs_login()
+                holding_view = refresh_positions()
+                st.session_state["holding_view"] = holding_view
+            except Exception as e:
+                st.error(f"持仓更新失败：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
+
+    holding_view = st.session_state.get("holding_view")
+    if not isinstance(holding_view,pd.DataFrame):
+        active = load_positions(True)
+        if not active.empty:
+            view_cols = ["code","name","entry_price","shares","entry_score","peak_score","last_score","last_price","last_action"]
+            holding_view = active[[x for x in view_cols if x in active.columns]].copy()
+            holding_view = holding_view.rename(columns={
+                "code":"代码","name":"名称","entry_price":"成本","shares":"持股",
+                "entry_score":"入场技术分","peak_score":"峰值技术分",
+                "last_score":"技术分/100","last_price":"现价","last_action":"管理状态"
+            })
+
+    if isinstance(holding_view,pd.DataFrame) and not holding_view.empty:
+        show = holding_view.copy()
+        if "收益率" in show.columns:
+            show["收益率"] = show["收益率"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+        st.dataframe(show,use_container_width=True,hide_index=True)
+
+        codes_available = []
+        for _,r in load_positions(True).iterrows():
+            codes_available.append((r["code"],f"{display_code(r['code'])} · {r['name']}"))
+        if codes_available:
+            label_to_code = {label:code for code,label in codes_available}
+            selected_hist = st.selectbox("查看持仓技术分历史",[x[1] for x in codes_available],key="pos_hist")
+            ph = position_history(label_to_code[selected_hist])
+            if not ph.empty:
+                chart = ph.sort_values("snapshot_date").set_index("snapshot_date")
+                cols = [x for x in ["technical_score","weekly_score","market_score"] if x in chart.columns]
+                st.line_chart(chart[cols],height=250)
+                st.dataframe(ph.head(30),use_container_width=True,hide_index=True)
+            else:
+                st.caption("刷新持仓后开始累计每日技术分快照。")
+    else:
+        st.info("暂无持仓。选股后实际买入时，把代码、成本和持股数量加入这里。")
+
+with tab4:
     st.subheader("交易机会策略回测")
     st.caption("回测与选股口径对齐：技术分 + 买点分 + 盈亏比 + 大盘环境 + 相对强度。历史相似胜率不参与历史入场，避免未来数据泄漏。信号收盘形成，下一交易日开盘执行。")
     bt_code = st.text_input("A股代码", placeholder="例如 600519", key="bt_code")
@@ -2081,7 +2480,7 @@ with tab3:
                 st.dataframe(curve[cols].tail(80), use_container_width=True, hide_index=True)
         st.warning("回测用于验证历史期望，不保证未来收益。真实交易仍会受到滑点、涨跌停、停牌、成交冲击和参数过拟合影响。")
 
-with tab4:
+with tab5:
     st.subheader("历史记录与信号演化")
     df = history()
     if df.empty:
