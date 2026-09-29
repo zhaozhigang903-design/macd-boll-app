@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import baostock as bs
-from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "analysis_history.db"
@@ -611,7 +610,7 @@ def _safe(v):
 
 def render_cockpit(report):
     if not report:
-        st.info("暂无分析结果。上传日线/周线后生成决策，结果会固定显示在这里。")
+        st.info("暂无分析结果。输入A股代码后生成决策，结果会固定显示在这里。")
         return
 
     score = report.get("score", 0)
@@ -695,11 +694,16 @@ def render_cockpit(report):
         if report.get("resonance"):
             st.caption("共振：" + report.get("resonance",""))
 
+    if report.get("data_source"):
+        st.caption(
+            f"数据源：{report.get('data_source')} · {report.get('adjustment','')} · "
+            f"最新交易日：{report.get('latest_date','—')} · 收盘：{report.get('latest_close','—')}"
+        )
     if weekly is None:
         st.caption("总技术分 = 趋势50% + 动能35% + 量能15%；各分项满分100。")
     else:
         st.caption("总技术分 = 趋势38% + 动能30% + 周线22% + 量能10%；各分项满分100。")
-    st.caption(f"置信度 {report.get('confidence',0)}% · 同一组截图复用同一识别结果；技术分不是上涨概率。")
+    st.caption(f"数据完整度 {report.get('confidence',0)}% · 同一代码使用同一数据源和公式；技术分不是上涨概率。")
 
 
 def _rs_to_df(rs):
@@ -939,6 +943,10 @@ def deterministic_report(code, name, df, position_state, fundamentals_ok):
         "macd_analysis":f"DIF {drow.get('dif',np.nan):.3f}，DEA {drow.get('dea',np.nan):.3f}，{cross}。",
         "weekly_analysis":f"周线技术分 {weekly:.0f}/100。" if weekly is not None else "",
         "resonance":"数据计算模式：全部指标由OHLCV直接计算，不依赖图片识别。",
+        "data_source":"BaoStock",
+        "adjustment":"前复权",
+        "latest_date":di.iloc[-1]["trade_date"].strftime("%Y-%m-%d"),
+        "latest_close":float(di.iloc[-1]["close"]),
         "_df":di
     }
 
@@ -1037,26 +1045,16 @@ init_db()
 
 st.markdown("<div style='height:.15rem'></div>", unsafe_allow_html=True)
 st.title("📈 日线 × 周线 中长线决策引擎")
-st.caption("DeepSeek 国内版 · 先读图 → 再规则评分 → 最后给行动条件。AI负责识别，规则负责决策。")
+st.caption("数据驱动版 · 自动获取日K → 聚合周K → 统一计算BOLL/MACD/VOL → 规则评分。")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📷 分析", "🔎 选股", "🧪 回测", "📚 历史", "🧠 方法", "⚙️ 设置"])
 
 with tab6:
-    st.subheader("接口设置")
-    env_key = os.getenv("DEEPSEEK_API_KEY", "")
-    if env_key:
-        st.success("服务器已配置 DeepSeek 接口密钥，无需重复输入。")
-    else:
-        st.info("服务器尚未配置 Key。可在这里临时输入；仅保存在当前会话。")
-    temp = st.text_input("DeepSeek 接口密钥", type="password", key="temp_key")
-    if temp:
-        st.session_state["api_key"] = temp
-        st.success("本次会话已启用临时 Key。")
-
-    st.markdown("**行情数据接口**")
-    st.success("A股行情已切换为 BaoStock，无需 Token 或会员。")
+    st.subheader("数据设置")
+    st.success("A股行情使用 BaoStock，无需 Token 或会员。")
+    st.info("统一使用前复权日线数据；周线由同一套日线聚合，分析、选股、回测使用相同数据口径和相同公式。")
+    st.caption("BaoStock采用自身复权算法，因此历史价格可能与同花顺/通达信存在细微差异；App内部始终保持同一数据源和同一复权口径。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
-    st.info("中长线工具的核心不是预测下一根K线，而是：只在趋势、动能、周期一致时提高风险暴露，在结构破坏时降低风险。")
 
 with tab5:
     st.subheader("这套系统怎么做决策")
@@ -1076,8 +1074,6 @@ with tab5:
 - 零轴下金叉 = 先看修复，不把反弹当反转。
 - BOLL中轨向下时，买入类信号天然降级。
 - 日线强、周线弱 = 先观察，不把局部反弹当中长线主升。
-- 盘中截图自动降置信度。
-- 图片不清晰时不给强结论。
 - 技术面只负责“什么时候风险收益更好”，不替代基本面和估值判断。
 """)
     st.warning("评分是“技术证据质量分”，不是上涨概率，也不是收益率预测。真正的收益来自正期望：胜率 × 盈亏比 × 仓位纪律 × 足够样本。")
@@ -1142,291 +1138,7 @@ with tab1:
                     except Exception: pass
 
     st.divider()
-    st.caption("备用：截图主要用于识别标的和辅助复核。A股若能识别出6位代码，评分将自动切换到与“代码分析”完全相同的行情数据算法。")
-    st.subheader("② 上传图表")
-    st.caption("模板：BOLL(20,2) + MACD(12,26,9) + VOL/MA5/MA10。")
-    nonce = st.session_state.get("upload_nonce", 0)
-    c1, c2 = st.columns(2)
-    with c1:
-        daily_upload = st.file_uploader(
-            "日线（必填）",
-            type=["png","jpg","jpeg","webp"],
-            key=f"daily_{nonce}"
-        )
-        if daily_upload is not None:
-            st.session_state["daily_bytes"] = daily_upload.getvalue()
-            st.session_state["daily_mime"] = getattr(daily_upload, "type", None) or "image/png"
-            st.session_state["daily_name"] = getattr(daily_upload, "name", "日线截图")
-        if st.session_state.get("daily_bytes"):
-            st.success("✅ 日线已载入")
-            with st.expander("查看日线截图"):
-                st.image(st.session_state["daily_bytes"], use_container_width=True)
-    with c2:
-        weekly_upload = st.file_uploader(
-            "周线（推荐）",
-            type=["png","jpg","jpeg","webp"],
-            key=f"weekly_{nonce}"
-        )
-        if weekly_upload is not None:
-            st.session_state["weekly_bytes"] = weekly_upload.getvalue()
-            st.session_state["weekly_mime"] = getattr(weekly_upload, "type", None) or "image/png"
-            st.session_state["weekly_name"] = getattr(weekly_upload, "name", "周线截图")
-        if st.session_state.get("weekly_bytes"):
-            st.success("✅ 周线已载入")
-            with st.expander("查看周线截图"):
-                st.image(st.session_state["weekly_bytes"], use_container_width=True)
-
-    if st.button("🗑️ 清空已上传图片", use_container_width=True):
-        reset_uploads()
-        st.rerun()
-
-    daily_ready = bool(st.session_state.get("daily_bytes"))
-    weekly_ready = bool(st.session_state.get("weekly_bytes"))
-
-    st.subheader("② 决策上下文")
-    symbol = st.text_input("股票/ETF名称或代码（可留空自动识别）", placeholder="留空时从截图顶部自动识别")
-    c3, c4 = st.columns(2)
-    with c3:
-        market = st.selectbox("市场", ["自动判断","A股","港股","美股","ETF/其他"])
-        horizon = st.selectbox("持有周期", ["2–8周", "2–6个月", "6–18个月"], index=1)
-    with c4:
-        position_state = st.selectbox("当前仓位", ["未持有","轻仓≤25%","中等25–50%","重仓>50%"])
-        cost = st.text_input("持仓成本（可选）", placeholder="例如：435")
-
-    fundamentals_ok = st.checkbox("基本面与估值已独立验证通过（中长线强烈建议）", value=False)
-    notes = st.text_area("补充说明（可选）", placeholder="例如：盘中截图；准备持有3个月；只考虑回调加仓……", height=80)
-
-    st.subheader("③ 分析模式")
-    mode = "稳定模式"
-    st.info("稳定模式：始终按原图读取，并复用同一截图的已识别结果，避免重复分析时评分漂移。")
-
-    if st.button("🚀 生成中长线决策", type="primary", use_container_width=True):
-        key = os.getenv("DEEPSEEK_API_KEY","") or st.session_state.get("api_key","")
-        if not daily_ready:
-            st.error("请先上传日线截图。")
-            st.stop()
-        if not key:
-            st.error("请先在“设置”配置 DeepSeek 接口密钥。")
-            st.stop()
-
-        prev = previous(symbol.strip())
-        prompt_lines = [
-            "请读取上传图表。第一张一定是日线；如果有第二张，则第二张是周线。",
-            f"标的：{symbol.strip() or '未填写'}",
-            f"市场：{market}",
-            f"持有周期：{horizon}",
-            f"当前仓位：{position_state}",
-            f"持仓成本：{cost or '未填写'}",
-            f"补充说明：{notes or '无'}",
-            f"周线截图：{'有' if weekly_ready else '无'}",
-        ]
-        detail = "original"
-        max_tokens = 4200
-
-        content = [{"type":"text","text":"\n".join(prompt_lines)}]
-        content.append({
-            "type":"image_url",
-            "image_url":{
-                "url":data_url_bytes(
-                    st.session_state["daily_bytes"],
-                    st.session_state.get("daily_mime","image/png")
-                ),
-                "detail":detail
-            }
-        })
-        if weekly_ready:
-            content.append({
-                "type":"image_url",
-                "image_url":{
-                    "url":data_url_bytes(
-                        st.session_state["weekly_bytes"],
-                        st.session_state.get("weekly_mime","image/png")
-                    ),
-                    "detail":detail
-                }
-            })
-
-        client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
-
-        def call_ds(budget, retry=False):
-            extra = ""
-            if retry:
-                extra = "\n上次输出不完整。请只返回一个完整、简洁、合法的JSON对象，宁可少写也不要截断。"
-            messages = [
-                {"role":"system","content":EXTRACT_PROMPT},
-                {"role":"user","content":[{"type":"text","text":"\n".join(prompt_lines)+extra}] + content[1:]}
-            ]
-            return client.chat.completions.create(
-                model="deepseek-flash",
-                response_format={"type":"json_object"},
-                temperature=0,
-                max_tokens=budget,
-                messages=messages
-            )
-
-        sig = image_signature(
-            st.session_state.get("daily_bytes", b""),
-            st.session_state.get("weekly_bytes", b"") if weekly_ready else None
-        )
-        x, raw = get_cached_extraction(sig)
-        cache_hit = x is not None
-
-        if not cache_hit:
-            with st.spinner("正在读取日线/周线并构建技术证据..."):
-                try:
-                    resp = call_ds(max_tokens)
-                    raw = resp.choices[0].message.content or ""
-                    x = parse_json(raw)
-                    if not x or getattr(resp.choices[0], "finish_reason", None) == "length":
-                        resp = call_ds(7000, True)
-                        raw = resp.choices[0].message.content or ""
-                        x = parse_json(raw)
-                except Exception as e:
-                    st.error(f"分析失败：{e}")
-                    st.stop()
-
-            if not x:
-                st.error("DeepSeek 连续返回了不完整结构，请重新分析一次。")
-                st.stop()
-            save_cached_extraction(sig, x, raw)
-        else:
-            st.toast("已识别为同一组截图，直接复用稳定结果。")
-
-        recognized_name = cat(x.get("symbol_name"))
-        recognized_code = cat(x.get("symbol_code"))
-        auto_symbol = ""
-        if recognized_name not in ("","未知"):
-            auto_symbol = recognized_name
-        if recognized_code not in ("","未知"):
-            auto_symbol = (auto_symbol + " / " + recognized_code).strip(" /")
-        if not symbol.strip() and auto_symbol:
-            symbol = auto_symbol
-
-        # A股截图若能识别出6位代码，统一使用BaoStock原始行情计算。
-        # 这样“截图分析”和“代码分析”的技术分来自同一套数据/公式，不再各算一套。
-        a_code = extract_a_share_code(symbol, recognized_code, auto_symbol)
-        used_market_data = False
-        if a_code and market in ("自动判断","A股"):
-            try:
-                bs_login()
-                bs_code = normalize_code(a_code)
-                df_from_code = fetch_stock_daily(bs_code, years=3)
-                bs_name = stock_basic_name(bs_code)
-                report = deterministic_report(
-                    bs_code, bs_name, df_from_code, position_state, fundamentals_ok
-                )
-                report["confidence"] = max(85, confidence_from(x, weekly_ready))
-                report["resonance"] = (
-                    "截图用于识别和视觉复核；技术分、日线、周线、BOLL、MACD、量能均按BaoStock行情统一计算。"
-                )
-                prev2 = previous(report["symbol"])
-                if prev2 and prev2.get("score") is not None:
-                    try:
-                        report["delta"] = report["score"] - float(prev2.get("score"))
-                    except Exception:
-                        pass
-
-                metrics = (
-                    report["score"], report["trend"], report["momentum"],
-                    report["weekly_score"], report["confirm"], False, False
-                )
-                meta = {
-                    "symbol":report["symbol"], "market":"A股", "horizon":horizon,
-                    "position_state":position_state, "rating":report["rating"],
-                    "state":report["state"], "stage":report["stage"],
-                    "confidence":report["confidence"], "mode":"截图识别+BaoStock统一评分",
-                    "weekly_used":True
-                }
-                xsave = {
-                    "data_quality":report["confidence"],
-                    "daily":{
-                        "price":str(report["_df"].iloc[-1]["close"]),
-                        "boll_mid":str(report["_df"].iloc[-1]["boll_mid"])
-                    },
-                    "key_support":report["support"],
-                    "key_resistance":report["resistance"]
-                }
-                save_result(
-                    meta, xsave, metrics,
-                    json.dumps({"source":"BaoStock","image_aux":True}, ensure_ascii=False)
-                )
-                report.pop("_df",None)
-                st.session_state["last_report"] = report
-                used_market_data = True
-            except Exception as e:
-                st.warning(f"已识别A股代码 {a_code}，但行情统一评分暂时失败，将退回截图估分：{e}")
-            finally:
-                try: bs.logout()
-                except Exception: pass
-
-        if not used_market_data:
-            metrics = score_engine(x, weekly_ready)
-            score, trend, momentum, weekly_score, confirm, hard_bear, strong_bull = metrics
-            weekly_ok = weekly_score is not None and weekly_score >= 60
-            confidence = confidence_from(x, weekly_ready)
-            rating = grade(score, weekly_ok, confidence)
-            stage = stage_from(score, x.get("daily",{}), weekly_ok)
-            state, state_reason = state_from(
-                score, rating, confidence, bool(x.get("is_intraday")),
-                weekly_ok, position_state, fundamentals_ok, hard_bear
-            )
-
-            meta = {
-                "symbol":symbol.strip(), "market":market, "horizon":horizon,
-                "position_state":position_state, "rating":rating, "state":state,
-                "stage":stage, "confidence":confidence, "mode":"截图估分",
-                "weekly_used":weekly_ready
-            }
-            save_result(meta, x, metrics, raw)
-
-            d = x.get("daily",{}) or {}
-            daily_mid = d.get("boll_mid","未知")
-            upgrade_parts = []
-            downgrade_parts = []
-            if d.get("boll_mid_direction") != "向上":
-                upgrade_parts.append("中轨转向上")
-            if d.get("price_vs_mid") != "中轨上":
-                upgrade_parts.append(f"站稳中轨 {daily_mid}")
-            if d.get("macd_zero_zone") != "零轴上":
-                upgrade_parts.append("MACD回到零轴上")
-            if weekly_score is None:
-                upgrade_parts.append("补周线确认")
-            elif weekly_score < 60:
-                upgrade_parts.append("周线转强")
-            if d.get("price_vs_mid") != "中轨下":
-                downgrade_parts.append(f"失守中轨 {daily_mid}")
-            if d.get("bar_momentum") != "绿柱放大":
-                downgrade_parts.append("MACD绿柱放大")
-            downgrade_parts.append("关键支撑失守")
-            up_text = "；".join(upgrade_parts[:2]) if upgrade_parts else "维持强势并继续确认"
-            down_text = "；".join(downgrade_parts[:2])
-
-            delta = None
-            if prev and prev.get("score") is not None:
-                try:
-                    delta = score - float(prev.get("score"))
-                except Exception:
-                    delta = None
-
-            st.session_state["last_report"] = {
-                "updated_at": datetime.now().strftime("%m-%d %H:%M"),
-                "symbol": symbol.strip() or auto_symbol or "当前标的",
-                "state": state, "rating": rating, "stage": stage,
-                "state_reason": state_reason, "score": score, "trend": trend,
-                "momentum": momentum, "weekly_score": weekly_score,
-                "confirm": confirm, "confidence": confidence,
-                "essence": "截图估分：" + x.get("essence",""),
-                "support": x.get("key_support","未知"),
-                "resistance": x.get("key_resistance","未知"),
-                "upgrade": up_text, "downgrade": down_text,
-                "delta": delta, "intraday": bool(x.get("is_intraday")),
-                "daily": d, "boll_analysis": x.get("boll_analysis",""),
-                "macd_analysis": x.get("macd_analysis",""),
-                "weekly_analysis": x.get("weekly_analysis","") if weekly_ready else "",
-                "resonance": "未识别到可用于BaoStock的A股6位代码，因此本次仅为截图估分。"
-            }
-
-        st.rerun()
+    st.caption("当前仅保留数据驱动模式：日K直接获取，周K由同一套日K聚合生成，避免截图识别误差。")
 
     with st.expander("仓位风险计算器"):
         rc1, rc2 = st.columns(2)
