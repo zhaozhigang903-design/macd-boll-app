@@ -246,12 +246,13 @@ def evidence_rows(daily, weekly):
         ]
     return rows
 
-def _strategy_curve(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9):
+def _strategy_curve(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9, use_weekly_filter=True):
     cols = {c.lower():c for c in df.columns}
     if "close" not in cols:
         raise ValueError("CSV 至少需要 Close 列。")
     date_col = cols.get("date") or cols.get("datetime")
     x = df.copy()
+    has_date = bool(date_col)
     if date_col:
         x[date_col] = pd.to_datetime(x[date_col], errors="coerce")
         x = x.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
@@ -268,8 +269,28 @@ def _strategy_curve(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9):
     dif = ema_f - ema_s
     dea = dif.ewm(span=signal, adjust=False).mean()
 
-    entry = (close > mid) & mid_up & (dif > dea) & (dif > 0)
-    exit_sig = (close < mid) | (dif < dea)
+    daily_entry = (close > mid) & mid_up & (dif > dea) & (dif > 0)
+    daily_exit = (close < mid) | (dif < dea)
+
+    weekly_ok_daily = pd.Series(True, index=x.index)
+    weekly_exit_daily = pd.Series(False, index=x.index)
+    if use_weekly_filter:
+        if not has_date or not isinstance(x.index, pd.DatetimeIndex):
+            raise ValueError("启用周线过滤时，CSV 必须包含 Date 或 Datetime 列。")
+        wclose = close.resample("W-FRI").last().dropna()
+        wmid = wclose.rolling(boll_n).mean()
+        wmid_up = wmid.diff() > 0
+        wema_f = wclose.ewm(span=fast, adjust=False).mean()
+        wema_s = wclose.ewm(span=slow, adjust=False).mean()
+        wdif = wema_f - wema_s
+        wdea = wdif.ewm(span=signal, adjust=False).mean()
+        weekly_ok = (wclose > wmid) & wmid_up & (wdif > wdea)
+        weekly_exit = (wclose < wmid) | (wdif < wdea)
+        weekly_ok_daily = weekly_ok.reindex(x.index, method="ffill").fillna(False)
+        weekly_exit_daily = weekly_exit.reindex(x.index, method="ffill").fillna(False)
+
+    entry = daily_entry & weekly_ok_daily
+    exit_sig = daily_exit | weekly_exit_daily
 
     state = 0
     pos = []
@@ -284,6 +305,7 @@ def _strategy_curve(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9):
     ret = close.pct_change().fillna(0)
     turnover = pos.diff().abs().fillna(pos.abs())
     cost = turnover * (fee_bps/10000)
+    # Signals use current close; shift position one bar to avoid look-ahead.
     strat = pos.shift(1).fillna(0)*ret - cost
     equity = (1+strat).cumprod()
     bench = (1+ret).cumprod()
@@ -299,21 +321,28 @@ def _strategy_curve(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9):
 
     return x, close, pos, strat, equity, bench, trades
 
-def backtest(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9):
-    x, close, pos, strat, equity, bench, trades = _strategy_curve(df, fee_bps, boll_n, fast, slow, signal)
+def backtest(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9, use_weekly_filter=True):
+    x, close, pos, strat, equity, bench, trades = _strategy_curve(
+        df, fee_bps, boll_n, fast, slow, signal, use_weekly_filter
+    )
     total = equity.iloc[-1]-1
+    benchmark_return = bench.iloc[-1]-1
     dd = equity/equity.cummax()-1
     mdd = dd.min()
+    exposure = float(pos.mean())
+
     if isinstance(x.index, pd.DatetimeIndex) and len(x)>1:
         years = max((x.index[-1]-x.index[0]).days/365.25, 1/365.25)
         cagr = equity.iloc[-1]**(1/years)-1
     else:
         cagr = float("nan")
+
     win = sum(t>0 for t in trades)/len(trades) if trades else float("nan")
     avg_trade = sum(trades)/len(trades) if trades else float("nan")
     gains = sum(t for t in trades if t>0)
     losses = abs(sum(t for t in trades if t<0))
     profit_factor = gains/losses if losses>0 else float("nan")
+    mar = cagr/abs(mdd) if (not pd.isna(cagr) and mdd < 0) else float("nan")
 
     split = int(len(x)*0.70)
     oos = None
@@ -331,12 +360,15 @@ def backtest(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9):
     curve = pd.DataFrame({"策略净值":equity,"买入持有":bench})
     return {
         "total_return":total,
+        "benchmark_return":benchmark_return,
         "cagr":cagr,
         "max_drawdown":mdd,
         "trades":len(trades),
         "win_rate":win,
         "avg_trade":avg_trade,
         "profit_factor":profit_factor,
+        "mar":mar,
+        "exposure":exposure,
         "oos":oos,
         "curve":curve,
     }
