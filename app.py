@@ -721,6 +721,16 @@ def normalize_code(code):
         return "sh." + digits
     return "sz." + digits
 
+def extract_a_share_code(*values):
+    for value in values:
+        s = str(value or "")
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", s)
+        if m:
+            code = m.group(1)
+            if code.startswith(("0","3","6","8","4")):
+                return code
+    return ""
+
 def display_code(code):
     s = str(code or "")
     return s.split(".")[-1].upper() if "." in s else s.upper()
@@ -1132,7 +1142,7 @@ with tab1:
                     except Exception: pass
 
     st.divider()
-    st.caption("备用：下面仍保留截图分析，适合特殊指标或数据源未覆盖的情况。")
+    st.caption("备用：截图主要用于识别标的和辅助复核。A股若能识别出6位代码，评分将自动切换到与“代码分析”完全相同的行情数据算法。")
     st.subheader("② 上传图表")
     st.caption("模板：BOLL(20,2) + MACD(12,26,9) + VOL/MA5/MA10。")
     nonce = st.session_state.get("upload_nonce", 0)
@@ -1292,82 +1302,130 @@ with tab1:
         if not symbol.strip() and auto_symbol:
             symbol = auto_symbol
 
-        metrics = score_engine(x, weekly_ready)
-        score, trend, momentum, weekly_score, confirm, hard_bear, strong_bull = metrics
-        weekly_ok = weekly_score is not None and weekly_score >= 60
-        confidence = confidence_from(x, weekly_ready)
-        rating = grade(score, weekly_ok, confidence)
-        stage = stage_from(score, x.get("daily",{}), weekly_ok)
-        state, state_reason = state_from(
-            score, rating, confidence, bool(x.get("is_intraday")),
-            weekly_ok, position_state, fundamentals_ok, hard_bear
-        )
-
-        meta = {
-            "symbol":symbol.strip(), "market":market, "horizon":horizon,
-            "position_state":position_state, "rating":rating, "state":state,
-            "stage":stage, "confidence":confidence, "mode":mode,
-            "weekly_used":weekly_ready
-        }
-        save_result(meta, x, metrics, raw)
-
-        d = x.get("daily",{}) or {}
-        daily_mid = d.get("boll_mid","未知")
-        upgrade_parts = []
-        downgrade_parts = []
-        if d.get("boll_mid_direction") != "向上":
-            upgrade_parts.append("中轨转向上")
-        if d.get("price_vs_mid") != "中轨上":
-            upgrade_parts.append(f"站稳中轨 {daily_mid}")
-        if d.get("macd_zero_zone") != "零轴上":
-            upgrade_parts.append("MACD回到零轴上")
-        if weekly_score is None:
-            upgrade_parts.append("补周线确认")
-        elif weekly_score < 60:
-            upgrade_parts.append("周线转强")
-
-        if d.get("price_vs_mid") != "中轨下":
-            downgrade_parts.append(f"失守中轨 {daily_mid}")
-        if d.get("bar_momentum") != "绿柱放大":
-            downgrade_parts.append("MACD绿柱放大")
-        downgrade_parts.append("关键支撑失守")
-
-        up_text = "；".join(upgrade_parts[:2]) if upgrade_parts else "维持强势并继续确认"
-        down_text = "；".join(downgrade_parts[:2])
-
-        delta = None
-        if prev and prev.get("score") is not None:
+        # A股截图若能识别出6位代码，统一使用BaoStock原始行情计算。
+        # 这样“截图分析”和“代码分析”的技术分来自同一套数据/公式，不再各算一套。
+        a_code = extract_a_share_code(symbol, recognized_code, auto_symbol)
+        used_market_data = False
+        if a_code and market in ("自动判断","A股"):
             try:
-                delta = score - float(prev.get("score"))
-            except Exception:
-                delta = None
+                bs_login()
+                bs_code = normalize_code(a_code)
+                df_from_code = fetch_stock_daily(bs_code, years=3)
+                bs_name = stock_basic_name(bs_code)
+                report = deterministic_report(
+                    bs_code, bs_name, df_from_code, position_state, fundamentals_ok
+                )
+                report["confidence"] = max(85, confidence_from(x, weekly_ready))
+                report["resonance"] = (
+                    "截图用于识别和视觉复核；技术分、日线、周线、BOLL、MACD、量能均按BaoStock行情统一计算。"
+                )
+                prev2 = previous(report["symbol"])
+                if prev2 and prev2.get("score") is not None:
+                    try:
+                        report["delta"] = report["score"] - float(prev2.get("score"))
+                    except Exception:
+                        pass
 
-        st.session_state["last_report"] = {
-            "updated_at": datetime.now().strftime("%m-%d %H:%M"),
-            "symbol": symbol.strip() or "当前标的",
-            "state": state,
-            "rating": rating,
-            "stage": stage,
-            "state_reason": state_reason,
-            "score": score,
-            "trend": trend,
-            "momentum": momentum,
-            "weekly_score": weekly_score,
-            "confirm": confirm,
-            "confidence": confidence,
-            "essence": x.get("essence",""),
-            "support": x.get("key_support","未知"),
-            "resistance": x.get("key_resistance","未知"),
-            "upgrade": up_text,
-            "downgrade": down_text,
-            "delta": delta,
-            "intraday": bool(x.get("is_intraday")),
-            "daily": d,
-            "boll_analysis": x.get("boll_analysis",""),
-            "macd_analysis": x.get("macd_analysis",""),
-            "weekly_analysis": x.get("weekly_analysis","") if weekly_ready else "",
-            "resonance": x.get("resonance",""),
-        }
+                metrics = (
+                    report["score"], report["trend"], report["momentum"],
+                    report["weekly_score"], report["confirm"], False, False
+                )
+                meta = {
+                    "symbol":report["symbol"], "market":"A股", "horizon":horizon,
+                    "position_state":position_state, "rating":report["rating"],
+                    "state":report["state"], "stage":report["stage"],
+                    "confidence":report["confidence"], "mode":"截图识别+BaoStock统一评分",
+                    "weekly_used":True
+                }
+                xsave = {
+                    "data_quality":report["confidence"],
+                    "daily":{
+                        "price":str(report["_df"].iloc[-1]["close"]),
+                        "boll_mid":str(report["_df"].iloc[-1]["boll_mid"])
+                    },
+                    "key_support":report["support"],
+                    "key_resistance":report["resistance"]
+                }
+                save_result(
+                    meta, xsave, metrics,
+                    json.dumps({"source":"BaoStock","image_aux":True}, ensure_ascii=False)
+                )
+                report.pop("_df",None)
+                st.session_state["last_report"] = report
+                used_market_data = True
+            except Exception as e:
+                st.warning(f"已识别A股代码 {a_code}，但行情统一评分暂时失败，将退回截图估分：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
+
+        if not used_market_data:
+            metrics = score_engine(x, weekly_ready)
+            score, trend, momentum, weekly_score, confirm, hard_bear, strong_bull = metrics
+            weekly_ok = weekly_score is not None and weekly_score >= 60
+            confidence = confidence_from(x, weekly_ready)
+            rating = grade(score, weekly_ok, confidence)
+            stage = stage_from(score, x.get("daily",{}), weekly_ok)
+            state, state_reason = state_from(
+                score, rating, confidence, bool(x.get("is_intraday")),
+                weekly_ok, position_state, fundamentals_ok, hard_bear
+            )
+
+            meta = {
+                "symbol":symbol.strip(), "market":market, "horizon":horizon,
+                "position_state":position_state, "rating":rating, "state":state,
+                "stage":stage, "confidence":confidence, "mode":"截图估分",
+                "weekly_used":weekly_ready
+            }
+            save_result(meta, x, metrics, raw)
+
+            d = x.get("daily",{}) or {}
+            daily_mid = d.get("boll_mid","未知")
+            upgrade_parts = []
+            downgrade_parts = []
+            if d.get("boll_mid_direction") != "向上":
+                upgrade_parts.append("中轨转向上")
+            if d.get("price_vs_mid") != "中轨上":
+                upgrade_parts.append(f"站稳中轨 {daily_mid}")
+            if d.get("macd_zero_zone") != "零轴上":
+                upgrade_parts.append("MACD回到零轴上")
+            if weekly_score is None:
+                upgrade_parts.append("补周线确认")
+            elif weekly_score < 60:
+                upgrade_parts.append("周线转强")
+            if d.get("price_vs_mid") != "中轨下":
+                downgrade_parts.append(f"失守中轨 {daily_mid}")
+            if d.get("bar_momentum") != "绿柱放大":
+                downgrade_parts.append("MACD绿柱放大")
+            downgrade_parts.append("关键支撑失守")
+            up_text = "；".join(upgrade_parts[:2]) if upgrade_parts else "维持强势并继续确认"
+            down_text = "；".join(downgrade_parts[:2])
+
+            delta = None
+            if prev and prev.get("score") is not None:
+                try:
+                    delta = score - float(prev.get("score"))
+                except Exception:
+                    delta = None
+
+            st.session_state["last_report"] = {
+                "updated_at": datetime.now().strftime("%m-%d %H:%M"),
+                "symbol": symbol.strip() or auto_symbol or "当前标的",
+                "state": state, "rating": rating, "stage": stage,
+                "state_reason": state_reason, "score": score, "trend": trend,
+                "momentum": momentum, "weekly_score": weekly_score,
+                "confirm": confirm, "confidence": confidence,
+                "essence": "截图估分：" + x.get("essence",""),
+                "support": x.get("key_support","未知"),
+                "resistance": x.get("key_resistance","未知"),
+                "upgrade": up_text, "downgrade": down_text,
+                "delta": delta, "intraday": bool(x.get("is_intraday")),
+                "daily": d, "boll_analysis": x.get("boll_analysis",""),
+                "macd_analysis": x.get("macd_analysis",""),
+                "weekly_analysis": x.get("weekly_analysis","") if weekly_ready else "",
+                "resonance": "未识别到可用于BaoStock的A股6位代码，因此本次仅为截图估分。"
+            }
+
         st.rerun()
 
     with st.expander("仓位风险计算器"):
