@@ -5638,6 +5638,12 @@ with tab8:
             format_func=lambda x:labels.get(x,x),key="research_run_select"
         )
         st.session_state["research_run_id"]=selected_run
+        if shared_db_enabled():
+            _rkey=f"_shared_research_pull::{selected_run}"
+            if not st.session_state.get(_rkey):
+                _rsync=sync_shared_research_safe(selected_run,mode="pull")
+                if not _rsync.get("errors"):
+                    st.session_state[_rkey]=True
         run=get_research_run(selected_run)
 
         if run.get("note"):
@@ -5880,6 +5886,17 @@ with tab8:
             )
             st.session_state["strategy_experiment_id"]=selected_exp
             exp=get_strategy_experiment(selected_exp)
+            if shared_db_enabled() and exp:
+                _ekey=f"_shared_experiment_pull::{selected_exp}"
+                if not st.session_state.get(_ekey):
+                    _esync=sync_shared_experiment_safe(
+                        selected_exp,
+                        research_run_id=exp.get("research_run_id"),
+                        mode="pull"
+                    )
+                    if not _esync.get("errors"):
+                        st.session_state[_ekey]=True
+                    exp=get_strategy_experiment(selected_exp)
 
             edone=int(exp.get("cursor",0) or 0)
             etotal=int(exp.get("total",0) or 0)
