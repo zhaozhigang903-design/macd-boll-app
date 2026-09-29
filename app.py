@@ -402,6 +402,7 @@ with tab_decision:
                 msg.append({"type":"text","text":"上一次JSON可能不完整。重新输出更短、更完整的合法JSON，确保括号全部闭合。"})
             return client.chat.completions.create(
                 model="deepseek-flash",
+                reasoning_effort="low",
                 max_tokens=tokens,
                 response_format={"type":"json_object"},
                 messages=[
@@ -638,31 +639,38 @@ with tab_backtest:
     with p1:
         fee = st.slider("单边交易成本（bp）",0,50,10,1)
         boll_n = st.slider("BOLL中轨周期",10,40,20,1)
+        weekly_filter = st.checkbox("启用周线环境过滤", value=True)
     with p2:
         fast = st.number_input("MACD快线",5,20,12)
         slow = st.number_input("MACD慢线",15,50,26)
         sig = st.number_input("MACD信号线",5,20,9)
 
+    st.caption("回测按收盘信号、下一根K线生效，避免使用未来数据。启用周线过滤时，CSV必须有Date/Datetime列。")
+
     if csv_file and st.button("运行回测",type="primary",width="stretch"):
         try:
             x = pd.read_csv(csv_file)
-            bt = backtest(x,fee,boll_n,int(fast),int(slow),int(sig))
+            bt = backtest(x,fee,boll_n,int(fast),int(slow),int(sig),weekly_filter)
             m1,m2,m3,m4 = st.columns(4)
-            m1.metric("总收益",pct(bt["total_return"]))
-            m2.metric("年化收益",pct(bt["cagr"]))
+            m1.metric("策略总收益",pct(bt["total_return"]))
+            m2.metric("买入持有",pct(bt["benchmark_return"]))
             m3.metric("最大回撤",pct(bt["max_drawdown"]))
             m4.metric("交易次数",bt["trades"])
-            m5,m6 = st.columns(2)
-            m5.metric("胜率",pct(bt["win_rate"]))
+            m5,m6,m7,m8 = st.columns(4)
+            m5.metric("年化收益",pct(bt["cagr"]))
+            m6.metric("胜率",pct(bt["win_rate"]))
             pf = bt["profit_factor"]
-            m6.metric("Profit Factor", "—" if pd.isna(pf) else f"{pf:.2f}")
+            m7.metric("Profit Factor", "—" if pd.isna(pf) else f"{pf:.2f}")
+            mar = bt["mar"]
+            m8.metric("MAR", "—" if pd.isna(mar) else f"{mar:.2f}")
+            st.caption(f"策略持仓暴露时间：{bt['exposure']:.1%}")
             st.line_chart(bt["curve"],height=280)
             if bt["oos"]:
                 st.info(
                     f"后30%样本检验：收益 {bt['oos']['return']:.1%}，"
                     f"最大回撤 {bt['oos']['max_drawdown']:.1%}。"
                 )
-            st.warning("不要针对单一标的反复调参数追求漂亮历史曲线；真正要看的是跨标的、跨周期和样本外稳定性。")
+            st.warning("不要针对单一标的反复调参数追求漂亮历史曲线；真正要看跨标的、跨周期、样本外稳定性，以及回撤是否可承受。")
         except Exception as e:
             st.error(f"回测失败：{e}")
 
