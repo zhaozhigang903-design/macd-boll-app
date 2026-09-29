@@ -698,7 +698,11 @@ with tab_backtest:
             m7.metric("Profit Factor", "—" if pd.isna(pf) else f"{pf:.2f}")
             mar = bt["mar"]
             m8.metric("MAR", "—" if pd.isna(mar) else f"{mar:.2f}")
-            st.caption(f"策略持仓暴露时间：{bt['exposure']:.1%}")
+            e1,e2,e3 = st.columns(3)
+            payoff = bt["payoff"]
+            e1.metric("平均单笔期望",pct(bt["expectancy"]))
+            e2.metric("盈亏比", "—" if pd.isna(payoff) else f"{payoff:.2f}")
+            e3.metric("持仓暴露",pct(bt["exposure"]))
             st.line_chart(bt["curve"],height=280)
             if bt["oos"]:
                 st.info(
