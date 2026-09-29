@@ -23,6 +23,18 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+:root{
+ --blue:#2563eb;
+ --blue2:#0ea5e9;
+ --violet:#7c3aed;
+ --teal:#0f766e;
+ --green:#16a34a;
+ --amber:#d97706;
+ --red:#dc2626;
+ --panel:rgba(59,130,246,.055);
+ --border:rgba(148,163,184,.26);
+ --muted:rgba(148,163,184,.82);
+}
 .block-container{
  max-width:1080px;
  padding-top:calc(env(safe-area-inset-top, 0px) + 3.4rem);
@@ -31,11 +43,141 @@ st.markdown("""
  padding-right:.7rem
 }
 h1{font-size:1.58rem!important;margin-bottom:.2rem!important}
-h2{font-size:1.25rem!important}
-div[data-testid="stMetric"]{border:1px solid rgba(128,128,128,.22);border-radius:12px;padding:9px 10px}
-.decision{border:1px solid rgba(128,128,128,.28);border-radius:14px;padding:14px;margin:8px 0 12px}
-.hero{border:1px solid rgba(128,128,128,.28);border-radius:16px;padding:15px;margin:8px 0 14px}
-.muted{opacity:.72;font-size:.88rem}
+h2,h3{
+ font-weight:760!important;
+ letter-spacing:.01em;
+}
+h2{
+ font-size:1.22rem!important;
+ border-left:4px solid var(--blue);
+ padding-left:.55rem!important;
+ margin-top:.65rem!important;
+}
+h3{
+ font-size:1.03rem!important;
+ color:var(--blue2)!important;
+}
+div[data-testid="stMetric"]{
+ border:1px solid var(--border);
+ border-radius:13px;
+ padding:9px 10px;
+ background:rgba(59,130,246,.035);
+ box-shadow:0 2px 10px rgba(15,23,42,.04)
+}
+div[data-testid="stMetricLabel"]{opacity:.68}
+div[data-testid="stMetricValue"]{font-weight:760}
+
+/* 顶部菜单：当前页高亮，其他页弱化 */
+div[data-testid="stTabs"] button[role="tab"]{
+ border-radius:10px 10px 0 0!important;
+ padding:.5rem .65rem!important;
+ font-weight:650!important;
+ opacity:.72;
+}
+div[data-testid="stTabs"] button[role="tab"][aria-selected="true"]{
+ color:#fff!important;
+ background:linear-gradient(135deg,var(--blue),var(--blue2))!important;
+ opacity:1;
+}
+div[data-testid="stTabs"] div[data-baseweb="tab-highlight"]{
+ background-color:transparent!important;
+}
+
+/* 输入区更有层次 */
+div[data-testid="stFileUploader"], div[data-testid="stTextInput"],
+div[data-testid="stSelectbox"], div[data-testid="stTextArea"]{
+ border-radius:12px;
+}
+div[data-testid="stExpander"]{
+ border:1px solid var(--border)!important;
+ border-radius:13px!important;
+ overflow:hidden;
+}
+.stButton>button[kind="primary"]{
+ border:none!important;
+ background:linear-gradient(135deg,var(--blue),var(--blue2))!important;
+ color:white!important;
+ font-weight:760!important;
+ box-shadow:0 5px 16px rgba(37,99,235,.22)!important;
+}
+.stButton>button:not([kind="primary"]){
+ border-color:var(--border)!important;
+}
+
+/* 驾驶舱 */
+.cockpit{
+ border:1px solid rgba(37,99,235,.25);
+ border-radius:18px;
+ padding:14px;
+ margin:4px 0 14px;
+ background:
+  linear-gradient(135deg,rgba(37,99,235,.10),rgba(14,165,233,.035) 48%,rgba(124,58,237,.035));
+ box-shadow:0 8px 26px rgba(15,23,42,.07)
+}
+.cockpit-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.cockpit-kicker{font-size:.76rem;color:var(--blue2);font-weight:650;margin-bottom:4px}
+.cockpit-state{font-size:1.33rem;font-weight:800;line-height:1.18}
+.cockpit-stage{font-size:.92rem;opacity:.76;margin-top:5px}
+.cockpit-score{
+ min-width:70px;text-align:center;
+ border:1px solid rgba(37,99,235,.28);
+ background:rgba(37,99,235,.10);
+ border-radius:14px;padding:8px 7px
+}
+.cockpit-score b{font-size:1.45rem;color:var(--blue2)}
+.cockpit-score span{display:block;font-size:.70rem;opacity:.62}
+.state-chip{
+ display:inline-block;
+ padding:4px 9px;
+ border-radius:999px;
+ font-size:.76rem;
+ font-weight:800;
+ margin-bottom:5px;
+ border:1px solid transparent;
+}
+.state-buy{color:#86efac;background:rgba(22,163,74,.14);border-color:rgba(22,163,74,.32)}
+.state-hold{color:#7dd3fc;background:rgba(14,165,233,.14);border-color:rgba(14,165,233,.30)}
+.state-watch{color:#fde68a;background:rgba(217,119,6,.14);border-color:rgba(217,119,6,.30)}
+.state-reduce,.state-avoid{color:#fca5a5;background:rgba(220,38,38,.14);border-color:rgba(220,38,38,.30)}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:11px}
+.kpi{
+ border:1px solid var(--border);
+ border-radius:12px;padding:8px;text-align:center;
+ background:rgba(15,23,42,.035)
+}
+.kpi b{display:block;font-size:1.02rem}
+.kpi span{font-size:.70rem;opacity:.62}
+.kpi-trend{border-top:3px solid var(--blue)}
+.kpi-momentum{border-top:3px solid var(--violet)}
+.kpi-weekly{border-top:3px solid var(--teal)}
+.kpi-volume{border-top:3px solid var(--amber)}
+.cockpit-note{
+ margin-top:10px;padding:10px 11px;border-radius:11px;
+ background:rgba(37,99,235,.07);
+ border-left:3px solid var(--blue2);
+ font-size:.90rem;line-height:1.48
+}
+.level-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
+.level{
+ border:1px solid var(--border);
+ border-radius:11px;padding:8px 10px;font-size:.84rem;
+ background:rgba(15,23,42,.025)
+}
+.level span{display:block;font-size:.68rem;opacity:.62;margin-bottom:2px}
+.level-support{border-left:3px solid var(--green)}
+.level-resist{border-left:3px solid var(--red)}
+.trigger-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
+.trigger{border-radius:11px;padding:8px 10px;font-size:.82rem;line-height:1.35}
+.trigger-up{
+ border:1px solid rgba(22,163,74,.28);
+ background:rgba(22,163,74,.07)
+}
+.trigger-down{
+ border:1px solid rgba(220,38,38,.28);
+ background:rgba(220,38,38,.07)
+}
+.compactline{font-size:.92rem;line-height:1.45;margin:.3rem 0}
+
 @media(max-width:700px){
  .block-container{
    padding-left:.5rem;
@@ -43,41 +185,20 @@ div[data-testid="stMetric"]{border:1px solid rgba(128,128,128,.22);border-radius
    padding-top:calc(env(safe-area-inset-top, 0px) + 3.7rem)
  }
  h1{font-size:1.38rem!important}
+ h2{font-size:1.10rem!important}
  .stTextInput input,.stTextArea textarea{font-size:16px!important}
  button[kind="primary"]{min-height:50px;font-size:1.03rem}
  div[data-testid="stMetric"]{padding:7px 8px}
- .hero{padding:11px;margin:6px 0 9px}
-}
-.compactline{font-size:.92rem;line-height:1.45;margin:.3rem 0}
-.cockpit{border:1px solid rgba(128,128,128,.28);border-radius:18px;padding:14px;margin:4px 0 14px;background:rgba(128,128,128,.035)}
-.cockpit-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
-.cockpit-kicker{font-size:.76rem;opacity:.62;margin-bottom:3px}
-.cockpit-state{font-size:1.33rem;font-weight:780;line-height:1.18}
-.cockpit-stage{font-size:.92rem;opacity:.76;margin-top:5px}
-.cockpit-score{min-width:68px;text-align:center;border:1px solid rgba(128,128,128,.28);border-radius:14px;padding:8px 7px}
-.cockpit-score b{font-size:1.42rem}
-.cockpit-score span{display:block;font-size:.70rem;opacity:.60}
-.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:11px}
-.kpi{border:1px solid rgba(128,128,128,.20);border-radius:11px;padding:8px;text-align:center}
-.kpi b{display:block;font-size:1.02rem}
-.kpi span{font-size:.70rem;opacity:.62}
-.cockpit-note{margin-top:10px;padding:9px 10px;border-radius:11px;background:rgba(128,128,128,.07);font-size:.90rem;line-height:1.45}
-.level-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
-.level{border:1px solid rgba(128,128,128,.20);border-radius:11px;padding:8px 10px;font-size:.84rem}
-.level span{display:block;font-size:.68rem;opacity:.60;margin-bottom:2px}
-.trigger-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
-.trigger{border-radius:11px;padding:8px 10px;font-size:.82rem;line-height:1.35;border:1px solid rgba(128,128,128,.20)}
-@media(max-width:700px){
+ div[data-testid="stTabs"] button[role="tab"]{padding:.42rem .46rem!important;font-size:.86rem!important}
+ .cockpit{padding:11px}
+ .cockpit-state{font-size:1.16rem}
+ .cockpit-score{min-width:61px;padding:7px 5px}
  .kpi-grid{grid-template-columns:repeat(4,1fr);gap:5px}
  .kpi{padding:6px 3px}
  .kpi b{font-size:.92rem}
  .kpi span{font-size:.64rem}
- .cockpit{padding:11px}
- .cockpit-state{font-size:1.18rem}
- .cockpit-score{min-width:60px;padding:7px 5px}
  .level,.trigger{padding:7px 8px;font-size:.78rem}
 }
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -452,31 +573,41 @@ def render_cockpit(report):
         arrow = "↑" if delta > 3 else ("↓" if delta < -3 else "→")
         compare_text = f" · 较上次 {arrow}{delta:+.1f}"
 
+    state = str(report.get("state") or "")
+    state_class = (
+        "state-buy" if state == "买入候选"
+        else "state-hold" if state == "持有"
+        else "state-watch" if state == "观察"
+        else "state-reduce" if state == "减仓"
+        else "state-avoid"
+    )
+
     st.markdown(
         f"""
 <div class="cockpit">
   <div class="cockpit-head">
     <div>
       <div class="cockpit-kicker">最新决策 · {_safe(symbol)} · {_safe(updated)}</div>
-      <div class="cockpit-state">{signal_color(score)} {_safe(report.get("state"))} · {_safe(report.get("rating"))}</div>
-      <div class="cockpit-stage">{_safe(report.get("stage"))}{_safe(compare_text) if compare_text else ""}</div>
+      <span class="state-chip {state_class}">{_safe(state)}</span>
+      <div class="cockpit-state">{signal_color(score)} {_safe(report.get("rating"))} · {_safe(report.get("stage"))}</div>
+      <div class="cockpit-stage">{_safe(compare_text) if compare_text else "当前结构"}</div>
     </div>
     <div class="cockpit-score"><b>{score:.0f}</b><span>技术分</span></div>
   </div>
   <div class="kpi-grid">
-    <div class="kpi"><b>{report.get("trend",0):.0f}</b><span>趋势</span></div>
-    <div class="kpi"><b>{report.get("momentum",0):.0f}</b><span>动能</span></div>
-    <div class="kpi"><b>{weekly_txt}</b><span>周线</span></div>
-    <div class="kpi"><b>{report.get("confirm",0):.0f}</b><span>量能</span></div>
+    <div class="kpi kpi-trend"><b>{report.get("trend",0):.0f}</b><span>趋势</span></div>
+    <div class="kpi kpi-momentum"><b>{report.get("momentum",0):.0f}</b><span>动能</span></div>
+    <div class="kpi kpi-weekly"><b>{weekly_txt}</b><span>周线</span></div>
+    <div class="kpi kpi-volume"><b>{report.get("confirm",0):.0f}</b><span>量能</span></div>
   </div>
   <div class="cockpit-note">{_safe(essence)}</div>
   <div class="level-grid">
-    <div class="level"><span>关键支撑</span><b>{_safe(report.get("support"))}</b></div>
-    <div class="level"><span>关键压力</span><b>{_safe(report.get("resistance"))}</b></div>
+    <div class="level level-support"><span>关键支撑</span><b>{_safe(report.get("support"))}</b></div>
+    <div class="level level-resist"><span>关键压力</span><b>{_safe(report.get("resistance"))}</b></div>
   </div>
   <div class="trigger-grid">
-    <div class="trigger">⬆️ <b>升级</b><br>{_safe(report.get("upgrade"))}</div>
-    <div class="trigger">⬇️ <b>降级</b><br>{_safe(report.get("downgrade"))}</div>
+    <div class="trigger trigger-up">⬆️ <b>升级</b><br>{_safe(report.get("upgrade"))}</div>
+    <div class="trigger trigger-down">⬇️ <b>降级</b><br>{_safe(report.get("downgrade"))}</div>
   </div>
 </div>
         """,
