@@ -3628,6 +3628,34 @@ def get_research_run(run_id):
     conn.close()
     return df.iloc[0].to_dict() if not df.empty else None
 
+def _research_membership_periods(run_id,code):
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        """SELECT period_start,period_end FROM research_membership
+           WHERE run_id=? AND code=?
+           ORDER BY period_start""",
+        conn,params=(run_id,code)
+    )
+    conn.close()
+    if not df.empty:
+        df["period_start"]=pd.to_datetime(df["period_start"],errors="coerce")
+        df["period_end"]=pd.to_datetime(df["period_end"],errors="coerce")
+    return df
+
+def filter_research_trades_by_membership(run_id,code,trades):
+    if trades is None or trades.empty:
+        return pd.DataFrame() if trades is None else trades
+    periods=_research_membership_periods(run_id,code)
+    if periods.empty:
+        return trades
+    signal_dates=pd.to_datetime(trades["signal_date"],errors="coerce")
+    keep=pd.Series(False,index=trades.index)
+    for _,p in periods.iterrows():
+        if pd.isna(p["period_start"]) or pd.isna(p["period_end"]):
+            continue
+        keep=keep | ((signal_dates>=p["period_start"]) & (signal_dates<=p["period_end"]))
+    return trades.loc[keep].reset_index(drop=True)
+
 def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
     now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pf=ev.get("盈亏因子")
@@ -3654,6 +3682,9 @@ def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
     if trades is not None and not trades.empty:
         rows=[]
         for _,t in trades.iterrows():
+            entry=float(t["entry"]) if pd.notna(t.get("entry")) else None
+            stop=float(t["stop"]) if pd.notna(t.get("stop")) else None
+            risk_pct=((entry-stop)/entry) if entry and stop is not None and entry>stop else None
             rows.append((
                 run_id,code,name,market,
                 pd.Timestamp(t["signal_date"]).strftime("%Y-%m-%d"),
@@ -3661,6 +3692,9 @@ def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
                 pd.Timestamp(t["exit_date"]).strftime("%Y-%m-%d"),
                 float(t["return"]) if pd.notna(t.get("return")) else None,
                 float(t["R"]) if pd.notna(t.get("R")) else None,
+                entry,
+                float(t["exit"]) if pd.notna(t.get("exit")) else None,
+                stop,risk_pct,
                 int(t.get("holding_days",0) or 0),
                 float(t["technical"]) if pd.notna(t.get("technical")) else None,
                 float(t["buy_score"]) if pd.notna(t.get("buy_score")) else None,
@@ -3674,9 +3708,10 @@ def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
         conn.executemany(
             """INSERT INTO research_trades(
                run_id,code,name,market,signal_date,entry_date,exit_date,return_pct,r_multiple,
+               entry_price,exit_price,stop_price,initial_risk_pct,
                holding_days,technical_score,buy_score,weekly_score,rr,market_score,rs_score,
                opportunity_score,exit_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",rows
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",rows
         )
     conn.commit(); conn.close()
 
