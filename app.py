@@ -118,6 +118,8 @@ div[data-testid="stExpander"]{
 }
 .cockpit-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
 .cockpit-kicker{font-size:.76rem;color:var(--blue2);font-weight:650;margin-bottom:4px}
+.symbol-highlight{font-size:1.34rem;font-weight:850;line-height:1.15;color:var(--blue2);margin:1px 0 3px}
+.symbol-code{font-size:.78rem;opacity:.68;margin-bottom:5px}
 .cockpit-state{font-size:1.33rem;font-weight:800;line-height:1.18}
 .cockpit-stage{font-size:.92rem;opacity:.76;margin-top:5px}
 .cockpit-score{
@@ -690,6 +692,9 @@ def render_cockpit(report):
     weekly = report.get("weekly_score")
     weekly_txt = "—" if weekly is None else f"{weekly:.0f}"
     symbol = report.get("symbol") or "当前标的"
+    parts = [x.strip() for x in str(symbol).split("/",1)]
+    symbol_name = parts[0] if parts else str(symbol)
+    symbol_code = parts[1] if len(parts)>1 else ""
     updated = report.get("updated_at","")
     essence = report.get("essence") or report.get("state_reason","")
     delta = report.get("delta")
@@ -712,7 +717,9 @@ def render_cockpit(report):
 <div class="cockpit">
   <div class="cockpit-head">
     <div>
-      <div class="cockpit-kicker">最新决策 · {_safe(symbol)} · {_safe(updated)}</div>
+      <div class="cockpit-kicker">最新决策 · {_safe(updated)}</div>
+      <div class="symbol-highlight">{_safe(symbol_name)}</div>
+      <div class="symbol-code">{_safe(symbol_code)}</div>
       <span class="state-chip {state_class}">{_safe(state)}</span>
       <div class="cockpit-state">{signal_color(score)} {_safe(report.get("rating"))} · {_safe(report.get("stage"))}</div>
       <div class="cockpit-stage">{_safe(compare_text) if compare_text else "当前结构"}</div>
@@ -793,10 +800,7 @@ def render_cockpit(report):
             f"数据源：{report.get('data_source')} · {report.get('adjustment','')} · "
             f"最新交易日：{report.get('latest_date','—')} · 收盘：{report.get('latest_close','—')}"
         )
-    if weekly is None:
-        st.caption("总技术分 = 趋势50% + 动能35% + 量能15%；各分项满分100。")
-    else:
-        st.caption("总技术分 = 趋势38% + 动能30% + 周线22% + 量能10%；各分项满分100。")
+    st.caption("总技术分 = 趋势38% + 动能30% + 周线22% + 量能10%；周线为中长线必选周期。各分项满分100。")
     st.caption(f"数据完整度 {report.get('confidence',0)}% · 同一代码使用同一数据源和公式；技术分不是上涨概率。")
 
 
@@ -838,6 +842,51 @@ def bs_login():
     if lg.error_code != "0":
         raise RuntimeError("BaoStock登录失败：" + lg.error_msg)
     return lg
+
+def resolve_symbol_input(value):
+    s = str(value or "").strip()
+    if not s:
+        raise ValueError("请输入股票代码或名称。")
+
+    digits = re.sub(r"\D","",s)
+    if len(digits) == 6:
+        code = normalize_code(digits)
+        return code, stock_basic_name(code)
+
+    # 先走BaoStock基础资料精确名称查询
+    try:
+        rs = bs.query_stock_basic(code_name=s)
+        df = _rs_to_df(rs)
+        if not df.empty and "code" in df.columns:
+            name_col = "code_name" if "code_name" in df.columns else ("name" if "name" in df.columns else None)
+            if name_col:
+                exact = df[df[name_col].astype(str).str.strip() == s]
+                if len(exact) == 1:
+                    row = exact.iloc[0]
+                    return str(row["code"]), str(row[name_col])
+            if len(df) == 1:
+                row = df.iloc[0]
+                return str(row["code"]), str(row[name_col]) if name_col else s
+    except Exception:
+        pass
+
+    # 再从当前全A股股票池匹配名称；唯一包含匹配也可用
+    pool = fetch_universe("全A股（沪深）")
+    if pool.empty:
+        raise ValueError(f"未找到股票：{s}")
+    exact = pool[pool["code_name"].astype(str).str.strip() == s]
+    if len(exact) == 1:
+        row = exact.iloc[0]
+        return str(row["code"]), str(row["code_name"])
+
+    contains = pool[pool["code_name"].astype(str).str.contains(re.escape(s), na=False)]
+    if len(contains) == 1:
+        row = contains.iloc[0]
+        return str(row["code"]), str(row["code_name"])
+    if len(contains) > 1:
+        names = "、".join(contains["code_name"].astype(str).head(5).tolist())
+        raise ValueError(f"名称不唯一，请输入更完整名称或6位代码。匹配到：{names}")
+    raise ValueError(f"未找到股票：{s}")
 
 def stock_basic_name(code):
     rs = bs.query_stock_basic(code=code)
@@ -1165,9 +1214,13 @@ def deterministic_report(code, name, df, position_state, fundamentals_ok, benchm
         raise RuntimeError("历史数据不足，无法计算指标")
     drow = di.iloc[-1].to_dict()
     drow["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
-    wrow = wi.iloc[-1].to_dict() if len(wi) >= 20 else None
+    if len(wi) < 20:
+        raise RuntimeError("周线历史不足，无法生成中长线决策")
+    wrow = wi.iloc[-1].to_dict()
     score, trend, momentum, weekly, confirm = numeric_score(drow, wrow)
-    weekly_ok = weekly is not None and weekly >= 60
+    if weekly is None:
+        raise RuntimeError("周线计算失败，无法生成中长线决策")
+    weekly_ok = weekly >= 60
     rating = grade(score, weekly_ok, 100)
     stage = stage_from(score, {}, weekly_ok)
 
@@ -1372,7 +1425,7 @@ def build_score_series(df):
         w2.sort_values("w_date"),
         left_on="trade_date", right_on="w_date", direction="backward"
     )
-    scores, buy_scores, rr_list = [], [], []
+    scores, weekly_scores, buy_scores, rr_list = [], [], [], []
     for i,row in m.iterrows():
         r = row.to_dict()
         r["macd_prev"] = m.iloc[i-1]["macd"] if i>0 else np.nan
@@ -1382,12 +1435,16 @@ def build_score_series(df):
                 "boll_slope":row.get("w_boll_slope"), "close":row.get("w_close"),
                 "boll_mid":row.get("w_boll_mid"), "dif":row.get("w_dif"), "dea":row.get("w_dea")
             }
-        tech = numeric_score(r,wr)[0]
+        metric = numeric_score(r,wr)
+        tech = metric[0]
+        weekly_score = metric[3]
         bp, rr, _, _ = entry_quality(r)
         scores.append(tech)
+        weekly_scores.append(weekly_score if weekly_score is not None else np.nan)
         buy_scores.append(bp)
         rr_list.append(rr)
     m["score"] = scores
+    m["weekly_score"] = weekly_scores
     m["buy_score"] = buy_scores
     m["rr"] = rr_list
     return m
@@ -1608,66 +1665,174 @@ def opportunity_label(opp, buy_score, rr, market_score, hist):
         return "候选观察"
     return "一般观察"
 
-def screen_codes(
-    codes, name_map=None, min_score=62, min_buy_score=60, min_rr=1.2,
-    benchmark_df=None, min_market=0
+def historical_edge_summary(hist):
+    weights = {20:0.45,40:0.35,60:0.20}
+    win_total = avg_total = 0.0
+    used = 0.0
+    samples = 0
+    for h,w in weights.items():
+        x = hist.get(h,{})
+        n = int(x.get("样本",0) or 0)
+        win = x.get("胜率")
+        avg = x.get("平均收益")
+        if n <= 0 or pd.isna(win) or pd.isna(avg):
+            continue
+        reliability = min(n/8.0,1.0)
+        adj_win = 0.50 + (float(win)-0.50)*reliability
+        adj_avg = float(avg)*reliability
+        win_total += w*adj_win
+        avg_total += w*adj_avg
+        used += w
+        samples += n
+    if used == 0:
+        return {"综合胜率":np.nan,"综合均收益":np.nan,"样本":0}
+    return {
+        "综合胜率":win_total/used,
+        "综合均收益":avg_total/used,
+        "样本":samples
+    }
+
+def automatic_entry_policy(market_score):
+    # 市场越弱，对技术质量、买点、盈亏比和相对强度要求越高。
+    if market_score >= 70:
+        return {"技术":58,"买点":58,"周线":50,"盈亏比":1.15,"相对强度":45,"机会":66}
+    if market_score >= 50:
+        return {"技术":62,"买点":60,"周线":52,"盈亏比":1.25,"相对强度":48,"机会":68}
+    if market_score >= 35:
+        return {"技术":67,"买点":64,"周线":55,"盈亏比":1.45,"相对强度":52,"机会":72}
+    return {"技术":73,"买点":68,"周线":60,"盈亏比":1.80,"相对强度":58,"机会":76}
+
+def automatic_opportunity_decision(
+    technical,buy_score,weekly,rr,market_score,rs_score,hist,opp
 ):
+    policy = automatic_entry_policy(market_score)
+    summary = historical_edge_summary(hist)
+    if pd.isna(rr):
+        return False,"盈亏比不可计算",policy,summary,np.nan
+
+    breakeven = 1.0/(1.0+max(float(rr),0.01))
+    margin = 0.06 if market_score >= 50 else (0.08 if market_score >= 35 else 0.10)
+    required_win = max(0.48,breakeven+margin)
+
+    checks = [
+        (technical >= policy["技术"], f"技术分<{policy['技术']}"),
+        (buy_score >= policy["买点"], f"买点分<{policy['买点']}"),
+        (weekly is not None and pd.notna(weekly) and weekly >= policy["周线"], f"周线分<{policy['周线']}"),
+        (rr >= policy["盈亏比"], f"盈亏比<{policy['盈亏比']:.2f}"),
+        (rs_score >= policy["相对强度"], f"相对强度<{policy['相对强度']}"),
+        (opp >= policy["机会"], f"机会分<{policy['机会']}")
+    ]
+    for ok,reason in checks:
+        if not ok:
+            return False,reason,policy,summary,required_win
+
+    n = int(summary.get("样本",0) or 0)
+    hist_win = summary.get("综合胜率")
+    hist_avg = summary.get("综合均收益")
+
+    # 样本足够时，让历史胜率/收益直接决定是否通过。
+    if n >= 5:
+        if pd.isna(hist_win) or hist_win < required_win:
+            return False,f"历史综合胜率未超过系统门槛{required_win:.0%}",policy,summary,required_win
+        if pd.isna(hist_avg) or hist_avg <= 0:
+            return False,"历史相似信号综合期望收益≤0",policy,summary,required_win
+    else:
+        # 样本不足时，不假装“胜率可靠”，改用更严格的当前结构门槛。
+        if not (
+            technical >= policy["技术"]+4 and
+            buy_score >= policy["买点"]+4 and
+            rr >= policy["盈亏比"]+0.25 and
+            rs_score >= policy["相对强度"]+4 and
+            opp >= policy["机会"]+3
+        ):
+            return False,"历史样本不足，当前结构未达到加严门槛",policy,summary,required_win
+
+    return True,"系统自动门槛全部通过",policy,summary,required_win
+
+def screen_codes(codes, name_map=None, benchmark_df=None):
     rows = []
     name_map = name_map or {}
     benchmark_df = benchmark_df if benchmark_df is not None else pd.DataFrame()
-    mkt_score, mkt_regime = market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
-    if min_market and mkt_score < min_market:
-        return pd.DataFrame()
+    mkt_score,mkt_regime = market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
+    policy = automatic_entry_policy(mkt_score)
 
     for code in codes:
         try:
-            d = fetch_stock_daily(code, years=1)
+            # 第一步：当前结构快速初筛
+            d = fetch_stock_daily(code,years=1)
             if len(d) < 150:
                 continue
             name = name_map.get(code) or stock_basic_name(code)
             di = add_indicators(d)
             wi = weekly_from_daily(d)
+            if wi.empty:
+                continue
             lr = di.iloc[-1].to_dict()
             lr["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
-            wr = wi.iloc[-1].to_dict() if not wi.empty else None
-            technical, trend, momentum, weekly, confirm = numeric_score(lr, wr)
-            buy_score, rr, stop, target = entry_quality(lr)
+            wr = wi.iloc[-1].to_dict()
+            technical,trend,momentum,weekly,confirm = numeric_score(lr,wr)
+            buy_score,rr,stop,target = entry_quality(lr)
 
-            if technical < min_score or buy_score < min_buy_score:
+            if weekly is None or pd.isna(rr):
                 continue
-            if pd.isna(rr) or rr < min_rr:
-                continue
-            if weekly is not None and weekly < 50:
+            if (
+                technical < policy["技术"]-4 or
+                buy_score < policy["买点"]-4 or
+                weekly < policy["周线"]-5 or
+                rr < max(0.9,policy["盈亏比"]-0.25)
+            ):
                 continue
 
-            hist_df = fetch_stock_daily(code, years=3)
-            rs_score, ex20, ex60 = relative_strength(hist_df, benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
+            # 第二步：补3年历史，计算相对强度与历史相似信号
+            hist_df = fetch_stock_daily(code,years=3)
+            rs_score,ex20,ex60 = relative_strength(hist_df,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
             hist = historical_edge(
-                hist_df, technical, buy_score,
+                hist_df,technical,buy_score,
                 benchmark_df=benchmark_df,
                 current_market_score=mkt_score
             )
             opp = opportunity_score(technical,buy_score,rr,hist,mkt_score,rs_score)
-            label = opportunity_label(opp,buy_score,rr,mkt_score,hist)
+            passed,reason,policy_used,summary,required_win = automatic_opportunity_decision(
+                technical,buy_score,weekly,rr,mkt_score,rs_score,hist,opp
+            )
+            if not passed:
+                continue
 
             def pct(v):
-                return f"{v:.0%}" if pd.notna(v) else "—"
+                return f"{v:.0%}" if v is not None and pd.notna(v) else "—"
             def pct1(v):
-                return f"{v:.1%}" if pd.notna(v) else "—"
+                return f"{v:.1%}" if v is not None and pd.notna(v) else "—"
+
+            hist_win = summary.get("综合胜率")
+            hist_avg = summary.get("综合均收益")
+            safety = (
+                float(hist_win)-float(required_win)
+                if hist_win is not None and pd.notna(hist_win) and required_win is not None and pd.notna(required_win)
+                else np.nan
+            )
 
             rows.append({
-                "代码":display_code(code), "名称":name, "机会状态":label,
-                "机会分/100":opp, "技术分/100":technical, "买点分/100":buy_score,
-                "盈亏比":rr, "大盘":f"{mkt_regime} {mkt_score}/100",
+                "代码":display_code(code),"名称":name,"机会状态":"系统通过",
+                "机会分/100":opp,"技术分/100":technical,"买点分/100":buy_score,
+                "周线/100":weekly,"盈亏比":rr,
+                "历史综合胜率":pct(hist_win),
+                "盈亏平衡+安全门槛":pct(required_win),
+                "胜率安全边际":pct(safety),
+                "历史综合均收益":pct1(hist_avg),
+                "历史样本":summary.get("样本",0),
+                "大盘":f"{mkt_regime} {mkt_score}/100",
                 "相对强度/100":rs_score,
-                "20日超额":pct1(ex20), "60日超额":pct1(ex60),
-                "20日胜率":pct(hist[20]["胜率"]), "20日样本":hist[20]["样本"], "20日均收益":pct1(hist[20]["平均收益"]),
-                "40日胜率":pct(hist[40]["胜率"]), "40日样本":hist[40]["样本"], "40日均收益":pct1(hist[40]["平均收益"]),
-                "60日胜率":pct(hist[60]["胜率"]), "60日样本":hist[60]["样本"], "60日均收益":pct1(hist[60]["平均收益"]),
-                "趋势/100":trend, "动能/100":momentum, "周线/100":weekly, "量能/100":confirm,
+                "20日超额":pct1(ex20),"60日超额":pct1(ex60),
+                "20日胜率":pct(hist[20]["胜率"]),"40日胜率":pct(hist[40]["胜率"]),"60日胜率":pct(hist[60]["胜率"]),
+                "趋势/100":trend,"动能/100":momentum,"量能/100":confirm,
                 "收盘":round(float(lr["close"]),2),
                 "风险位":round(float(stop),2) if pd.notna(stop) else np.nan,
-                "参考压力":round(float(target),2) if pd.notna(target) else np.nan
+                "参考压力":round(float(target),2) if pd.notna(target) else np.nan,
+                "系统规则":(
+                    f"技≥{policy_used['技术']} / 买≥{policy_used['买点']} / "
+                    f"周≥{policy_used['周线']} / RR≥{policy_used['盈亏比']:.2f} / "
+                    f"RS≥{policy_used['相对强度']} / 机会≥{policy_used['机会']}"
+                )
             })
         except Exception:
             continue
@@ -1675,13 +1840,10 @@ def screen_codes(
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values(
-        ["机会分/100","买点分/100","技术分/100"], ascending=False
+        ["机会分/100","买点分/100","技术分/100"],ascending=False
     ).reset_index(drop=True)
 
-def run_backtest(
-    df, benchmark_df, entry_score=65, entry_buy=60, min_rr=1.2,
-    min_market=35, exit_score=48, fee_bps=8
-):
+def run_backtest(df,benchmark_df,fee_bps=8):
     m = build_score_series(df)
     if m.empty or len(m) < 120:
         return pd.DataFrame(), {}
@@ -1691,15 +1853,15 @@ def run_backtest(
         bm2 = bm[["trade_date","close","ret20","ret60","market_score"]].copy()
         bm2.columns = ["trade_date","bm_close","bm_ret20","bm_ret60","market_score"]
         m = pd.merge_asof(
-            m.sort_values("trade_date"), bm2.sort_values("trade_date"),
-            on="trade_date", direction="backward"
+            m.sort_values("trade_date"),bm2.sort_values("trade_date"),
+            on="trade_date",direction="backward"
         )
     else:
         m["market_score"] = 50
         m["bm_ret20"] = np.nan
         m["bm_ret60"] = np.nan
 
-    rs_scores = []
+    rs_scores,tech_req,buy_req,week_req,rr_req,rs_req = [],[],[],[],[],[]
     for _,r in m.iterrows():
         ex20 = r.get("ret20")-r.get("bm_ret20") if pd.notna(r.get("ret20")) and pd.notna(r.get("bm_ret20")) else np.nan
         ex60 = r.get("ret60")-r.get("bm_ret60") if pd.notna(r.get("ret60")) and pd.notna(r.get("bm_ret60")) else np.nan
@@ -1707,30 +1869,36 @@ def run_backtest(
         if pd.notna(ex20): rs += 120*ex20
         if pd.notna(ex60): rs += 60*ex60
         rs_scores.append(clamp(rs))
+        p = automatic_entry_policy(float(r.get("market_score",50) or 50))
+        tech_req.append(p["技术"]); buy_req.append(p["买点"]); week_req.append(p["周线"])
+        rr_req.append(p["盈亏比"]); rs_req.append(p["相对强度"])
+
     m["rs_score"] = rs_scores
+    m["tech_req"] = tech_req
+    m["buy_req"] = buy_req
+    m["week_req"] = week_req
+    m["rr_req"] = rr_req
+    m["rs_req"] = rs_req
 
     m["entry_cond"] = (
-        (m["score"] >= entry_score) &
-        (m["buy_score"] >= entry_buy) &
-        m["rr"].notna() & (m["rr"] >= min_rr) &
-        (m["market_score"] >= min_market) &
-        (m["rs_score"] >= 45)
-    )
-    m["exit_cond"] = (
-        (m["score"] <= exit_score) |
-        ((m["close"] < m["boll_mid"]) & (m["dif"] < m["dea"])) |
-        (m["market_score"] < 25)
+        (m["score"] >= m["tech_req"]) &
+        (m["buy_score"] >= m["buy_req"]) &
+        m["weekly_score"].notna() & (m["weekly_score"] >= m["week_req"]) &
+        m["rr"].notna() & (m["rr"] >= m["rr_req"]) &
+        (m["rs_score"] >= m["rs_req"])
     )
 
     fee = fee_bps/10000.0
-    cash, shares = 1.0, 0.0
+    cash,shares = 1.0,0.0
     pending = None
-    eq, pos = [], []
-    trade_returns, holding_days = [], []
-    trade_start_equity, trade_start_i = None, None
+    eq,pos = [],[]
+    trade_returns,holding_days = [],[]
+    trade_start_equity,trade_start_i = None,None
+    trade_peak_score = None
+    actions = []
 
     for i,row in m.iterrows():
-        openp = float(row["open"]) if pd.notna(row.get("open")) and row.get("open") > 0 else float(row["close"])
+        openp = float(row["open"]) if pd.notna(row.get("open")) and row.get("open")>0 else float(row["close"])
         closep = float(row["close"])
 
         if pending == "buy" and shares == 0:
@@ -1738,53 +1906,68 @@ def run_backtest(
             shares = cash*(1-fee)/openp
             cash = 0.0
             trade_start_i = i
+            trade_peak_score = float(row["score"])
         elif pending == "sell" and shares > 0:
             cash = shares*openp*(1-fee)
             shares = 0.0
-            if trade_start_equity and trade_start_equity > 0:
+            if trade_start_equity and trade_start_equity>0:
                 trade_returns.append(cash/trade_start_equity-1)
                 holding_days.append(int(i-trade_start_i) if trade_start_i is not None else 0)
-            trade_start_equity, trade_start_i = None, None
+            trade_start_equity,trade_start_i,trade_peak_score = None,None,None
 
-        equity = cash if shares == 0 else shares*closep
+        if shares > 0:
+            trade_peak_score = max(float(trade_peak_score or row["score"]),float(row["score"]))
+
+        equity = cash if shares==0 else shares*closep
         eq.append(equity)
-        pos.append(1 if shares > 0 else 0)
+        pos.append(1 if shares>0 else 0)
 
         pending = None
-        if i < len(m)-1:
-            if shares == 0 and bool(row["entry_cond"]):
+        action = "空仓"
+        if shares == 0:
+            if bool(row["entry_cond"]) and i < len(m)-1:
                 pending = "buy"
-            elif shares > 0 and bool(row["exit_cond"]):
+                action = "次日买入"
+        else:
+            exit_now = (
+                float(row["score"]) < 45 or
+                (trade_peak_score is not None and trade_peak_score-float(row["score"]) >= 15 and float(row["score"]) < 65) or
+                (pd.notna(row.get("weekly_score")) and float(row["weekly_score"]) < 45) or
+                (float(row.get("market_score",50)) < 25 and float(row["score"]) < 60)
+            )
+            if exit_now and i < len(m)-1:
                 pending = "sell"
+                action = "次日退出"
+            else:
+                action = "持有"
+        actions.append(action)
 
     m["净值"] = eq
     m["position"] = pos
-    first_open = float(m.iloc[0]["open"]) if pd.notna(m.iloc[0]["open"]) and m.iloc[0]["open"] > 0 else float(m.iloc[0]["close"])
+    m["action"] = actions
+    first_open = float(m.iloc[0]["open"]) if pd.notna(m.iloc[0]["open"]) and m.iloc[0]["open"]>0 else float(m.iloc[0]["close"])
     m["买入持有"] = m["close"]/first_open
 
-    equity = pd.Series(eq, index=m.index)
+    equity = pd.Series(eq,index=m.index)
     total = equity.iloc[-1]-1
     n_years = max((m["trade_date"].iloc[-1]-m["trade_date"].iloc[0]).days/365.25,0.01)
     annual = equity.iloc[-1]**(1/n_years)-1
     dd = (equity/equity.cummax()-1).min()
 
     tr = np.array(trade_returns,dtype=float)
-    wins = tr[tr>0]
-    losses = tr[tr<0]
+    wins = tr[tr>0]; losses = tr[tr<0]
     win_rate = float((tr>0).mean()) if len(tr) else np.nan
     avg_trade = float(tr.mean()) if len(tr) else np.nan
     profit_factor = float(wins.sum()/abs(losses.sum())) if len(losses) and abs(losses.sum())>1e-12 else (np.inf if len(wins) else np.nan)
-    avg_hold = float(np.mean(holding_days)) if holding_days else np.nan
-    exposure = float(np.mean(pos)) if pos else 0.0
 
     metrics = {
-        "累计收益":total, "年化收益":annual, "最大回撤":dd,
-        "交易次数":int(len(tr)), "买入持有":m["买入持有"].iloc[-1]-1,
-        "交易胜率":win_rate, "单笔均收益":avg_trade,
-        "盈亏因子":profit_factor, "平均持有天数":avg_hold,
-        "持仓暴露":exposure
+        "累计收益":total,"年化收益":annual,"最大回撤":dd,
+        "交易次数":int(len(tr)),"买入持有":m["买入持有"].iloc[-1]-1,
+        "交易胜率":win_rate,"单笔均收益":avg_trade,"盈亏因子":profit_factor,
+        "平均持有天数":float(np.mean(holding_days)) if holding_days else np.nan,
+        "持仓暴露":float(np.mean(pos)) if pos else 0.0
     }
-    return m, metrics
+    return m,metrics
 
 def position_action(
     current_score, entry_score, peak_score, weekly_score,
@@ -1896,6 +2079,72 @@ def load_positions(active_only=True):
     df = pd.read_sql_query(q,conn)
     conn.close()
     return df
+
+def import_positions_dataframe(df):
+    if df is None or df.empty:
+        return 0,["文件为空"]
+
+    aliases = {
+        "symbol":["代码","股票代码","code","symbol","股票","名称","股票名称"],
+        "price":["买入均价","成本","成本价","entry_price","price"],
+        "shares":["持股数量","数量","持股","shares","qty"],
+        "date":["买入日期","日期","entry_date","date"],
+        "stop":["技术失效价","失效价","止损价","initial_stop","stop"],
+        "note":["备注","note","memo"]
+    }
+    cols = {str(x).strip():x for x in df.columns}
+
+    def pick(keys):
+        for k in keys:
+            if k in cols:
+                return cols[k]
+        return None
+
+    symbol_col = pick(aliases["symbol"])
+    price_col = pick(aliases["price"])
+    shares_col = pick(aliases["shares"])
+    date_col = pick(aliases["date"])
+    stop_col = pick(aliases["stop"])
+    note_col = pick(aliases["note"])
+
+    if symbol_col is None or price_col is None:
+        return 0,["至少需要“代码/名称”和“买入均价/成本”两列"]
+
+    ok = 0
+    errors = []
+    for idx,row in df.iterrows():
+        try:
+            raw_symbol = str(row.get(symbol_col,"")).strip()
+            if not raw_symbol or raw_symbol.lower()=="nan":
+                continue
+            code,name = resolve_symbol_input(raw_symbol)
+            price = pd.to_numeric(row.get(price_col),errors="coerce")
+            if pd.isna(price) or float(price)<=0:
+                raise ValueError("买入均价无效")
+            shares = pd.to_numeric(row.get(shares_col),errors="coerce") if shares_col else 0
+            shares = 0 if pd.isna(shares) else float(shares)
+
+            entry_date = pd.Timestamp.today().strftime("%Y-%m-%d")
+            if date_col and pd.notna(row.get(date_col)):
+                try:
+                    entry_date = pd.to_datetime(row.get(date_col)).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
+            stop = None
+            if stop_col:
+                v = pd.to_numeric(row.get(stop_col),errors="coerce")
+                if pd.notna(v) and float(v)>0:
+                    stop = float(v)
+            note = ""
+            if note_col and pd.notna(row.get(note_col)):
+                note = str(row.get(note_col))
+
+            upsert_position(code,name,entry_date,float(price),shares,stop,note)
+            ok += 1
+        except Exception as e:
+            errors.append(f"第{idx+2}行：{e}")
+    return ok,errors
 
 def position_history(code, limit=120):
     conn = sqlite3.connect(DB_PATH)
@@ -2055,7 +2304,7 @@ with tab6:
 
 1. **趋势分（满分100）**：BOLL中轨方向、价格相对中轨、带宽状态。  
 2. **动能分（满分100）**：MACD零轴、DIF方向、金叉/死叉、柱体加减速。  
-3. **周线分（满分100）**：周线确认日线；没有周线时不显示该项。  
+3. **周线分（满分100）**：周线是中长线体系的必选过滤器，所有分析、选股、回测都必须有周线。  
 4. **量能分（满分100）**：成交量与背离，只做确认，不抢主导权。成交量读取 **VOL柱 + MA5 + MA10**。  
 
 **总技术分也是100分制：**
@@ -2069,6 +2318,7 @@ with tab6:
 - **盈亏比**：以中轨/20日低点作为风险参考，以20日高点/BOLL上轨作为压力参考。
 - **历史胜率**：该股票过去出现相似技术分和买点分时，未来20日获得正收益的比例。
 - **机会分**：技术25% + 买点25% + 盈亏比15% + 历史相似信号20% + 大盘10% + 相对强度5%。
+- **自动门槛**：用户不再设置技术分/买点分/盈亏比。系统根据大盘强弱动态设定基础门槛，再用当前盈亏比计算盈亏平衡胜率，并要求历史相似信号胜率留出安全边际、综合期望收益为正。
 - **大盘环境**：以沪深300的BOLL、MACD、MA60及20/60日收益评估“顺风/中性/偏弱/逆风”。
 - **相对强度**：比较个股与沪深300的20/60日表现，避免只买“随大盘被动上涨”的股票。
 - **历史统计**：同时看20/40/60日胜率、平均收益和样本量；样本不足时自动降低权重。
@@ -2089,10 +2339,10 @@ with tab1:
     st.divider()
 
     st.subheader("① 自动数据分析")
-    st.caption("输入A股代码即可。系统自动获取日K、聚合周K，并计算BOLL/MACD/VOL；无需上传截图。")
+    st.caption("输入A股6位代码或股票名称均可。系统自动获取日K并生成周K，周线始终参与中长线评分。")
     a1,a2 = st.columns([1.2,1])
     with a1:
-        auto_code = st.text_input("A股代码", placeholder="例如 600519 / 000001 / 300750", key="auto_code")
+        auto_code = st.text_input("股票代码或名称", placeholder="例如 600519 / 贵州茅台 / 宁德时代", key="auto_code")
     with a2:
         auto_horizon = st.selectbox("持有周期", ["2–8周","2–6个月","6–18个月"], index=1, key="auto_horizon")
     a3,a4 = st.columns(2)
@@ -2108,10 +2358,9 @@ with tab1:
             with st.spinner("正在获取行情并计算日线/周线指标..."):
                 try:
                     bs_login()
-                    code = normalize_code(auto_code)
+                    code,name = resolve_symbol_input(auto_code)
                     df_auto = fetch_stock_daily(code, years=3)
                     benchmark_df = fetch_benchmark_daily(years=3)
-                    name = stock_basic_name(code)
                     report = deterministic_report(code, name, df_auto, auto_position, auto_fund, benchmark_df)
                     prev = previous(report["symbol"])
                     if prev and prev.get("score") is not None:
@@ -2163,29 +2412,29 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("目标不是找最高分股票，而是找可执行的交易机会：技术结构 + 当前买点 + 盈亏比 + 历史相似信号。首次扫描会建立缓存，全市场可分批扫描到100%。")
+    st.caption("策略门槛由系统自动决定，不需要手动调技术分、机会分或盈亏比。系统会根据大盘环境、当前盈亏比和历史相似信号胜率自动提高或降低门槛。")
 
-    universe = st.selectbox("选股范围", ["全A股（沪深）","沪深300","中证500","上证50"], index=0)
-    f1,f2,f3 = st.columns(3)
-    with f1:
-        batch_size = st.selectbox("每批扫描", [100,200,300,500], index=2)
-    with f2:
-        min_score = st.slider("最低技术分", 50, 90, 62)
-    with f3:
-        min_buy_score = st.slider("最低买点分", 40, 90, 60)
+    sopt1,sopt2,sopt3 = st.columns(3)
+    with sopt1:
+        universe = st.selectbox("选股范围",["全A股（沪深）","沪深300","中证500","上证50"],index=0)
+    with sopt2:
+        batch_size = st.selectbox("每批扫描",[100,200,300,500],index=2)
+    with sopt3:
+        exclude_st = st.checkbox("排除ST/*ST",value=True)
 
-    g1,g2,g3 = st.columns(3)
-    with g1:
-        min_rr = st.selectbox("最低盈亏比", [0.8,1.0,1.2,1.5,2.0], index=2)
-    with g2:
-        market_filter = st.selectbox("大盘过滤", ["≥35 避开极弱","≥50 中性以上","不硬过滤"], index=0)
-    with g3:
-        exclude_st = st.checkbox("排除ST/*ST", value=True)
-    min_market = 35 if market_filter.startswith("≥35") else (50 if market_filter.startswith("≥50") else 0)
+    scan_market = st.session_state.get("scan_market")
+    if scan_market:
+        p = automatic_entry_policy(scan_market[0])
+        st.info(
+            f"当前大盘：{scan_market[1]} {scan_market[0]}/100。系统基础门槛自动调整为："
+            f"技术≥{p['技术']}、买点≥{p['买点']}、周线≥{p['周线']}、"
+            f"盈亏比≥{p['盈亏比']:.2f}、相对强度≥{p['相对强度']}、机会≥{p['机会']}。"
+            "历史样本足够时，还必须满足“历史综合胜率 > 盈亏平衡胜率 + 安全边际”且综合期望收益>0。"
+        )
 
-    s1,s2 = st.columns(2)
-    start_scan = s1.button("🔎 开始/重新扫描", type="primary", use_container_width=True)
-    continue_scan = s2.button("➡️ 扫描下一批", use_container_width=True)
+    sb1,sb2 = st.columns(2)
+    start_scan = sb1.button("🔎 开始/重新扫描",type="primary",use_container_width=True)
+    continue_scan = sb2.button("➡️ 扫描下一批",use_container_width=True)
 
     if start_scan:
         st.session_state["scan_cursor"] = 0
@@ -2194,15 +2443,16 @@ with tab2:
         st.session_state["scan_done"] = False
 
     if start_scan or continue_scan:
-        with st.spinner("正在获取股票池并扫描本批次..."):
+        with st.spinner("正在按系统自动门槛扫描交易机会..."):
             try:
                 bs_login()
                 benchmark_df = fetch_benchmark_daily(years=3)
-                current_market_score, current_market_regime = market_environment(benchmark_df)
+                current_market_score,current_market_regime = market_environment(benchmark_df)
                 st.session_state["scan_market"] = (current_market_score,current_market_regime)
+
                 pool = fetch_universe(universe)
                 if exclude_st and not pool.empty:
-                    pool = pool[~pool["code_name"].str.upper().str.contains(r"(^ST|\*ST)", regex=True, na=False)]
+                    pool = pool[~pool["code_name"].str.upper().str.contains(r"(^ST|\*ST)",regex=True,na=False)]
                 pool = pool.reset_index(drop=True)
 
                 total = len(pool)
@@ -2212,18 +2462,11 @@ with tab2:
                     st.session_state["scan_results"] = pd.DataFrame()
                     st.session_state["scan_universe"] = universe
 
-                end_i = min(cursor + int(batch_size), total)
+                end_i = min(cursor+int(batch_size),total)
                 batch = pool.iloc[cursor:end_i]
                 codes = batch["code"].tolist()
-                names = dict(zip(batch["code"], batch["code_name"]))
-                batch_result = screen_codes(
-                    codes, names,
-                    min_score=min_score,
-                    min_buy_score=min_buy_score,
-                    min_rr=float(min_rr),
-                    benchmark_df=benchmark_df,
-                    min_market=min_market
-                )
+                names = dict(zip(batch["code"],batch["code_name"]))
+                batch_result = screen_codes(codes,names,benchmark_df=benchmark_df)
 
                 old_result = st.session_state.get("scan_results")
                 if not isinstance(old_result,pd.DataFrame) or old_result.empty:
@@ -2231,14 +2474,16 @@ with tab2:
                 elif batch_result.empty:
                     merged = old_result.copy()
                 else:
-                    merged = pd.concat([old_result,batch_result], ignore_index=True)
-                    merged = merged.drop_duplicates("代码", keep="last")
-                    merged = merged.sort_values(["机会分/100","买点分/100","技术分/100"], ascending=False).reset_index(drop=True)
+                    merged = pd.concat([old_result,batch_result],ignore_index=True)
+                    merged = merged.drop_duplicates("代码",keep="last")
+                    merged = merged.sort_values(
+                        ["机会分/100","买点分/100","技术分/100"],ascending=False
+                    ).reset_index(drop=True)
 
                 st.session_state["scan_results"] = merged
                 st.session_state["scan_cursor"] = end_i
                 st.session_state["scan_total"] = total
-                st.session_state["scan_done"] = end_i >= total
+                st.session_state["scan_done"] = end_i>=total
             except Exception as e:
                 st.error(f"选股失败：{e}")
             finally:
@@ -2247,41 +2492,78 @@ with tab2:
 
     scan_market = st.session_state.get("scan_market")
     if scan_market:
-        st.info(f"大盘环境（沪深300）：{scan_market[1]} · {scan_market[0]}/100。该因子已进入机会分，并按你的“大盘过滤”设置决定是否硬过滤。")
+        p = automatic_entry_policy(scan_market[0])
+        st.info(
+            f"大盘环境（沪深300）：{scan_market[1]} · {scan_market[0]}/100；"
+            f"本轮自动门槛：技≥{p['技术']} / 买≥{p['买点']} / 周≥{p['周线']} / "
+            f"RR≥{p['盈亏比']:.2f} / RS≥{p['相对强度']} / 机会≥{p['机会']}。"
+        )
 
     total = int(st.session_state.get("scan_total",0))
     cursor = int(st.session_state.get("scan_cursor",0))
     result = st.session_state.get("scan_results")
 
-    if total > 0:
+    if total>0:
         pct = min(cursor/total,1.0)
-        st.progress(pct, text=f"已扫描 {cursor:,} / {total:,} 只（{pct:.1%}）")
-        if cursor < total:
-            st.info(f"还有 {total-cursor:,} 只未扫描。点击“扫描下一批”继续，直到100%。")
+        st.progress(pct,text=f"已扫描 {cursor:,} / {total:,} 只（{pct:.1%}）")
+        if cursor<total:
+            st.info(f"还有 {total-cursor:,} 只未扫描。点击“扫描下一批”继续。")
         else:
             st.success("✅ 当前股票池已全部扫描完成。")
 
     if isinstance(result,pd.DataFrame):
         if result.empty:
-            if cursor > 0:
-                st.warning("已扫描部分暂未发现满足条件的标的。")
+            if cursor>0:
+                st.warning("已扫描部分暂未出现通过系统自动门槛的交易机会。")
         else:
-            st.success(f"当前累计筛出 {len(result)} 只候选")
-            st.dataframe(result.head(100), use_container_width=True, hide_index=True)
+            st.success(f"当前累计筛出 {len(result)} 只系统通过候选")
+            st.dataframe(result.head(100),use_container_width=True,hide_index=True)
             st.download_button(
                 "⬇️ 导出当前候选",
                 result.to_csv(index=False).encode("utf-8-sig"),
-                "screen_candidates.csv",
-                "text/csv",
-                use_container_width=True
+                "screen_candidates.csv","text/csv",use_container_width=True
             )
-            st.caption("机会分综合：技术25% + 买点25% + 盈亏比15% + 历史相似信号20% + 大盘10% + 相对强度5%。历史统计覆盖20/40/60日；样本少时会自动降低其影响。")
+            st.caption("系统通过 ≠ 保证盈利。自动门槛的作用是减少低胜率、低盈亏比和逆风环境中的交易。")
 
 with tab3:
     st.subheader("持仓管理")
     st.caption("买入后不再用“买点分”决定去留，核心改为跟踪技术分、技术分变化、周线和大盘环境。")
 
     st.markdown("**管理分区**：≥78 强势持有｜65–77 持有｜55–64 谨慎持有｜45–54 减仓候选｜<45 退出候选。技术分从峰值快速回落、周线转弱或大盘逆风会进一步降档。")
+
+    with st.expander("📥 批量导入持仓", expanded=False):
+        st.caption("支持 CSV / XLSX。至少需要：代码或名称 + 买入均价。可选：持股数量、买入日期、技术失效价、备注。")
+        template_df = pd.DataFrame([
+            {"代码或名称":"600519","买入均价":1450.00,"持股数量":100,"买入日期":pd.Timestamp.today().strftime("%Y-%m-%d"),"技术失效价":"","备注":""},
+            {"代码或名称":"宁德时代","买入均价":300.00,"持股数量":200,"买入日期":pd.Timestamp.today().strftime("%Y-%m-%d"),"技术失效价":"","备注":""}
+        ])
+        st.download_button(
+            "⬇️ 下载批量导入模板",
+            template_df.to_csv(index=False).encode("utf-8-sig"),
+            "positions_import_template.csv","text/csv",use_container_width=True
+        )
+        pos_file = st.file_uploader("选择持仓文件",type=["csv","xlsx"],key="positions_batch_file")
+        if pos_file is not None and st.button("📥 批量导入",type="primary",use_container_width=True):
+            try:
+                if str(pos_file.name).lower().endswith(".xlsx"):
+                    imp = pd.read_excel(pos_file)
+                else:
+                    imp = pd.read_csv(pos_file,dtype=str,encoding="utf-8-sig")
+                # “代码或名称”也作为股票字段识别
+                if "代码或名称" in imp.columns and not any(x in imp.columns for x in ["代码","股票代码","code","symbol","股票","名称","股票名称"]):
+                    imp = imp.rename(columns={"代码或名称":"股票"})
+                bs_login()
+                ok,errs = import_positions_dataframe(imp)
+                if ok:
+                    st.success(f"成功导入/更新 {ok} 只持仓。点击“更新全部持仓”生成最新技术分。")
+                if errs:
+                    st.warning("部分行未导入："+"；".join(errs[:8]))
+                st.session_state.pop("holding_view",None)
+            except Exception as e:
+                st.error(f"批量导入失败：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
 
     with st.expander("➕ 新增 / 更新持仓", expanded=False):
         candidates = st.session_state.get("scan_results")
@@ -2297,7 +2579,7 @@ with tab3:
         default_code = candidate_map.get(source_pick,"")
         p1,p2,p3 = st.columns(3)
         with p1:
-            pos_code = st.text_input("股票代码",value=default_code,placeholder="例如 600519",key="pos_code")
+            pos_code = st.text_input("股票代码或名称",value=default_code,placeholder="例如 600519 / 贵州茅台",key="pos_code")
         with p2:
             pos_price = st.number_input("买入均价",min_value=0.0,value=0.0,step=0.01,key="pos_price")
         with p3:
@@ -2316,8 +2598,7 @@ with tab3:
             else:
                 try:
                     bs_login()
-                    code = normalize_code(pos_code)
-                    name = stock_basic_name(code)
+                    code,name = resolve_symbol_input(pos_code)
                     upsert_position(
                         code,name,str(pos_date),pos_price,pos_shares,
                         pos_stop if pos_stop>0 else None,pos_note
@@ -2405,48 +2686,26 @@ with tab3:
         st.info("暂无持仓。选股后实际买入时，把代码、成本和持股数量加入这里。")
 
 with tab4:
-    st.subheader("交易机会策略回测")
-    st.caption("回测与选股口径对齐：技术分 + 买点分 + 盈亏比 + 大盘环境 + 相对强度。历史相似胜率不参与历史入场，避免未来数据泄漏。信号收盘形成，下一交易日开盘执行。")
-    bt_code = st.text_input("A股代码", placeholder="例如 600519", key="bt_code")
+    st.subheader("自动策略回测")
+    st.caption("这里不再让用户手调技术分、买点分、盈亏比或退出分。回测直接验证选股和持仓管理所使用的同一套自动规则，避免“为了回测好看而调参数”。")
+    bt_code = st.text_input("股票代码或名称",placeholder="例如 600519 / 贵州茅台",key="bt_code")
 
-    b1,b2,b3 = st.columns(3)
-    with b1:
-        years = st.selectbox("回测年限",[3,5],index=1)
-    with b2:
-        entry_score = st.slider("最低技术分",55,85,65,key="bt_tech")
-    with b3:
-        entry_buy = st.slider("最低买点分",45,85,60,key="bt_buy")
+    st.info("固定口径：5年历史、单边交易成本万分之8；入场门槛每天根据当时的大盘环境自动变化；退出使用持仓管理规则。")
 
-    b4,b5,b6 = st.columns(3)
-    with b4:
-        bt_rr = st.selectbox("最低盈亏比",[1.0,1.2,1.5,2.0],index=1,key="bt_rr")
-    with b5:
-        bt_market = st.selectbox("最低大盘分",[25,35,50],index=1,key="bt_market")
-    with b6:
-        exit_score = st.slider("退出技术分",30,60,48,key="bt_exit")
-
-    fee_bps = st.number_input("单边交易成本（万分之一）", min_value=0.0, max_value=30.0, value=8.0, step=1.0)
-
-    if st.button("🧪 开始机会策略回测", type="primary", use_container_width=True):
+    if st.button("🧪 一键自动回测",type="primary",use_container_width=True):
         if not bt_code.strip():
-            st.error("请输入A股代码。")
+            st.error("请输入股票代码或名称。")
         else:
-            with st.spinner("正在读取缓存/补齐行情并执行无未来函数回测..."):
+            with st.spinner("正在执行自动策略回测..."):
                 try:
                     bs_login()
-                    df_bt = fetch_stock_daily(bt_code.strip(), years=years)
-                    benchmark_bt = fetch_benchmark_daily(years=years)
-                    curve, m = run_backtest(
-                        df_bt, benchmark_bt,
-                        entry_score=entry_score,
-                        entry_buy=entry_buy,
-                        min_rr=float(bt_rr),
-                        min_market=int(bt_market),
-                        exit_score=exit_score,
-                        fee_bps=fee_bps
-                    )
+                    code,name = resolve_symbol_input(bt_code)
+                    df_bt = fetch_stock_daily(code,years=5)
+                    benchmark_bt = fetch_benchmark_daily(years=5)
+                    curve,m = run_backtest(df_bt,benchmark_bt,fee_bps=8)
                     st.session_state["bt_curve"] = curve
                     st.session_state["bt_metrics"] = m
+                    st.session_state["bt_symbol"] = f"{name} / {display_code(code)}"
                 except Exception as e:
                     st.error(f"回测失败：{e}")
                 finally:
@@ -2456,29 +2715,33 @@ with tab4:
     m = st.session_state.get("bt_metrics")
     curve = st.session_state.get("bt_curve")
     if isinstance(m,dict) and m:
+        st.markdown(f"### {st.session_state.get('bt_symbol','回测结果')}")
         a,b,c1,c2 = st.columns(4)
-        a.metric("累计收益", f"{m['累计收益']:.1%}")
-        b.metric("年化收益", f"{m['年化收益']:.1%}")
-        c1.metric("最大回撤", f"{m['最大回撤']:.1%}")
-        c2.metric("交易次数", str(m["交易次数"]))
+        a.metric("累计收益",f"{m['累计收益']:.1%}")
+        b.metric("年化收益",f"{m['年化收益']:.1%}")
+        c1.metric("最大回撤",f"{m['最大回撤']:.1%}")
+        c2.metric("交易次数",str(m["交易次数"]))
 
         d1,d2,d3,d4 = st.columns(4)
-        d1.metric("交易胜率", f"{m['交易胜率']:.1%}" if pd.notna(m["交易胜率"]) else "—")
-        d2.metric("单笔均收益", f"{m['单笔均收益']:.1%}" if pd.notna(m["单笔均收益"]) else "—")
+        d1.metric("交易胜率",f"{m['交易胜率']:.1%}" if pd.notna(m["交易胜率"]) else "—")
+        d2.metric("单笔均收益",f"{m['单笔均收益']:.1%}" if pd.notna(m["单笔均收益"]) else "—")
         pf = m["盈亏因子"]
-        d3.metric("盈亏因子", f"{pf:.2f}" if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else "—"))
-        d4.metric("持仓暴露", f"{m['持仓暴露']:.1%}")
+        d3.metric("盈亏因子",f"{pf:.2f}" if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else "—"))
+        d4.metric("持仓暴露",f"{m['持仓暴露']:.1%}")
 
         st.caption(
             f"同期买入持有：{m['买入持有']:.1%}"
-            + (f" · 平均持有 {m['平均持有天数']:.0f} 天" if pd.notna(m["平均持有天数"]) else "")
+            +(f" · 平均持有 {m['平均持有天数']:.0f} 天" if pd.notna(m["平均持有天数"]) else "")
         )
         if isinstance(curve,pd.DataFrame) and not curve.empty:
-            st.line_chart(curve.set_index("trade_date")[["净值","买入持有"]], height=280)
-            with st.expander("查看最近机会信号"):
-                cols = [x for x in ["trade_date","close","score","buy_score","rr","market_score","rs_score","entry_cond","exit_cond","position"] if x in curve.columns]
-                st.dataframe(curve[cols].tail(80), use_container_width=True, hide_index=True)
-        st.warning("回测用于验证历史期望，不保证未来收益。真实交易仍会受到滑点、涨跌停、停牌、成交冲击和参数过拟合影响。")
+            st.line_chart(curve.set_index("trade_date")[["净值","买入持有"]],height=280)
+            with st.expander("查看最近自动信号"):
+                cols = [x for x in [
+                    "trade_date","close","score","weekly_score","buy_score","rr",
+                    "market_score","rs_score","tech_req","buy_req","week_req","rr_req","action","position"
+                ] if x in curve.columns]
+                st.dataframe(curve[cols].tail(100),use_container_width=True,hide_index=True)
+        st.warning("回测用于检验历史期望，不保证未来收益；5年单股样本仍可能有限，重点看盈亏因子、回撤、交易次数和稳定性，而不是只看累计收益。")
 
 with tab5:
     st.subheader("历史记录与信号演化")
