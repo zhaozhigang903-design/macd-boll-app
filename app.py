@@ -4994,6 +4994,7 @@ with tab8:
                         )
                     else:
                         st.success(f"本批完成 {batch_out.get('processed',0)} 只。")
+                    st.session_state.pop(f"research_summary_bundle::{selected_run}",None)
                     st.rerun()
                 except Exception as e:
                     st.error(f"研究批次失败：{e}")
@@ -5001,7 +5002,24 @@ with tab8:
                     try: bs.logout()
                     except Exception: pass
 
-        summary,stock_results,research_trades,portfolio_curve,calibration=research_summary(selected_run)
+        summary_key=f"research_summary_bundle::{selected_run}"
+        sr1,sr2=st.columns([1.2,1])
+        refresh_summary=sr1.button("📊 刷新研究汇总",use_container_width=True)
+        sr2.caption("组合日级净值、Bootstrap和EV校准计算量较大，只在你点击时刷新，避免拖慢整个App。")
+        if refresh_summary:
+            with st.spinner("正在计算系统级EV、Bootstrap、Purged OOS与日级组合净值..."):
+                try:
+                    st.session_state[summary_key]=research_summary(selected_run)
+                except Exception as e:
+                    st.error(f"研究汇总计算失败：{e}")
+
+        bundle=st.session_state.get(summary_key)
+        if bundle is None:
+            st.info("研究批次结果已保存。点击“刷新研究汇总”计算当前系统级结果。")
+            summary=stock_results=research_trades=portfolio_curve=calibration=None
+        else:
+            summary,stock_results,research_trades,portfolio_curve,calibration=bundle
+
         if summary is not None:
             st.markdown("### ① 系统级Edge")
             s1,s2,s3,s4=st.columns(4)
