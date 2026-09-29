@@ -566,6 +566,21 @@ def init_db():
     ON research_members(run_id,code)
     """)
     conn.execute("""
+    CREATE TABLE IF NOT EXISTS research_membership(
+      run_id TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      code TEXT NOT NULL,
+      name TEXT,
+      market TEXT,
+      PRIMARY KEY(run_id,period_start,code)
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_research_membership_run_code_date
+    ON research_membership(run_id,code,period_start,period_end)
+    """)
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS research_stock_results(
       run_id TEXT NOT NULL,
       code TEXT NOT NULL,
@@ -595,6 +610,10 @@ def init_db():
       exit_date TEXT,
       return_pct REAL,
       r_multiple REAL,
+      entry_price REAL,
+      exit_price REAL,
+      stop_price REAL,
+      initial_risk_pct REAL,
       holding_days INTEGER,
       technical_score REAL,
       buy_score REAL,
@@ -610,6 +629,12 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_research_trades_run_date
     ON research_trades(run_id,signal_date)
     """)
+    rtcols={r[1] for r in conn.execute("PRAGMA table_info(research_trades)").fetchall()}
+    for cname,ctype in {
+        "entry_price":"REAL","exit_price":"REAL","stop_price":"REAL","initial_risk_pct":"REAL"
+    }.items():
+        if cname not in rtcols:
+            conn.execute(f"ALTER TABLE research_trades ADD COLUMN {cname} {ctype}")
     fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
     if "rule_version" not in fcols:
         conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
