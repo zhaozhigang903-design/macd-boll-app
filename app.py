@@ -1153,11 +1153,182 @@ def fetch_universe(kind):
     out["code_name"] = df[name_col].astype(str) if name_col else out["code"]
     return out.drop_duplicates("code").reset_index(drop=True)
 
-def screen_codes(codes, name_map=None, min_score=62):
+def build_score_series(df):
+    d = add_indicators(df)
+    w = weekly_from_daily(df)
+    if d.empty or w.empty:
+        return pd.DataFrame()
+    w2 = w[["trade_date","boll_mid","boll_slope","close","dif","dea"]].copy()
+    w2.columns = ["w_date","w_boll_mid","w_boll_slope","w_close","w_dif","w_dea"]
+    m = pd.merge_asof(
+        d.sort_values("trade_date"),
+        w2.sort_values("w_date"),
+        left_on="trade_date", right_on="w_date", direction="backward"
+    )
+    scores = []
+    buy_scores = []
+    rr_list = []
+    for i,row in m.iterrows():
+        r = row.to_dict()
+        r["macd_prev"] = m.iloc[i-1]["macd"] if i>0 else np.nan
+        wr = None
+        if pd.notna(row.get("w_date")):
+            wr = {
+                "boll_slope":row.get("w_boll_slope"), "close":row.get("w_close"),
+                "boll_mid":row.get("w_boll_mid"), "dif":row.get("w_dif"), "dea":row.get("w_dea")
+            }
+        score = numeric_score(r,wr)[0]
+        bp, rr, _, _ = entry_quality(r)
+        scores.append(score)
+        buy_scores.append(bp)
+        rr_list.append(rr)
+    m["score"] = scores
+    m["buy_score"] = buy_scores
+    m["rr"] = rr_list
+    return m
+
+def entry_quality(r):
+    close = r.get("close",np.nan)
+    mid = r.get("boll_mid",np.nan)
+    upper = r.get("boll_up",np.nan)
+    low20 = r.get("low20",np.nan)
+    high20 = r.get("high20",np.nan)
+    slope = r.get("boll_slope",np.nan)
+    dif = r.get("dif",np.nan)
+    dea = r.get("dea",np.nan)
+    vol = r.get("vol",np.nan)
+    v5 = r.get("vol_ma5",np.nan)
+    v10 = r.get("vol_ma10",np.nan)
+
+    if pd.isna(close) or close <= 0:
+        return 0, np.nan, np.nan, np.nan
+
+    score = 0
+
+    # 位置：中轨上方但不过度乖离最理想
+    if pd.notna(mid) and mid > 0:
+        dist_mid = close/mid - 1
+        if 0 <= dist_mid <= 0.035:
+            score += 35
+        elif -0.02 <= dist_mid < 0:
+            score += 24
+        elif 0.035 < dist_mid <= 0.07:
+            score += 20
+        elif dist_mid > 0.10:
+            score += 5
+        else:
+            score += 12
+    else:
+        score += 12
+
+    # 趋势：只奖励向上趋势
+    if pd.notna(slope) and slope > 0:
+        score += 25
+    elif pd.notna(slope) and slope < 0:
+        score += 4
+    else:
+        score += 12
+
+    # 动能：零轴上金叉最好；零轴下反弹不追高
+    if pd.notna(dif) and pd.notna(dea):
+        if dif > 0 and dea > 0 and dif > dea:
+            score += 22
+        elif dif > dea:
+            score += 14
+        else:
+            score += 5
+    else:
+        score += 8
+
+    # 量能：温和高于均量优于极端放量或明显缩量
+    if pd.notna(vol) and pd.notna(v5) and pd.notna(v10) and v5 > 0 and v10 > 0:
+        ratio = vol/max(v5,v10)
+        if 1.0 <= ratio <= 1.6:
+            score += 18
+        elif 0.75 <= ratio < 1.0:
+            score += 12
+        elif ratio > 2.0:
+            score += 7
+        else:
+            score += 9
+    else:
+        score += 8
+
+    # 过度靠近上轨/20日高点时降分，避免“强但追高”
+    overextended = False
+    if pd.notna(upper) and upper > 0 and close >= upper*0.985:
+        score -= 12
+        overextended = True
+    if pd.notna(high20) and high20 > 0 and close >= high20*0.985:
+        score -= 8
+        overextended = True
+
+    # 风险收益：用最近可见支撑与20日高点/上轨构造，不人为保证目标价
+    supports = [x for x in [mid,low20] if pd.notna(x) and x < close]
+    stop = max(supports) if supports else np.nan
+    targets = [x for x in [high20,upper] if pd.notna(x) and x > close]
+    target = min(targets) if targets else np.nan
+    rr = np.nan
+    if pd.notna(stop) and pd.notna(target) and close > stop:
+        rr = (target-close)/(close-stop)
+
+    score = int(clamp(score))
+    if overextended and score > 75:
+        score = 75
+    return score, (round(float(rr),2) if pd.notna(rr) else np.nan), stop, target
+
+def historical_edge(df, current_score, current_buy_score, horizon=20):
+    m = build_score_series(df)
+    if m.empty or len(m) < horizon + 80:
+        return {"样本":0,"胜率":np.nan,"平均收益":np.nan,"中位收益":np.nan}
+
+    m["fwd"] = m["close"].shift(-horizon)/m["close"] - 1
+    lo = max(0,current_score-5)
+    hi = min(100,current_score+5)
+
+    # 相似信号：技术分接近 + 买点分不低于当前附近；每20天只取一个，减少同一波行情重复计数
+    cand = m[
+        (m["score"]>=lo) & (m["score"]<=hi) &
+        (m["buy_score"]>=max(50,current_buy_score-10)) &
+        m["fwd"].notna()
+    ].copy()
+    if cand.empty:
+        return {"样本":0,"胜率":np.nan,"平均收益":np.nan,"中位收益":np.nan}
+
+    picked = []
+    last_i = -999
+    for idx in cand.index:
+        pos = m.index.get_loc(idx)
+        if pos-last_i >= horizon:
+            picked.append(idx)
+            last_i = pos
+    s = cand.loc[picked,"fwd"] if picked else pd.Series(dtype=float)
+    if s.empty:
+        return {"样本":0,"胜率":np.nan,"平均收益":np.nan,"中位收益":np.nan}
+    return {
+        "样本":int(len(s)),
+        "胜率":float((s>0).mean()),
+        "平均收益":float(s.mean()),
+        "中位收益":float(s.median())
+    }
+
+def opportunity_score(technical, buy_score, rr, hist):
+    # 机会分只做排序：技术40% + 买点35% + 盈亏比15% + 历史样本10%
+    rr_score = 35
+    if pd.notna(rr):
+        rr_score = clamp(rr/3.0*100)
+    hist_score = 50
+    if hist.get("样本",0) >= 5 and pd.notna(hist.get("胜率")):
+        hist_score = clamp(hist["胜率"]*100)
+    score = 0.40*technical + 0.35*buy_score + 0.15*rr_score + 0.10*hist_score
+    return round(float(score),1)
+
+def screen_codes(codes, name_map=None, min_score=62, min_buy_score=60, min_rr=1.2):
     rows = []
     name_map = name_map or {}
     for code in codes:
         try:
+            # 第一阶段：用缓存/1年数据快速判断当前技术结构
             d = fetch_stock_daily(code, years=1)
             if len(d) < 150:
                 continue
@@ -1167,19 +1338,43 @@ def screen_codes(codes, name_map=None, min_score=62):
             lr = di.iloc[-1].to_dict()
             lr["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
             wr = wi.iloc[-1].to_dict() if not wi.empty else None
-            score, trend, momentum, weekly, confirm = numeric_score(lr, wr)
-            if score >= min_score and (weekly is None or weekly >= 50):
-                rows.append({
-                    "代码":display_code(code), "名称":name,
-                    "技术分/100":score, "趋势/100":trend, "动能/100":momentum,
-                    "周线/100":weekly, "量能/100":confirm,
-                    "收盘":round(float(lr["close"]),2)
-                })
+            technical, trend, momentum, weekly, confirm = numeric_score(lr, wr)
+            buy_score, rr, stop, target = entry_quality(lr)
+
+            if technical < min_score or buy_score < min_buy_score:
+                continue
+            if pd.notna(rr) and rr < min_rr:
+                continue
+            if weekly is not None and weekly < 50:
+                continue
+
+            # 第二阶段：只对初筛通过者补3年历史，统计相似信号20日表现
+            hist_df = fetch_stock_daily(code, years=3)
+            hist = historical_edge(hist_df, technical, buy_score, horizon=20)
+            opp = opportunity_score(technical,buy_score,rr,hist)
+
+            rows.append({
+                "代码":display_code(code), "名称":name,
+                "机会分/100":opp,
+                "技术分/100":technical,
+                "买点分/100":buy_score,
+                "盈亏比":rr if pd.notna(rr) else np.nan,
+                "20日胜率":hist["胜率"],
+                "样本":hist["样本"],
+                "20日均收益":hist["平均收益"],
+                "趋势/100":trend, "动能/100":momentum,
+                "周线/100":weekly, "量能/100":confirm,
+                "收盘":round(float(lr["close"]),2),
+                "风险位":round(float(stop),2) if pd.notna(stop) else np.nan,
+                "参考压力":round(float(target),2) if pd.notna(target) else np.nan
+            })
         except Exception:
             continue
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["技术分/100","周线/100"], ascending=False).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(
+        ["机会分/100","买点分/100","技术分/100"], ascending=False
+    ).reset_index(drop=True)
 
 def run_backtest(df, entry_score=78, exit_score=48, fee_bps=8):
     d = add_indicators(df)
@@ -1274,6 +1469,14 @@ with tab5:
 - 有周线：趋势38% + 动能30% + 周线22% + 量能10%
 - 无周线：趋势50% + 动能35% + 量能15%  
 
+**选股目标：寻找交易机会，不是寻找最高技术分。**
+
+- **技术分**：这只股票的趋势/动能是否值得关注。
+- **买点分**：当前价格位置是否适合介入，越追高分数越低。
+- **盈亏比**：以中轨/20日低点作为风险参考，以20日高点/BOLL上轨作为压力参考。
+- **历史胜率**：该股票过去出现相似技术分和买点分时，未来20日获得正收益的比例。
+- **机会分**：技术40% + 买点35% + 盈亏比15% + 历史胜率10%，用于候选排序，不代表上涨概率。
+
 **关键原则**
 - 零轴下金叉 = 先看修复，不把反弹当反转。
 - BOLL中轨向下时，买入类信号天然降级。
@@ -1361,7 +1564,7 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("支持全沪深A股。首次扫描会建立本地日线缓存；以后重复扫描主要补最新交易日，速度会明显提升。全市场分批扫描可连续到100%。")
+    st.caption("目标不是找最高分股票，而是找可执行的交易机会：技术结构 + 当前买点 + 盈亏比 + 历史相似信号。首次扫描会建立缓存，全市场可分批扫描到100%。")
 
     universe = st.selectbox("选股范围", ["全A股（沪深）","沪深300","中证500","上证50"], index=0)
     f1,f2,f3 = st.columns(3)
@@ -1370,6 +1573,12 @@ with tab2:
     with f2:
         min_score = st.slider("最低技术分", 50, 90, 62)
     with f3:
+        min_buy_score = st.slider("最低买点分", 40, 90, 60)
+
+    g1,g2 = st.columns(2)
+    with g1:
+        min_rr = st.selectbox("最低盈亏比", [0.8,1.0,1.2,1.5,2.0], index=2)
+    with g2:
         exclude_st = st.checkbox("排除ST/*ST", value=True)
 
     s1,s2 = st.columns(2)
@@ -1402,7 +1611,12 @@ with tab2:
                 batch = pool.iloc[cursor:end_i]
                 codes = batch["code"].tolist()
                 names = dict(zip(batch["code"], batch["code_name"]))
-                batch_result = screen_codes(codes, names, min_score=min_score)
+                batch_result = screen_codes(
+                    codes, names,
+                    min_score=min_score,
+                    min_buy_score=min_buy_score,
+                    min_rr=float(min_rr)
+                )
 
                 old_result = st.session_state.get("scan_results")
                 if not isinstance(old_result,pd.DataFrame) or old_result.empty:
@@ -1412,7 +1626,7 @@ with tab2:
                 else:
                     merged = pd.concat([old_result,batch_result], ignore_index=True)
                     merged = merged.drop_duplicates("代码", keep="last")
-                    merged = merged.sort_values(["技术分/100","周线/100"], ascending=False).reset_index(drop=True)
+                    merged = merged.sort_values(["机会分/100","买点分/100","技术分/100"], ascending=False).reset_index(drop=True)
 
                 st.session_state["scan_results"] = merged
                 st.session_state["scan_cursor"] = end_i
@@ -1450,7 +1664,7 @@ with tab2:
                 "text/csv",
                 use_container_width=True
             )
-            st.caption("候选表按技术分排序；技术分不是上涨概率，仍需结合基本面、估值和组合风险。")
+            st.caption("候选表按“机会分”排序：技术结构只是第一层，还同时考虑当前买点、盈亏比和历史相似信号。胜率来自该股票历史相似信号的20日正收益比例；样本少时参考价值有限。")
 
 with tab3:
     st.subheader("策略回测")
