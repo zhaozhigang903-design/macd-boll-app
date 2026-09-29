@@ -906,7 +906,7 @@ def normalize_code(code):
     digits = re.sub(r"\D","",s)
     if not digits:
         return s
-    if hk_hint or len(digits) == 5:
+    if hk_hint or (1 <= len(digits) <= 5):
         return "hk." + digits.zfill(5)[-5:]
     if len(digits) == 6:
         if digits.startswith(("5","6","9")):
@@ -943,24 +943,69 @@ def bs_login():
         raise RuntimeError("BaoStock登录失败：" + lg.error_msg)
     return lg
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def hk_universe_snapshot():
-    try:
-        df = ak.stock_hk_main_board_spot_em()
-    except Exception:
-        df = ak.stock_hk_spot_em()
+def _normalize_hk_name(v):
+    s = str(v or "").strip()
+    s = re.sub(r"\s+","",s)
+    s = s.replace("－","-").replace("—","-")
+    # 港股名称常见股份类别/第二上市后缀；匹配时忽略后缀，但展示仍保留原名
+    s = re.sub(r"(?i)-(SW|S|W|R|B)$","",s)
+    return s.upper()
+
+def _hk_spot_to_universe(df):
     if df is None or df.empty:
         return pd.DataFrame(columns=["code","code_name","latest","amount"])
-    code_col = "代码" if "代码" in df.columns else df.columns[0]
-    name_col = "名称" if "名称" in df.columns else ("中文名称" if "中文名称" in df.columns else None)
-    out = pd.DataFrame()
+    code_col = "代码" if "代码" in df.columns else None
+    name_col = (
+        "名称" if "名称" in df.columns
+        else ("中文名称" if "中文名称" in df.columns else None)
+    )
+    if code_col is None or name_col is None:
+        return pd.DataFrame(columns=["code","code_name","latest","amount"])
+
     raw_code = df[code_col].astype(str).str.extract(r"(\d+)")[0].fillna("")
+    out = pd.DataFrame(index=df.index)
     out["code"] = "hk." + raw_code.str.zfill(5).str[-5:]
-    out["code_name"] = df[name_col].astype(str).str.strip() if name_col else out["code"]
+    out["code_name"] = df[name_col].astype(str).str.strip()
     out["latest"] = pd.to_numeric(df["最新价"],errors="coerce") if "最新价" in df.columns else np.nan
     out["amount"] = pd.to_numeric(df["成交额"],errors="coerce") if "成交额" in df.columns else np.nan
-    out = out[out["code"].str.match(r"^hk\.\d{5}$")]
+    out = out[
+        out["code"].str.match(r"^hk\.\d{5}$") &
+        out["code_name"].ne("") &
+        out["code_name"].str.lower().ne("nan")
+    ]
     return out.drop_duplicates("code").reset_index(drop=True)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def hk_universe_snapshot():
+    frames = []
+    errors = []
+
+    # 多数据源并行兜底思路：东财主板 -> 东财全港股 -> 新浪全港股 -> 东财知名港股
+    getters = [
+        ("东财主板", lambda: ak.stock_hk_main_board_spot_em()),
+        ("东财全港股", lambda: ak.stock_hk_spot_em()),
+        ("新浪全港股", lambda: ak.stock_hk_spot()),
+        ("东财知名港股", lambda: ak.stock_hk_famous_spot_em()),
+    ]
+    for label,getter in getters:
+        try:
+            x = _hk_spot_to_universe(getter())
+            if not x.empty:
+                frames.append(x)
+                # 主板或全港股任一拿到大表后即可满足名称查询；继续尝试会拖慢页面
+                if len(x) > 500:
+                    break
+        except Exception as ex:
+            errors.append(f"{label}:{ex}")
+
+    if not frames:
+        return pd.DataFrame(columns=["code","code_name","latest","amount"])
+
+    out = pd.concat(frames,ignore_index=True)
+    # 信息更完整的行优先
+    out["_info"] = out["latest"].notna().astype(int) + out["amount"].notna().astype(int)
+    out = out.sort_values("_info",ascending=False).drop_duplicates("code",keep="first").drop(columns="_info")
+    return out.reset_index(drop=True)
 
 def _a_name_matches(s):
     rows = []
@@ -1000,9 +1045,11 @@ def resolve_symbol_input(value):
 
     try:
         hk = hk_universe_snapshot()
-        exact = hk[hk["code_name"].astype(str).str.strip() == clean_name]
-        for _,row in exact.iterrows():
-            matches.append((str(row["code"]),str(row["code_name"]),"港股"))
+        if not hk.empty:
+            target_hk_name = _normalize_hk_name(clean_name)
+            exact = hk[hk["code_name"].map(_normalize_hk_name) == target_hk_name]
+            for _,row in exact.iterrows():
+                matches.append((str(row["code"]),str(row["code_name"]),"港股"))
     except Exception:
         hk = pd.DataFrame()
 
@@ -1025,7 +1072,9 @@ def resolve_symbol_input(value):
     try:
         if "hk" not in locals() or hk.empty:
             hk = hk_universe_snapshot()
-        hh = hk[hk["code_name"].astype(str).str.contains(re.escape(clean_name),na=False)]
+        target_hk_name = _normalize_hk_name(clean_name)
+        hk_names = hk["code_name"].map(_normalize_hk_name)
+        hh = hk[hk_names.str.contains(re.escape(target_hk_name),na=False)]
         for _,row in hh.head(8).iterrows():
             candidates.append((str(row["code"]),str(row["code_name"]),"港股"))
     except Exception:
@@ -1041,7 +1090,7 @@ def resolve_symbol_input(value):
     if len(candidates) > 1:
         choices = "、".join([f"{x[1]}({display_code(x[0])},{x[2]})" for x in candidates[:6]])
         raise ValueError(f"名称不唯一，请输入更完整名称或代码。匹配到：{choices}")
-    raise ValueError(f"未找到股票：{s}")
+    raise ValueError(f"未找到股票：{s}。港股名称查询依赖港股股票池接口；若上游暂时不可用，可先输入港股代码，例如腾讯控股输入 0700 或 00700。")
 
 def stock_basic_name(code):
     code = normalize_code(code)
@@ -2755,7 +2804,7 @@ with tab1:
     st.caption("支持A股和港股。可输入6位A股代码、5位港股代码或股票名称；系统自动识别市场并使用对应基准。")
     a1,a2 = st.columns([1.2,1])
     with a1:
-        auto_code = st.text_input("股票代码或名称", placeholder="例如 600519 / 贵州茅台 / 00700 / 腾讯控股", key="auto_code")
+        auto_code = st.text_input("股票代码或名称", placeholder="例如 600519 / 贵州茅台 / 0700 / 腾讯控股", key="auto_code")
     with a2:
         auto_horizon = st.selectbox("持有周期", ["2–8周","2–6个月","6–18个月"], index=1, key="auto_horizon")
     a3,a4 = st.columns(2)
