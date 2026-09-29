@@ -14,7 +14,7 @@ from openai import OpenAI
 from engine import (
     ACTION_CN, backtest, confidence_score, decision, evidence_rows,
     normalize_tf, rating, risk_position_reference, score_breakdown,
-    stage, technical_score
+    stage, technical_score, transition_conditions, validate_extraction
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -435,6 +435,10 @@ with tab_decision:
 
         score, dscore, wscore = technical_score(daily, weekly)
         conf = confidence_score(daily, weekly)
+        extraction_issues, extraction_penalty = validate_extraction(daily, weekly)
+        conf = max(0, conf - extraction_penalty)
+        if data.get("global",{}).get("is_intraday_unclosed"):
+            conf = max(0, conf - 10)
         rtg = rating(score)
         stg = stage(daily, weekly)
 
@@ -452,6 +456,7 @@ with tab_decision:
             compare_text = f"{direction}：评分 {old:.0f} → {score:.0f}（{delta:+.0f}）"
 
         pos_ref = risk_position_reference(daily, risk_budget, max_single)
+        upgrades, downgrades = transition_conditions(daily, weekly)
 
         if data.get("global",{}).get("is_intraday_unclosed"):
             st.warning("⚠️ 当前截图可能是盘中数据：收盘前BOLL和MACD信号仍可能变化。")
@@ -469,6 +474,8 @@ with tab_decision:
             st.warning("中长线系统缺少周线截图：当前结论只适合做日线观察，主动建仓/加仓会被自动降级。")
         if conf < 70:
             st.warning("证据置信度低于70%。建议上传更清晰、指标更完整的截图后再做仓位决策。")
+        for issue in extraction_issues:
+            st.warning("数据一致性检查：" + issue)
         if daily.get("image_quality",0) and int(daily.get("image_quality",0)) < 65:
             st.warning("日线截图质量偏低：关键数值可能识别错误，建议重新截图。")
         if weekly.get("visible") and int(weekly.get("image_quality",0) or 0) < 65:
@@ -503,6 +510,23 @@ with tab_decision:
         st.dataframe(pd.DataFrame(score_rows,columns=["因子","日线得分","周线得分"]),hide_index=True,width="stretch")
 
         st.subheader("3. 关键位与执行条件")
+        ucol,dcol = st.columns(2)
+        with ucol:
+            st.markdown("### 升级条件")
+            if upgrades:
+                for x in upgrades:
+                    st.markdown(f"- {x}")
+            else:
+                st.write("当前已接近高质量趋势状态。")
+        with dcol:
+            st.markdown("### 降级/失效条件")
+            if downgrades:
+                for x in downgrades:
+                    st.markdown(f"- {x}")
+            else:
+                st.write("截图中暂未形成清晰失效位。")
+
+        st.markdown("### 关键价格")
         key_rows = [
             ["现价",fmt_num(daily.get("price"))],
             ["日线BOLL中轨",fmt_num(daily.get("boll_mid"))],
@@ -517,6 +541,15 @@ with tab_decision:
                 ["周线压力",fmt_num(weekly.get("resistance_1"))],
             ]
         st.dataframe(pd.DataFrame(key_rows,columns=["关键位","数值"]),hide_index=True,width="stretch")
+
+        try:
+            current_price = float(str(daily.get("price","")).replace(",",""))
+            holding_cost = float(str(cost).replace(",","")) if cost else None
+            if holding_cost and holding_cost > 0:
+                pnl = current_price/holding_cost - 1
+                st.caption(f"相对持仓成本浮动：{pnl:+.1%}。系统不会因为盈亏本身改变趋势判断，避免成本锚定。")
+        except Exception:
+            pass
 
         if pos_ref:
             st.markdown("### 风险预算仓位参考")
@@ -556,7 +589,9 @@ with tab_decision:
             "result":{
                 "score":score,"daily_score":dscore,"weekly_score":wscore,
                 "confidence":conf,"rating":rtg,"stage":stg,"action":action,
-                "reasons":reasons,"compare":compare_text,"position_reference":pos_ref
+                "reasons":reasons,"compare":compare_text,"position_reference":pos_ref,
+                "upgrade_conditions":upgrades,"downgrade_conditions":downgrades,
+                "extraction_issues":extraction_issues
             }
         }
         save_record(symbol.strip(), market, score, rtg, action, stg, dscore, wscore, conf, decision_text, payload)
