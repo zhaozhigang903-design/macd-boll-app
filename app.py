@@ -710,11 +710,12 @@ with tab_history:
 with tab_backtest:
     st.subheader("规则回测")
     st.caption("这里验证的是核心技术规则，而不是DeepSeek的主观判断。回测不能证明未来收益，但可以排除明显无效的规则。")
-    csv_file = st.file_uploader(
-        "上传日线CSV",
+    csv_files = st.file_uploader(
+        "上传一个或多个日线CSV",
         type=["csv"],
         key="bt_csv",
-        help="至少包含 Date 和 Close 列；Date不是必需，但有日期才能计算年化收益。"
+        accept_multiple_files=True,
+        help="至少包含 Date 和 Close 列。建议每个标的提供3年以上数据，用多标的检验规则稳健性。"
     )
     p1,p2 = st.columns(2)
     with p1:
@@ -728,36 +729,60 @@ with tab_backtest:
 
     st.caption("回测按收盘信号、下一根K线生效，避免使用未来数据。启用周线过滤时，CSV必须有Date/Datetime列。")
 
-    if csv_file and st.button("运行回测",type="primary",width="stretch"):
-        try:
-            x = pd.read_csv(csv_file)
-            bt = backtest(x,fee,boll_n,int(fast),int(slow),int(sig),weekly_filter)
-            m1,m2,m3,m4 = st.columns(4)
-            m1.metric("策略总收益",pct(bt["total_return"]))
-            m2.metric("买入持有",pct(bt["benchmark_return"]))
-            m3.metric("最大回撤",pct(bt["max_drawdown"]))
-            m4.metric("交易次数",bt["trades"])
-            m5,m6,m7,m8 = st.columns(4)
-            m5.metric("年化收益",pct(bt["cagr"]))
-            m6.metric("胜率",pct(bt["win_rate"]))
-            pf = bt["profit_factor"]
-            m7.metric("Profit Factor", "—" if pd.isna(pf) else f"{pf:.2f}")
-            mar = bt["mar"]
-            m8.metric("MAR", "—" if pd.isna(mar) else f"{mar:.2f}")
-            e1,e2,e3 = st.columns(3)
-            payoff = bt["payoff"]
-            e1.metric("平均单笔期望",pct(bt["expectancy"]))
-            e2.metric("盈亏比", "—" if pd.isna(payoff) else f"{payoff:.2f}")
-            e3.metric("持仓暴露",pct(bt["exposure"]))
-            st.line_chart(bt["curve"],height=280)
-            if bt["oos"]:
-                st.info(
-                    f"后30%样本检验：收益 {bt['oos']['return']:.1%}，"
-                    f"最大回撤 {bt['oos']['max_drawdown']:.1%}。"
-                )
-            st.warning("不要针对单一标的反复调参数追求漂亮历史曲线；真正要看跨标的、跨周期、样本外稳定性，以及回撤是否可承受。")
-        except Exception as e:
-            st.error(f"回测失败：{e}")
+    if csv_files and st.button("运行回测",type="primary",width="stretch"):
+        summaries = []
+        curves = {}
+        errors = []
+        for file in csv_files:
+            try:
+                x = pd.read_csv(file)
+                bt = backtest(x,fee,boll_n,int(fast),int(slow),int(sig),weekly_filter)
+                summaries.append({
+                    "标的":file.name.rsplit(".",1)[0],
+                    "总收益":bt["total_return"],
+                    "买入持有":bt["benchmark_return"],
+                    "年化":bt["cagr"],
+                    "最大回撤":bt["max_drawdown"],
+                    "交易次数":bt["trades"],
+                    "胜率":bt["win_rate"],
+                    "ProfitFactor":bt["profit_factor"],
+                    "MAR":bt["mar"],
+                    "期望/笔":bt["expectancy"],
+                    "盈亏比":bt["payoff"],
+                    "暴露":bt["exposure"],
+                    "样本外收益":bt["oos"]["return"] if bt["oos"] else float("nan"),
+                })
+                curves[file.name] = bt["curve"]
+            except Exception as e:
+                errors.append(f"{file.name}: {e}")
+
+        if summaries:
+            summary = pd.DataFrame(summaries)
+            st.subheader("跨标的结果")
+            display = summary.copy()
+            for col in ["总收益","买入持有","年化","最大回撤","胜率","期望/笔","暴露","样本外收益"]:
+                display[col] = display[col].map(lambda x: "—" if pd.isna(x) else f"{x:.1%}")
+            for col in ["ProfitFactor","MAR","盈亏比"]:
+                display[col] = display[col].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+            st.dataframe(display,hide_index=True,width="stretch")
+
+            v1,v2,v3,v4 = st.columns(4)
+            v1.metric("标的数",len(summary))
+            v2.metric("年化中位数",pct(summary["年化"].median()))
+            v3.metric("最大回撤中位数",pct(summary["最大回撤"].median()))
+            valid_oos = summary["样本外收益"].dropna()
+            oos_positive = (valid_oos>0).mean() if len(valid_oos) else float("nan")
+            v4.metric("样本外为正占比",pct(oos_positive))
+
+            if len(summary)==1:
+                first_name = csv_files[0].name
+                if first_name in curves:
+                    st.line_chart(curves[first_name],height=280)
+
+            st.caption("稳健系统应优先看跨标的中位数、样本外表现和回撤，而不是单一标的最高收益。")
+            st.warning("如果只有少数股票有效、参数稍变就失效，通常是过拟合，不应直接用于真钱。")
+        if errors:
+            st.error("部分文件失败：\n" + "\n".join(errors))
 
 st.divider()
 st.caption("中长线决策辅助工具。目标是提高决策一致性与风险控制，不承诺收益；关键价格与基本面请用原始行情/财报复核。")
