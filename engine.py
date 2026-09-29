@@ -57,19 +57,23 @@ def normalize_tf(x, visible_default=False):
         x.setdefault(k,v)
     return x
 
-def timeframe_score(x):
+def score_breakdown(x):
     if not x.get("visible"):
         return None
-    return float(
-        MID_SCORE.get(x.get("mid_direction"),8) +
-        PRICE_SCORE.get(x.get("price_vs_mid"),6) +
-        ZERO_SCORE.get(x.get("zero_zone"),6) +
-        DIF_SCORE.get(x.get("dif_direction"),4) +
-        BAR_SCORE.get(x.get("bar_momentum"),6) +
-        CROSS_SCORE.get(x.get("cross"),4) +
-        VOLUME_SCORE.get(x.get("volume_state"),4) +
-        DIV_SCORE.get(x.get("divergence"),3)
-    )
+    return {
+        "BOLL中轨":MID_SCORE.get(x.get("mid_direction"),8),
+        "价格/中轨":PRICE_SCORE.get(x.get("price_vs_mid"),6),
+        "MACD零轴":ZERO_SCORE.get(x.get("zero_zone"),6),
+        "DIF方向":DIF_SCORE.get(x.get("dif_direction"),4),
+        "柱体动能":BAR_SCORE.get(x.get("bar_momentum"),6),
+        "金叉/死叉":CROSS_SCORE.get(x.get("cross"),4),
+        "成交量":VOLUME_SCORE.get(x.get("volume_state"),4),
+        "背离":DIV_SCORE.get(x.get("divergence"),3),
+    }
+
+def timeframe_score(x):
+    b = score_breakdown(x)
+    return None if b is None else float(sum(b.values()))
 
 def completeness(x):
     keys = ["mid_direction","price_vs_mid","zero_zone","dif_direction","bar_momentum","cross","volume_state"]
