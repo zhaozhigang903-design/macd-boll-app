@@ -4121,6 +4121,557 @@ def delete_research_run(run_id):
     conn.execute("DELETE FROM research_runs WHERE run_id=?",(run_id,))
     conn.commit(); conn.close()
 
+def strategy_default_params():
+    return {
+        "select_delta":0.0,
+        "buy_delta":0.0,
+        "rr_delta":0.0,
+        "max_gap_atr":1.5,
+        "ignore_weekly":False,
+        "ignore_rs":False,
+        "ignore_opp":False,
+        "ignore_rr":False,
+        "fixed_market_policy":False,
+        "exit_score":45.0,
+        "peak_drop":15.0,
+        "peak_guard_score":65.0,
+        "weekly_exit":45.0,
+        "market_exit_threshold":25.0,
+        "market_exit_score":60.0
+    }
+
+def strategy_variant_configs(module):
+    base=strategy_default_params()
+    def cfg(cid,label,order,**kw):
+        p=base.copy(); p.update(kw)
+        return {"config_id":cid,"label":label,"order":order,"params":p}
+
+    if module=="选股门槛":
+        return [
+            cfg("S-6","宽松 -6",0,select_delta=-6),
+            cfg("S-3","稍宽 -3",1,select_delta=-3),
+            cfg("BASE","EV1.0 基准",2),
+            cfg("S+3","稍严 +3",3,select_delta=3),
+            cfg("S+6","严格 +6",4,select_delta=6)
+        ]
+    if module=="买入质量":
+        return [
+            cfg("B-4","宽松买点",0,buy_delta=-4,rr_delta=-0.20,max_gap_atr=1.8),
+            cfg("B-2","稍宽买点",1,buy_delta=-2,rr_delta=-0.10,max_gap_atr=1.65),
+            cfg("BASE","EV1.0 基准",2),
+            cfg("B+2","稍严买点",3,buy_delta=2,rr_delta=0.10,max_gap_atr=1.35),
+            cfg("B+4","严格买点",4,buy_delta=4,rr_delta=0.20,max_gap_atr=1.15)
+        ]
+    if module=="持仓退出":
+        return [
+            cfg("E_FAST","快速退出",0,exit_score=48,peak_drop=12,weekly_exit=48),
+            cfg("E_QFAST","稍快退出",1,exit_score=46,peak_drop=14,weekly_exit=46),
+            cfg("BASE","EV1.0 基准",2),
+            cfg("E_SLOW","稍慢退出",3,exit_score=43,peak_drop=17,weekly_exit=43),
+            cfg("E_TREND","趋势延长",4,exit_score=40,peak_drop=20,weekly_exit=40)
+        ]
+    if module=="因子消融":
+        return [
+            cfg("BASE","完整EV1.0",0),
+            cfg("NO_WEEK","去掉周线门槛",1,ignore_weekly=True),
+            cfg("NO_RS","去掉相对强度门槛",2,ignore_rs=True),
+            cfg("NO_OPP","去掉机会分门槛",3,ignore_opp=True),
+            cfg("NO_RR","去掉RR门槛",4,ignore_rr=True),
+            cfg("FIX_MKT","去掉市场自适应门槛",5,fixed_market_policy=True)
+        ]
+    raise ValueError("不支持的优化模块")
+
+def strategy_variant_entry_ok(row,code,params):
+    actual_market=float(row.get("market_score",50) or 50)
+    policy_market=50.0 if params.get("fixed_market_policy") else actual_market
+    p=automatic_entry_policy(policy_market)
+    d=float(params.get("select_delta",0) or 0)
+    buy_delta=float(params.get("buy_delta",0) or 0)
+    rr_delta=float(params.get("rr_delta",0) or 0)
+    liq_ok,_,_=liquidity_rule(code,row)
+    if not liq_ok:
+        return False
+
+    rr=row.get("rr",np.nan)
+    weekly=row.get("weekly_score",np.nan)
+    tech_ok=float(row.get("score",0) or 0)>=float(p["技术"])+d
+    buy_ok=float(row.get("buy_score",0) or 0)>=float(p["买点"])+buy_delta
+    week_ok=True if params.get("ignore_weekly") else (
+        pd.notna(weekly) and float(weekly)>=float(p["周线"])+d
+    )
+    rr_ok=True if params.get("ignore_rr") else (
+        pd.notna(rr) and float(rr)>=max(0.5,float(p["盈亏比"])+rr_delta)
+    )
+    rs_ok=True if params.get("ignore_rs") else (
+        float(row.get("rs_score",50) or 50)>=float(p["相对强度"])+d
+    )
+    opp_ok=True if params.get("ignore_opp") else (
+        float(row.get("opportunity_score",0) or 0)>=float(p["机会"])+d
+    )
+    return bool(tech_ok and buy_ok and week_ok and rr_ok and rs_ok and opp_ok)
+
+def strategy_variant_exit_ok(row,peak_score,params):
+    score=float(row.get("score",0) or 0)
+    weekly=row.get("weekly_score",np.nan)
+    market_score=float(row.get("market_score",50) or 50)
+    return bool(
+        score<float(params.get("exit_score",45)) or
+        (
+            peak_score-score>=float(params.get("peak_drop",15)) and
+            score<float(params.get("peak_guard_score",65))
+        ) or
+        (
+            pd.notna(weekly) and
+            float(weekly)<float(params.get("weekly_exit",45))
+        ) or
+        (
+            market_score<float(params.get("market_exit_threshold",25)) and
+            score<float(params.get("market_exit_score",60))
+        )
+    )
+
+def simulate_strategy_variant(prepared_frame,code,params,cost_mult=1.0):
+    m=prepared_frame
+    if m is None or m.empty or len(m)<180:
+        return pd.DataFrame()
+
+    fee_bps,slip_bps=trade_cost_profile(code)
+    friction=(fee_bps+slip_bps)*float(cost_mult)/10000.0
+    trades=[]
+    i=120
+    n=len(m)
+
+    while i<n-1:
+        signal=m.iloc[i]
+        if not strategy_variant_entry_ok(signal,code,params):
+            i+=1
+            continue
+
+        entry_i=i+1
+        entry_row=m.iloc[entry_i]
+        raw_entry=(
+            float(entry_row["open"])
+            if pd.notna(entry_row.get("open")) and entry_row.get("open")>0
+            else float(entry_row["close"])
+        )
+        signal_close=float(signal["close"])
+        stop=signal.get("stop_ref",np.nan)
+        atr=signal.get("atr14",np.nan)
+
+        if pd.isna(stop) or raw_entry<=float(stop):
+            i+=1
+            continue
+
+        gap_limit=float(params.get("max_gap_atr",1.5))
+        if pd.notna(atr) and atr>0 and abs(raw_entry-signal_close)>gap_limit*float(atr):
+            i+=1
+            continue
+
+        entry_fill=raw_entry*(1+friction)
+        initial_risk=entry_fill-float(stop)
+        if initial_risk<=0:
+            i+=1
+            continue
+
+        peak_score=float(signal.get("score",0) or 0)
+        exit_i=None
+        raw_exit=None
+        exit_reason=None
+        j=entry_i
+
+        while j<n:
+            row=m.iloc[j]
+            peak_score=max(peak_score,float(row.get("score",0) or 0))
+            day_open=(
+                float(row["open"])
+                if pd.notna(row.get("open")) and row.get("open")>0
+                else float(row["close"])
+            )
+            day_low=float(row["low"]) if pd.notna(row.get("low")) else day_open
+
+            if day_low<=float(stop):
+                raw_exit=day_open if day_open<float(stop) else float(stop)
+                exit_i=j
+                exit_reason="风险位"
+                break
+
+            if j<n-1 and strategy_variant_exit_ok(row,peak_score,params):
+                nxt=m.iloc[j+1]
+                raw_exit=(
+                    float(nxt["open"])
+                    if pd.notna(nxt.get("open")) and nxt.get("open")>0
+                    else float(nxt["close"])
+                )
+                exit_i=j+1
+                exit_reason="技术退出"
+                break
+            j+=1
+
+        if exit_i is None:
+            break
+
+        exit_fill=raw_exit*(1-friction)
+        ret=exit_fill/entry_fill-1
+        r_mult=(exit_fill-entry_fill)/initial_risk
+        trades.append({
+            "signal_date":pd.Timestamp(signal["trade_date"]),
+            "entry_date":pd.Timestamp(entry_row["trade_date"]),
+            "exit_date":pd.Timestamp(m.iloc[exit_i]["trade_date"]),
+            "return":ret,"R":r_mult,
+            "holding_days":int(exit_i-entry_i+1),
+            "opportunity":float(signal.get("opportunity_score",0) or 0),
+            "risk_pct":float(initial_risk/entry_fill) if entry_fill>0 else np.nan,
+            "exit_reason":exit_reason
+        })
+        i=exit_i+1
+
+    return pd.DataFrame(trades)
+
+def _strategy_experiment_period(run_id):
+    conn=sqlite3.connect(DB_PATH)
+    row=conn.execute(
+        """SELECT MIN(period_start),MAX(period_end)
+           FROM research_membership WHERE run_id=?""",
+        (run_id,)
+    ).fetchone()
+    conn.close()
+    if row and row[0] and row[1]:
+        start=pd.Timestamp(row[0]); end=pd.Timestamp(row[1])
+    else:
+        run=get_research_run(run_id)
+        end=pd.Timestamp.today().normalize()
+        start=end-pd.DateOffset(years=int(run.get("years",5) or 5))
+    span=max((end-start).days,10)
+    train_end=start+pd.Timedelta(days=int(span*0.60))
+    validation_end=start+pd.Timedelta(days=int(span*0.80))
+    return start.normalize(),train_end.normalize(),validation_end.normalize(),end.normalize()
+
+def create_strategy_experiment(research_run_id,module):
+    run=get_research_run(research_run_id)
+    if not run:
+        raise RuntimeError("请先创建研究任务。")
+    configs=strategy_variant_configs(module)
+    _,train_end,val_end,_=_strategy_experiment_period(research_run_id)
+    exp_id="EXP_"+datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((research_run_id,module)))%10000).zfill(4)
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO strategy_experiments(
+           experiment_id,research_run_id,module,created_at,updated_at,status,cursor,total,
+           train_end,validation_end,test_revealed,config_json,rule_version,note
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            exp_id,research_run_id,module,now,now,"running",0,int(run.get("total",0) or 0),
+            train_end.strftime("%Y-%m-%d"),val_end.strftime("%Y-%m-%d"),0,
+            json.dumps(configs,ensure_ascii=False),RULE_VERSION,
+            "60%训练 + 20%验证 + 20%最终测试；实验排序只使用训练/验证区间。"
+        )
+    )
+    conn.commit(); conn.close()
+    return exp_id
+
+def load_strategy_experiments(research_run_id=None,limit=30):
+    conn=sqlite3.connect(DB_PATH)
+    if research_run_id:
+        df=pd.read_sql_query(
+            """SELECT * FROM strategy_experiments
+               WHERE research_run_id=?
+               ORDER BY created_at DESC LIMIT ?""",
+            conn,params=(research_run_id,int(limit))
+        )
+    else:
+        df=pd.read_sql_query(
+            """SELECT * FROM strategy_experiments
+               ORDER BY created_at DESC LIMIT ?""",
+            conn,params=(int(limit),)
+        )
+    conn.close()
+    return df
+
+def get_strategy_experiment(experiment_id):
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        "SELECT * FROM strategy_experiments WHERE experiment_id=?",
+        conn,params=(experiment_id,)
+    )
+    conn.close()
+    return df.iloc[0].to_dict() if not df.empty else None
+
+def _save_strategy_experiment_trades(experiment_id,config_id,code,trades):
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """DELETE FROM strategy_experiment_trades
+           WHERE experiment_id=? AND config_id=? AND code=?""",
+        (experiment_id,config_id,code)
+    )
+    if trades is not None and not trades.empty:
+        rows=[]
+        for _,t in trades.iterrows():
+            rows.append((
+                experiment_id,config_id,code,
+                pd.Timestamp(t["signal_date"]).strftime("%Y-%m-%d"),
+                pd.Timestamp(t["entry_date"]).strftime("%Y-%m-%d"),
+                pd.Timestamp(t["exit_date"]).strftime("%Y-%m-%d"),
+                float(t["R"]) if pd.notna(t.get("R")) else None,
+                float(t["return"]) if pd.notna(t.get("return")) else None,
+                int(t.get("holding_days",0) or 0),
+                float(t["opportunity"]) if pd.notna(t.get("opportunity")) else None,
+                float(t["risk_pct"]) if pd.notna(t.get("risk_pct")) else None
+            ))
+        conn.executemany(
+            """INSERT OR REPLACE INTO strategy_experiment_trades(
+               experiment_id,config_id,code,signal_date,entry_date,exit_date,
+               r_multiple,return_pct,holding_days,opportunity_score,initial_risk_pct
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",rows
+        )
+    conn.commit(); conn.close()
+
+def run_strategy_experiment_batch(experiment_id,batch_size=5,progress_callback=None):
+    exp=get_strategy_experiment(experiment_id)
+    if not exp:
+        raise RuntimeError("策略实验不存在。")
+    if exp.get("status")=="completed":
+        return {"processed":0,"errors":[],"done":True}
+
+    run=get_research_run(exp["research_run_id"])
+    configs=json.loads(exp["config_json"])
+    cursor=int(exp.get("cursor",0) or 0)
+    total=int(exp.get("total",0) or 0)
+    end=min(cursor+int(batch_size),total)
+
+    conn=sqlite3.connect(DB_PATH)
+    members=pd.read_sql_query(
+        """SELECT * FROM research_members
+           WHERE run_id=? AND seq>=? AND seq<?
+           ORDER BY seq""",
+        conn,params=(exp["research_run_id"],cursor,end)
+    )
+    conn.close()
+    if members.empty:
+        return {"processed":0,"errors":[],"done":cursor>=total}
+
+    years=int(run.get("years",5) or 5)
+    universe=str(run.get("universe"))
+    benchmark=(
+        fetch_hk_benchmark_daily(years=years)
+        if universe=="港股主板"
+        else fetch_benchmark_daily(years=years)
+    )
+    errors=[]
+    processed=0
+
+    for _,member in members.iterrows():
+        seq=int(member["seq"]); code=str(member["code"]); name=str(member["name"])
+        try:
+            if progress_callback:
+                progress_callback(seq-cursor,len(members),seq,total,code,name,"准备共享指标")
+            df=fetch_stock_daily(code,years=years)
+            if len(df)<180:
+                raise RuntimeError("有效历史少于180个交易日")
+            prepared=prepare_strategy_frame(df,benchmark)
+            if prepared.empty:
+                raise RuntimeError("策略指标无法构建")
+
+            for ci,cfg in enumerate(configs,start=1):
+                if progress_callback:
+                    progress_callback(
+                        seq-cursor,len(members),seq,total,code,name,
+                        f"{cfg['label']} ({ci}/{len(configs)})"
+                    )
+                trades=simulate_strategy_variant(
+                    prepared,code,cfg["params"],cost_mult=1.0
+                )
+                trades=filter_research_trades_by_membership(
+                    exp["research_run_id"],code,trades
+                )
+                _save_strategy_experiment_trades(
+                    experiment_id,cfg["config_id"],code,trades
+                )
+        except Exception as e:
+            errors.append(f"{display_code(code)} {name}: {e}")
+        finally:
+            processed+=1
+            new_cursor=seq+1
+            status="completed" if new_cursor>=total else "running"
+            conn=sqlite3.connect(DB_PATH)
+            conn.execute(
+                """UPDATE strategy_experiments
+                   SET cursor=?,status=?,updated_at=? WHERE experiment_id=?""",
+                (
+                    new_cursor,status,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    experiment_id
+                )
+            )
+            conn.commit(); conn.close()
+
+    return {"processed":processed,"errors":errors,"done":end>=total}
+
+def _experiment_segment_metrics(df):
+    if df is None or df.empty:
+        return {
+            "n":0,"ev":np.nan,"lcb":np.nan,"win":np.nan,
+            "pf":np.nan,"avg_win":np.nan,"avg_loss":np.nan
+        }
+    temp=pd.DataFrame({
+        "R":pd.to_numeric(df["r_multiple"],errors="coerce"),
+        "holding_days":pd.to_numeric(df["holding_days"],errors="coerce"),
+        "signal_date":pd.to_datetime(df["signal_date"],errors="coerce")
+    }).dropna(subset=["R","signal_date"])
+    ev=summarize_ev(temp)
+    return {
+        "n":int(ev.get("样本",0) or 0),
+        "ev":ev.get("EV_R"),"lcb":ev.get("保守EV_R"),
+        "win":ev.get("胜率"),"pf":ev.get("盈亏因子"),
+        "avg_win":ev.get("平均盈利R"),"avg_loss":ev.get("平均亏损R")
+    }
+
+def strategy_experiment_summary(experiment_id,include_test=None):
+    exp=get_strategy_experiment(experiment_id)
+    if not exp:
+        return pd.DataFrame(),None
+    configs=json.loads(exp["config_json"])
+    if include_test is None:
+        include_test=bool(int(exp.get("test_revealed",0) or 0))
+    train_end=pd.Timestamp(exp["train_end"])
+    val_end=pd.Timestamp(exp["validation_end"])
+
+    conn=sqlite3.connect(DB_PATH)
+    trades=pd.read_sql_query(
+        """SELECT * FROM strategy_experiment_trades
+           WHERE experiment_id=?""",
+        conn,params=(experiment_id,)
+    )
+    conn.close()
+    if trades.empty:
+        return pd.DataFrame(),None
+    trades["signal_date"]=pd.to_datetime(trades["signal_date"],errors="coerce")
+
+    rows=[]
+    for cfg in configs:
+        cid=cfg["config_id"]
+        g=trades[trades["config_id"]==cid].copy()
+        train=g[g["signal_date"]<=train_end]
+        val=g[(g["signal_date"]>train_end)&(g["signal_date"]<=val_end)]
+        test=g[g["signal_date"]>val_end]
+        tr=_experiment_segment_metrics(train)
+        va=_experiment_segment_metrics(val)
+        te=_experiment_segment_metrics(test) if include_test else None
+
+        pf=va["pf"]
+        pf_term=np.log(max(float(pf),0.25)) if pd.notna(pf) and np.isfinite(pf) and pf>0 else -1.0
+        sample_term=min(1.0,va["n"]/30.0)
+        robust=(
+            0.55*(va["ev"] if pd.notna(va["ev"]) else -2.0)+
+            0.25*min(
+                tr["ev"] if pd.notna(tr["ev"]) else -2.0,
+                va["ev"] if pd.notna(va["ev"]) else -2.0
+            )+
+            0.10*pf_term+
+            0.10*sample_term
+        )
+        row={
+            "config_id":cid,"方案":cfg["label"],"顺序":int(cfg.get("order",0)),
+            "训练样本":tr["n"],"训练EV(R)":tr["ev"],
+            "验证样本":va["n"],"验证EV(R)":va["ev"],"验证保守EV(R)":va["lcb"],
+            "验证胜率":va["win"],"验证PF":va["pf"],
+            "稳健分":float(robust),"参数":json.dumps(cfg["params"],ensure_ascii=False)
+        }
+        if include_test and te is not None:
+            row.update({
+                "最终测试样本":te["n"],"最终测试EV(R)":te["ev"],
+                "最终测试保守EV(R)":te["lcb"],"最终测试胜率":te["win"],
+                "最终测试PF":te["pf"]
+            })
+        rows.append(row)
+
+    out=pd.DataFrame(rows).sort_values("顺序").reset_index(drop=True)
+    if out.empty:
+        return out,None
+
+    out["邻域验证EV"]=np.nan
+    out["稳定区域"]=False
+    if exp["module"]!="因子消融" and len(out)>=3:
+        vals=pd.to_numeric(out["验证EV(R)"],errors="coerce")
+        trains=pd.to_numeric(out["训练EV(R)"],errors="coerce")
+        for i in range(len(out)):
+            lo=max(0,i-1); hi=min(len(out),i+2)
+            neigh=vals.iloc[lo:hi].dropna()
+            neigh_train=trains.iloc[lo:hi].dropna()
+            if len(neigh)>=2:
+                out.loc[i,"邻域验证EV"]=float(neigh.mean())
+                out.loc[i,"稳定区域"]=bool(
+                    (neigh>0).all() and
+                    len(neigh_train)>=2 and (neigh_train>0).all()
+                )
+
+    if "BASE" in out["config_id"].values:
+        base_val=float(
+            pd.to_numeric(
+                out.loc[out["config_id"]=="BASE","验证EV(R)"],errors="coerce"
+            ).iloc[0]
+        )
+        out["相对基准EV"]=pd.to_numeric(out["验证EV(R)"],errors="coerce")-base_val
+    else:
+        out["相对基准EV"]=np.nan
+
+    eligible=out[
+        (pd.to_numeric(out["训练EV(R)"],errors="coerce")>0)&
+        (pd.to_numeric(out["验证EV(R)"],errors="coerce")>0)&
+        (out["验证样本"]>=5)
+    ].copy()
+    if exp["module"]!="因子消融":
+        stable=eligible[eligible["稳定区域"]==True]
+        if not stable.empty:
+            eligible=stable
+    candidate=(
+        eligible.sort_values(["稳健分","验证保守EV(R)"],ascending=False).iloc[0].to_dict()
+        if not eligible.empty else None
+    )
+    return out,candidate
+
+def reveal_strategy_test(experiment_id):
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """UPDATE strategy_experiments
+           SET test_revealed=1,updated_at=? WHERE experiment_id=?""",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),experiment_id)
+    )
+    conn.commit(); conn.close()
+
+def save_strategy_candidate(experiment_id,config_id):
+    exp=get_strategy_experiment(experiment_id)
+    if not exp:
+        raise RuntimeError("实验不存在")
+    configs=json.loads(exp["config_json"])
+    cfg=next((x for x in configs if x["config_id"]==config_id),None)
+    if not cfg:
+        raise RuntimeError("找不到该参数方案")
+    cid="CAND_"+datetime.now().strftime("%Y%m%d_%H%M%S")
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO strategy_candidates(
+           candidate_id,experiment_id,created_at,module,config_id,config_json,status,note
+        ) VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            cid,experiment_id,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            exp["module"],config_id,json.dumps(cfg,ensure_ascii=False),
+            "candidate","仅保存为候选版本；不会自动替换EV1.0实盘规则。"
+        )
+    )
+    conn.commit(); conn.close()
+    return cid
+
+def load_strategy_candidates(limit=30):
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        """SELECT * FROM strategy_candidates
+           ORDER BY created_at DESC LIMIT ?""",
+        conn,params=(int(limit),)
+    )
+    conn.close()
+    return df
+
 def load_forward_signals(limit=300):
     conn=sqlite3.connect(DB_PATH)
     df=pd.read_sql_query(
