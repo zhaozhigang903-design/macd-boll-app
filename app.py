@@ -334,6 +334,36 @@ def init_db():
       raw_result TEXT
     )
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS market_daily_cache(
+      code TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      open REAL,
+      high REAL,
+      low REAL,
+      close REAL,
+      vol REAL,
+      amount REAL,
+      pctChg REAL,
+      turn REAL,
+      tradestatus TEXT,
+      isST TEXT,
+      adjustflag TEXT NOT NULL DEFAULT '2',
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY(code, trade_date, adjustflag)
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_market_daily_cache_code_date
+    ON market_daily_cache(code, trade_date)
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS market_cache_meta(
+      code TEXT PRIMARY KEY,
+      last_checked TEXT,
+      updated_at TEXT
+    )
+    """)
     conn.commit()
     conn.close()
 
@@ -755,10 +785,89 @@ def stock_basic_name(code):
             return str(df.iloc[0][col]).strip()
     return display_code(code)
 
-def fetch_stock_daily(code, years=3):
-    code = normalize_code(code)
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+def _read_daily_cache(code, start_date, end_date, adjustflag="2"):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """SELECT trade_date,code,open,high,low,close,vol,amount,pctChg,turn,tradestatus,isST
+           FROM market_daily_cache
+           WHERE code=? AND adjustflag=? AND trade_date BETWEEN ? AND ?
+           ORDER BY trade_date""",
+        conn,
+        params=(code,adjustflag,start_date,end_date)
+    )
+    conn.close()
+    if df.empty:
+        return df
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+def _cache_bounds(code, adjustflag="2"):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT MIN(trade_date),MAX(trade_date) FROM market_daily_cache WHERE code=? AND adjustflag=?",
+        (code,adjustflag)
+    ).fetchone()
+    meta = conn.execute(
+        "SELECT last_checked FROM market_cache_meta WHERE code=?",
+        (code,)
+    ).fetchone()
+    conn.close()
+    return (row[0] if row else None, row[1] if row else None, meta[0] if meta else None)
+
+def _save_daily_cache(df, code, adjustflag="2"):
+    if df is None or df.empty:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for _,r in df.iterrows():
+        rows.append((
+            code,
+            pd.Timestamp(r["trade_date"]).strftime("%Y-%m-%d"),
+            float(r["open"]) if pd.notna(r.get("open")) else None,
+            float(r["high"]) if pd.notna(r.get("high")) else None,
+            float(r["low"]) if pd.notna(r.get("low")) else None,
+            float(r["close"]) if pd.notna(r.get("close")) else None,
+            float(r["vol"]) if pd.notna(r.get("vol")) else None,
+            float(r["amount"]) if pd.notna(r.get("amount")) else None,
+            float(r["pctChg"]) if pd.notna(r.get("pctChg")) else None,
+            float(r["turn"]) if pd.notna(r.get("turn")) else None,
+            str(r.get("tradestatus","")),
+            str(r.get("isST","")),
+            adjustflag,
+            now
+        ))
+    conn = sqlite3.connect(DB_PATH)
+    conn.executemany(
+        """INSERT OR REPLACE INTO market_daily_cache(
+           code,trade_date,open,high,low,close,vol,amount,pctChg,turn,
+           tradestatus,isST,adjustflag,fetched_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+def _mark_cache_checked(code):
+    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO market_cache_meta(code,last_checked,updated_at)
+           VALUES(?,?,?)
+           ON CONFLICT(code) DO UPDATE SET
+             last_checked=excluded.last_checked,
+             updated_at=excluded.updated_at""",
+        (code,today,now)
+    )
+    conn.commit()
+    conn.close()
+
+def _download_daily(code, start, end):
+    if start > end:
+        return pd.DataFrame()
     fields = "date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus,isST"
     rs = bs.query_history_k_data_plus(
         code, fields, start_date=start, end_date=end, frequency="d", adjustflag="2"
@@ -774,6 +883,59 @@ def fetch_stock_daily(code, years=3):
     if "tradestatus" in df.columns:
         df = df[df["tradestatus"].astype(str) == "1"]
     return df.sort_values("trade_date").reset_index(drop=True)
+
+def fetch_stock_daily(code, years=3):
+    code = normalize_code(code)
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (pd.Timestamp.today() - pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    cache_min, cache_max, last_checked = _cache_bounds(code, "2")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 首次读取：下载完整所需区间。
+    if not cache_min or not cache_max:
+        fresh = _download_daily(code, start, end)
+        _save_daily_cache(fresh, code, "2")
+        _mark_cache_checked(code)
+    else:
+        # 如果请求区间比缓存更早，只补前段。
+        if start < cache_min:
+            pre_end = (pd.Timestamp(cache_min) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            older = _download_daily(code, start, pre_end)
+            _save_daily_cache(older, code, "2")
+
+        # 每只股票每天最多检查一次最新行情，避免重复请求BaoStock。
+        if last_checked != today:
+            next_start = (pd.Timestamp(cache_max) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            newer = _download_daily(code, next_start, end)
+            _save_daily_cache(newer, code, "2")
+            _mark_cache_checked(code)
+
+    return _read_daily_cache(code, start, end, "2")
+
+def market_cache_stats():
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        """SELECT COUNT(*),COUNT(DISTINCT code),MIN(trade_date),MAX(trade_date)
+           FROM market_daily_cache"""
+    ).fetchone()
+    size = conn.execute(
+        "SELECT page_count*page_size FROM pragma_page_count(), pragma_page_size()"
+    ).fetchone()[0]
+    conn.close()
+    return {
+        "rows":int(row[0] or 0),
+        "stocks":int(row[1] or 0),
+        "min_date":row[2] or "—",
+        "max_date":row[3] or "—",
+        "db_mb":round(float(size or 0)/1024/1024,1)
+    }
+
+def clear_market_cache():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM market_daily_cache")
+    conn.execute("DELETE FROM market_cache_meta")
+    conn.commit()
+    conn.close()
 
 def add_indicators(df):
     if df is None or df.empty:
@@ -1083,6 +1245,19 @@ with tab6:
     st.success("A股行情使用 BaoStock，无需 Token 或会员。")
     st.info("统一使用前复权日线数据；周线由同一套日线聚合，分析、选股、回测使用相同数据口径和相同公式。")
     st.caption("BaoStock采用自身复权算法，因此历史价格可能与同花顺/通达信存在细微差异；App内部始终保持同一数据源和同一复权口径。")
+
+    st.subheader("本地行情缓存")
+    cs = market_cache_stats()
+    c1,c2,c3 = st.columns(3)
+    c1.metric("已缓存股票", f"{cs['stocks']:,}")
+    c2.metric("日线记录", f"{cs['rows']:,}")
+    c3.metric("数据库大小", f"{cs['db_mb']:.1f} MB")
+    st.caption(f"缓存区间：{cs['min_date']} ～ {cs['max_date']}。首次下载完整历史，以后同一股票每天只补最新数据。")
+    if st.button("🗑️ 清空行情缓存", use_container_width=True):
+        clear_market_cache()
+        st.success("行情缓存已清空。")
+        st.rerun()
+    st.warning("当前缓存位于Render本机SQLite：日常重复扫描会明显加速，但服务重新部署/重建实例时可能被清空。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
 
 with tab5:
@@ -1186,7 +1361,7 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("支持全沪深A股，不再只扫描指数前100只。全市场采用分批扫描，避免手机页面超时；可连续扫描直到100%。")
+    st.caption("支持全沪深A股。首次扫描会建立本地日线缓存；以后重复扫描主要补最新交易日，速度会明显提升。全市场分批扫描可连续到100%。")
 
     universe = st.selectbox("选股范围", ["全A股（沪深）","沪深300","中证500","上证50"], index=0)
     f1,f2,f3 = st.columns(3)
@@ -1348,4 +1523,4 @@ with tab4:
         )
 
 st.divider()
-st.caption("中长线技术决策辅助工具。先控制错误，再放大正确；截图识别和技术指标均可能失真，请以原始行情数据复核。")
+st.caption("中长线技术决策辅助工具。分析、选股、回测统一使用同一行情数据和指标公式；技术分不是未来收益保证。")
