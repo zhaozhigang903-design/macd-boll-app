@@ -3791,59 +3791,210 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
 
     return {"processed":processed,"errors":errors,"done":end>=total}
 
-def research_portfolio_approx(trades,max_slots=10):
-    if trades is None or trades.empty:
-        return {"交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,"采用率":np.nan},pd.DataFrame()
-
-    t=trades.copy()
-    for col in ["entry_date","exit_date","signal_date"]:
-        t[col]=pd.to_datetime(t[col],errors="coerce")
-    t["opportunity_score"]=pd.to_numeric(t["opportunity_score"],errors="coerce").fillna(0)
-    t=t.dropna(subset=["entry_date","exit_date","return_pct"]).sort_values(
-        ["entry_date","opportunity_score"],ascending=[True,False]
+def _cached_close_series(code,start_date,end_date):
+    code=normalize_code(code)
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        """SELECT trade_date,close FROM market_daily_cache
+           WHERE code=? AND trade_date>=? AND trade_date<=?
+           ORDER BY trade_date""",
+        conn,
+        params=(
+            code,pd.Timestamp(start_date).strftime("%Y-%m-%d"),
+            pd.Timestamp(end_date).strftime("%Y-%m-%d")
+        )
     )
-
-    active=[]
-    accepted=[]
-    for _,row in t.iterrows():
-        entry=row["entry_date"]
-        active=[x for x in active if x>entry]
-        if len(active)>=max_slots:
-            continue
-        active.append(row["exit_date"])
-        accepted.append(row.to_dict())
-
-    if not accepted:
-        return {"交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,"采用率":0.0},pd.DataFrame()
-
-    a=pd.DataFrame(accepted).sort_values("exit_date").reset_index(drop=True)
-    capital=1.0
-    points=[]
-    peak=1.0
-    max_dd=0.0
-    for _,row in a.iterrows():
-        contribution=float(row["return_pct"])/float(max_slots)
-        capital*=max(0.0001,1.0+contribution)
-        peak=max(peak,capital)
-        max_dd=min(max_dd,capital/peak-1.0)
-        points.append({"date":row["exit_date"],"equity":capital})
-    curve=pd.DataFrame(points)
-    start=pd.to_datetime(a["entry_date"]).min()
-    end=pd.to_datetime(a["exit_date"]).max()
-    years=max((end-start).days/365.25,0.01)
-    annual=capital**(1/years)-1 if capital>0 else -1.0
+    conn.close()
+    if df.empty:
+        return {}
+    df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
+    df["close"]=pd.to_numeric(df["close"],errors="coerce")
+    df=df.dropna(subset=["trade_date","close"])
     return {
-        "交易数":int(len(a)),
-        "累计收益":float(capital-1),
-        "年化收益":float(annual),
-        "最大回撤":float(max_dd),
-        "采用率":float(len(a)/len(t)) if len(t) else np.nan
-    },curve
+        pd.Timestamp(d).normalize():float(px)
+        for d,px in zip(df["trade_date"],df["close"])
+    }
+
+def _research_calendar(run,start_date,end_date):
+    code="hkidx.HSI" if str(run.get("universe"))=="港股主板" else "sh.000300"
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        """SELECT DISTINCT trade_date FROM market_daily_cache
+           WHERE code=? AND trade_date>=? AND trade_date<=?
+           ORDER BY trade_date""",
+        conn,
+        params=(
+            code,pd.Timestamp(start_date).strftime("%Y-%m-%d"),
+            pd.Timestamp(end_date).strftime("%Y-%m-%d")
+        )
+    )
+    conn.close()
+    if not df.empty:
+        dates=pd.to_datetime(df["trade_date"],errors="coerce").dropna().dt.normalize().tolist()
+        if dates:
+            return dates
+    return list(pd.bdate_range(start_date,end_date).normalize())
+
+def research_daily_portfolio(run_id,trades,max_slots=10,risk_budget=0.005,max_weight=0.10):
+    if trades is None or trades.empty:
+        return {
+            "交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,
+            "Sharpe":np.nan,"Sortino":np.nan,"Calmar":np.nan,"换手率":np.nan,
+            "采用率":np.nan,"平均仓位":np.nan
+        },pd.DataFrame(),pd.DataFrame()
+
+    run=get_research_run(run_id)
+    t=attach_walkforward_pred_ev(trades,min_history=20,embargo_days=10)
+    if t.empty:
+        return {
+            "交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,
+            "Sharpe":np.nan,"Sortino":np.nan,"Calmar":np.nan,"换手率":np.nan,
+            "采用率":np.nan,"平均仓位":np.nan
+        },pd.DataFrame(),pd.DataFrame()
+
+    for col in ["entry_date","exit_date","signal_date"]:
+        t[col]=pd.to_datetime(t[col],errors="coerce").dt.normalize()
+    for col in ["entry_price","exit_price","stop_price","initial_risk_pct","opportunity_score"]:
+        t[col]=pd.to_numeric(t[col],errors="coerce")
+    t=t.dropna(subset=["entry_date","exit_date","entry_price","exit_price","initial_risk_pct","pred_ev_r"])
+    t=t[(t["initial_risk_pct"]>0) & (t["pred_ev_r"]>0)].copy()
+    if t.empty:
+        return {
+            "交易数":0,"累计收益":0.0,"年化收益":0.0,"最大回撤":0.0,
+            "Sharpe":np.nan,"Sortino":np.nan,"Calmar":np.nan,"换手率":0.0,
+            "采用率":0.0,"平均仓位":0.0
+        },pd.DataFrame(),pd.DataFrame()
+
+    t=t.sort_values(
+        ["entry_date","pred_ev_r","opportunity_score"],
+        ascending=[True,False,False]
+    ).reset_index(drop=True)
+    start=t["entry_date"].min()
+    end=t["exit_date"].max()
+    calendar=_research_calendar(run,start,end)
+    entries={d:g.copy() for d,g in t.groupby("entry_date")}
+    exits={}
+    # accepted trades will be placed here after sizing.
+    accepted=[]
+    active={}
+    cash=1.0
+    turnover=0.0
+    curve=[]
+    last_nav=1.0
+
+    for day in calendar:
+        day=pd.Timestamp(day).normalize()
+
+        # Mark active holdings with latest available close.
+        for code,pos in list(active.items()):
+            px=pos["prices"].get(day)
+            if px is not None and np.isfinite(px):
+                pos["last_close"]=float(px)
+
+        # Exit at modeled execution price before allocating new risk.
+        due=[code for code,pos in active.items() if pos["exit_date"]<=day]
+        for code in due:
+            pos=active.pop(code)
+            proceeds=pos["shares"]*pos["exit_price"]
+            cash+=proceeds
+            turnover+=abs(proceeds)
+
+        nav=cash+sum(pos["shares"]*pos["last_close"] for pos in active.values())
+        nav=max(nav,1e-9)
+
+        todays=entries.get(day)
+        if todays is not None and not todays.empty:
+            for _,row in todays.iterrows():
+                code=str(row["code"])
+                if code in active or len(active)>=int(max_slots):
+                    continue
+                risk_pct=float(row["initial_risk_pct"])
+                if not np.isfinite(risk_pct) or risk_pct<=0:
+                    continue
+
+                # Fixed NAV risk budget + stop-distance sizing.
+                # Smaller stop distance => larger notional, but max 10% NAV and available cash.
+                target_weight=min(float(max_weight),float(risk_budget)/risk_pct)
+                target_weight=max(0.0,target_weight)
+                notional=min(cash,nav*target_weight)
+                if notional<nav*0.005:
+                    continue
+
+                entry_price=float(row["entry_price"])
+                if entry_price<=0:
+                    continue
+                shares=notional/entry_price
+                prices=_cached_close_series(code,row["entry_date"],row["exit_date"])
+                last_close=prices.get(day,entry_price)
+                cash-=notional
+                turnover+=abs(notional)
+
+                pos={
+                    "code":code,"shares":shares,"entry_date":day,
+                    "exit_date":pd.Timestamp(row["exit_date"]).normalize(),
+                    "entry_price":entry_price,"exit_price":float(row["exit_price"]),
+                    "stop_price":float(row["stop_price"]) if pd.notna(row["stop_price"]) else np.nan,
+                    "risk_pct":risk_pct,"weight":target_weight,
+                    "pred_ev_r":float(row["pred_ev_r"]),
+                    "last_close":float(last_close),"prices":prices
+                }
+                active[code]=pos
+                accepted_row=row.to_dict()
+                accepted_row["position_weight"]=target_weight
+                accepted_row["risk_budget_nav"]=min(float(risk_budget),target_weight*risk_pct)
+                accepted.append(accepted_row)
+
+                nav=cash+sum(p["shares"]*p["last_close"] for p in active.values())
+                nav=max(nav,1e-9)
+
+        nav=cash+sum(pos["shares"]*pos["last_close"] for pos in active.values())
+        exposure=(nav-cash)/nav if nav>0 else 0.0
+        curve.append({
+            "date":day,"equity":nav,"cash":cash,
+            "exposure":exposure,"positions":len(active)
+        })
+        last_nav=nav
+
+    curve_df=pd.DataFrame(curve)
+    accepted_df=pd.DataFrame(accepted)
+    if curve_df.empty:
+        return {
+            "交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,
+            "Sharpe":np.nan,"Sortino":np.nan,"Calmar":np.nan,"换手率":np.nan,
+            "采用率":0.0,"平均仓位":np.nan
+        },curve_df,accepted_df
+
+    eq=pd.to_numeric(curve_df["equity"],errors="coerce").ffill().fillna(1.0)
+    daily_ret=eq.pct_change().fillna(0.0)
+    total=float(eq.iloc[-1]-1)
+    years=max((pd.Timestamp(curve_df["date"].iloc[-1])-pd.Timestamp(curve_df["date"].iloc[0])).days/365.25,0.01)
+    annual=float(eq.iloc[-1]**(1/years)-1) if eq.iloc[-1]>0 else -1.0
+    dd=eq/eq.cummax()-1
+    max_dd=float(dd.min())
+    std=float(daily_ret.std(ddof=1))
+    sharpe=float(daily_ret.mean()/std*np.sqrt(252)) if std>1e-12 else np.nan
+    downside=daily_ret[daily_ret<0]
+    dstd=float(downside.std(ddof=1)) if len(downside)>=2 else np.nan
+    sortino=float(daily_ret.mean()/dstd*np.sqrt(252)) if pd.notna(dstd) and dstd>1e-12 else np.nan
+    calmar=float(annual/abs(max_dd)) if max_dd<0 else np.nan
+    avg_nav=float(eq.mean()) if len(eq) else 1.0
+    turnover_ratio=float(turnover/max(avg_nav,1e-9))
+    avg_exposure=float(pd.to_numeric(curve_df["exposure"],errors="coerce").mean())
+    adoption=float(len(accepted_df)/len(t)) if len(t) else np.nan
+
+    return {
+        "交易数":int(len(accepted_df)),
+        "累计收益":total,"年化收益":annual,"最大回撤":max_dd,
+        "Sharpe":sharpe,"Sortino":sortino,"Calmar":calmar,
+        "换手率":turnover_ratio,"采用率":adoption,"平均仓位":avg_exposure,
+        "单笔风险预算":float(risk_budget),"单股上限":float(max_weight),"最大持仓数":int(max_slots)
+    },curve_df,accepted_df
 
 def research_summary(run_id):
     run=get_research_run(run_id)
     if not run:
-        return None,pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+        return None,pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+
     conn=sqlite3.connect(DB_PATH)
     stocks=pd.read_sql_query(
         "SELECT * FROM research_stock_results WHERE run_id=? ORDER BY ev_r DESC",
@@ -3859,17 +4010,25 @@ def research_summary(run_id):
         summary={
             "股票数":int(len(stocks)),"交易数":0,"EV_R":np.nan,"保守EV_R":np.nan,
             "胜率":np.nan,"平均盈利R":np.nan,"平均亏损R":np.nan,"真实盈亏比":np.nan,
-            "盈亏因子":np.nan,"OOS_EV_R":np.nan,"OOS稳定性":"样本不足"
+            "盈亏因子":np.nan,"OOS_EV_R":np.nan,"OOS稳定性":"样本不足",
+            "Bootstrap_P正EV":np.nan,"Bootstrap_P05":np.nan,"Bootstrap_P50":np.nan,"Bootstrap_P95":np.nan
         }
-        return summary,stocks,trades,pd.DataFrame()
+        return summary,stocks,trades,pd.DataFrame(),pd.DataFrame()
 
     temp=pd.DataFrame({
         "R":pd.to_numeric(trades["r_multiple"],errors="coerce"),
         "holding_days":pd.to_numeric(trades["holding_days"],errors="coerce"),
-        "signal_date":pd.to_datetime(trades["signal_date"],errors="coerce")
+        "signal_date":pd.to_datetime(trades["signal_date"],errors="coerce"),
+        "exit_date":pd.to_datetime(trades["exit_date"],errors="coerce"),
+        "market":trades["market"],
+        "opportunity_score":pd.to_numeric(trades["opportunity_score"],errors="coerce")
     }).dropna(subset=["R","signal_date"])
+
     ev=summarize_ev(temp)
-    wf=walk_forward_validation(temp)
+    wf=purged_walk_forward_validation(temp,purge_days=30,embargo_days=10)
+    boot=bootstrap_ev_interval(temp,n_boot=600)
+    calibration=ev_calibration_table(trades)
+
     avg_win=ev.get("平均盈利R")
     avg_loss=ev.get("平均亏损R")
     wl=(
@@ -3883,21 +4042,32 @@ def research_summary(run_id):
         "EV_R":ev.get("EV_R"),"保守EV_R":ev.get("保守EV_R"),
         "胜率":ev.get("胜率"),"平均盈利R":avg_win,"平均亏损R":avg_loss,
         "真实盈亏比":wl,"盈亏因子":pf,
-        "OOS_EV_R":wf.get("OOS_EV_R"),"OOS稳定性":wf.get("稳定性")
+        "OOS_EV_R":wf.get("OOS_EV_R"),"OOS稳定性":wf.get("稳定性"),
+        "Purged折数":wf.get("折数",0),"Purged正EV折数":wf.get("正EV折数",0),
+        "Bootstrap_P正EV":boot.get("P(EV>0)"),
+        "Bootstrap_P05":boot.get("EV_P05"),
+        "Bootstrap_P50":boot.get("EV_P50"),
+        "Bootstrap_P95":boot.get("EV_P95")
     }
-    port,curve=research_portfolio_approx(trades,max_slots=10)
+
+    port,curve,accepted=research_daily_portfolio(
+        run_id,trades,max_slots=10,risk_budget=0.005,max_weight=0.10
+    )
     summary.update({
         "组合累计收益":port.get("累计收益"),"组合年化收益":port.get("年化收益"),
         "组合最大回撤":port.get("最大回撤"),"组合交易数":port.get("交易数"),
-        "组合采用率":port.get("采用率")
+        "组合采用率":port.get("采用率"),"组合Sharpe":port.get("Sharpe"),
+        "组合Sortino":port.get("Sortino"),"组合Calmar":port.get("Calmar"),
+        "组合换手率":port.get("换手率"),"组合平均仓位":port.get("平均仓位")
     })
-    return summary,stocks,trades,curve
+    return summary,stocks,trades,curve,calibration
 
 def delete_research_run(run_id):
     conn=sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM research_trades WHERE run_id=?",(run_id,))
     conn.execute("DELETE FROM research_stock_results WHERE run_id=?",(run_id,))
     conn.execute("DELETE FROM research_members WHERE run_id=?",(run_id,))
+    conn.execute("DELETE FROM research_membership WHERE run_id=?",(run_id,))
     conn.execute("DELETE FROM research_runs WHERE run_id=?",(run_id,))
     conn.commit(); conn.close()
 
