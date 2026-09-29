@@ -1,5 +1,6 @@
 import base64
 import html
+import hashlib
 import json
 import os
 import re
@@ -228,6 +229,8 @@ EXTRACT_PROMPT = """
 - 成交量只依据截图中的VOL柱与MA5/MA10判断；不要求MA20。
 - “异常放量”只表示明显偏离近期均量，不能自动判定利多或利空，必须结合价格位置与趋势解释。
 - 不要根据股票名称补充截图外行情。
+- 同一张截图在相同规则下必须尽量给出相同的分类结果；只依据图中可见事实分类。
+- 持仓、成本、历史评分、用户倾向不得影响BOLL/MACD/量能事实识别。
 
 必须只输出合法 json，不要Markdown，不要额外文字。JSON格式：
 {
@@ -319,6 +322,14 @@ def init_db():
     for name, typ in required.items():
         if name not in cols:
             conn.execute(f"ALTER TABLE analyses ADD COLUMN {name} {typ}")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS extraction_cache(
+      signature TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      raw_result TEXT
+    )
+    """)
     conn.commit()
     conn.close()
 
@@ -332,6 +343,43 @@ def reset_uploads():
     ]:
         st.session_state.pop(k, None)
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+
+def image_signature(daily_bytes, weekly_bytes=None):
+    h = hashlib.sha256()
+    h.update(b"TECH_EXTRACT_V3|")
+    h.update(daily_bytes or b"")
+    h.update(b"|WEEKLY|")
+    h.update(weekly_bytes or b"")
+    return h.hexdigest()
+
+def get_cached_extraction(signature):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT payload, raw_result FROM extraction_cache WHERE signature=?",
+        (signature,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None, None
+    try:
+        return json.loads(row[0]), row[1]
+    except Exception:
+        return None, None
+
+def save_cached_extraction(signature, payload, raw_result):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT OR REPLACE INTO extraction_cache(signature,created_at,payload,raw_result)
+           VALUES(?,?,?,?)""",
+        (
+            signature,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            json.dumps(payload, ensure_ascii=False, separators=(",",":")),
+            raw_result
+        )
+    )
+    conn.commit()
+    conn.close()
 
 def parse_json(text):
     text = (text or "").strip()
@@ -642,7 +690,7 @@ def render_cockpit(report):
         if report.get("resonance"):
             st.caption("共振：" + report.get("resonance",""))
 
-    st.caption(f"置信度 {report.get('confidence',0)}% · 技术分不是上涨概率。")
+    st.caption(f"置信度 {report.get('confidence',0)}% · 同一组截图复用同一识别结果；技术分不是上涨概率。")
 
 def history(limit=300):
     conn = sqlite3.connect(DB_PATH)
@@ -750,9 +798,9 @@ with tab1:
     fundamentals_ok = st.checkbox("基本面与估值已独立验证通过（中长线强烈建议）", value=False)
     notes = st.text_area("补充说明（可选）", placeholder="例如：盘中截图；准备持有3个月；只考虑回调加仓……", height=80)
 
-    st.subheader("③ 分析精度")
-    mode = st.radio("模式", ["省钱模式","标准模式","精细模式"], index=1, horizontal=True)
-    st.caption("标准模式适合绝大多数情况；省钱模式用于批量初筛；精细模式用于重要标的或图形复杂时。")
+    st.subheader("③ 分析模式")
+    mode = "稳定模式"
+    st.info("稳定模式：始终按原图读取，并复用同一截图的已识别结果，避免重复分析时评分漂移。")
 
     if st.button("🚀 生成中长线决策", type="primary", use_container_width=True):
         key = os.getenv("DEEPSEEK_API_KEY","") or st.session_state.get("api_key","")
@@ -774,16 +822,8 @@ with tab1:
             f"补充说明：{notes or '无'}",
             f"周线截图：{'有' if weekly_ready else '无'}",
         ]
-        if prev:
-            prompt_lines += [
-                "存在同标的历史记录，仅用于给comparison_hint提供方向性参考：",
-                f"上次评分：{prev.get('score','')}",
-                f"上次评级：{prev.get('rating','')}",
-                f"上次阶段：{prev.get('stage','')}",
-            ]
-
-        detail = "low" if mode == "省钱模式" else "original"
-        max_tokens = 2500 if mode == "省钱模式" else (4200 if mode == "标准模式" else 6000)
+        detail = "original"
+        max_tokens = 4200
 
         content = [{"type":"text","text":"\n".join(prompt_lines)}]
         content.append({
@@ -821,26 +861,38 @@ with tab1:
             return client.chat.completions.create(
                 model="deepseek-flash",
                 response_format={"type":"json_object"},
+                temperature=0,
                 max_tokens=budget,
                 messages=messages
             )
 
-        with st.spinner("正在读取日线/周线并构建技术证据..."):
-            try:
-                resp = call_ds(max_tokens)
-                raw = resp.choices[0].message.content or ""
-                x = parse_json(raw)
-                if not x or getattr(resp.choices[0], "finish_reason", None) == "length":
-                    resp = call_ds(7000, True)
+        sig = image_signature(
+            st.session_state.get("daily_bytes", b""),
+            st.session_state.get("weekly_bytes", b"") if weekly_ready else None
+        )
+        x, raw = get_cached_extraction(sig)
+        cache_hit = x is not None
+
+        if not cache_hit:
+            with st.spinner("正在读取日线/周线并构建技术证据..."):
+                try:
+                    resp = call_ds(max_tokens)
                     raw = resp.choices[0].message.content or ""
                     x = parse_json(raw)
-            except Exception as e:
-                st.error(f"分析失败：{e}")
-                st.stop()
+                    if not x or getattr(resp.choices[0], "finish_reason", None) == "length":
+                        resp = call_ds(7000, True)
+                        raw = resp.choices[0].message.content or ""
+                        x = parse_json(raw)
+                except Exception as e:
+                    st.error(f"分析失败：{e}")
+                    st.stop()
 
-        if not x:
-            st.error("DeepSeek 连续返回了不完整结构，请重新分析一次。")
-            st.stop()
+            if not x:
+                st.error("DeepSeek 连续返回了不完整结构，请重新分析一次。")
+                st.stop()
+            save_cached_extraction(sig, x, raw)
+        else:
+            st.toast("已识别为同一组截图，直接复用稳定结果。")
 
         metrics = score_engine(x, weekly_ready)
         score, trend, momentum, weekly_score, confirm, hard_bear, strong_bull = metrics
