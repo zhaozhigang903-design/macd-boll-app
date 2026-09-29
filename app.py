@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import hmac
 import re
 import sqlite3
 from datetime import datetime
@@ -25,6 +26,20 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+if APP_PASSWORD:
+    if not st.session_state.get("authenticated", False):
+        st.title("🔐 中长线决策引擎")
+        pwd = st.text_input("访问密码", type="password", placeholder="请输入访问密码")
+        if st.button("进入", type="primary", width="stretch"):
+            if hmac.compare_digest(pwd, APP_PASSWORD):
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("密码错误")
+        st.stop()
 
 st.markdown("""
 <style>
@@ -247,7 +262,8 @@ def fmt_num(v):
 init_db()
 
 st.title("📈 中长线决策引擎 V3")
-st.caption("周线定环境 · 日线定时机 · DeepSeek读图 · 规则引擎评分 · 风险预算控仓")
+st.caption("周线定环境 · 日线定时机 · DeepSeek只负责读图 · 规则引擎评分 · 风险预算控仓")
+st.caption("评分是规则一致性分数，不是上涨概率；任何单次信号都必须服从仓位和失效位纪律。")
 
 tab_decision, tab_history, tab_backtest, tab_system, tab_settings = st.tabs(
     ["🎯 决策","📚 历史","🧪 回测","🧠 系统","⚙️ 设置"]
@@ -265,6 +281,10 @@ with tab_settings:
             st.session_state["api_key"] = temp
             st.success("本次会话已启用临时 Key。")
     st.info("历史记录目前使用本地 SQLite。Render 免费实例重新部署/重建时可能清空历史；正式长期复盘应迁移到持久化数据库。")
+    if os.getenv("APP_PASSWORD",""):
+        st.success("已启用访问密码保护，DeepSeek额度不会暴露给公开访客。")
+    else:
+        st.warning("当前未启用APP_PASSWORD。若网址公开，其他人可能消耗你的DeepSeek额度。")
     st.markdown("iPhone：Safari 打开网址 → 分享 → **添加到主屏幕**。")
 
 with tab_system:
@@ -288,7 +308,7 @@ with tab_system:
         ["金叉/死叉",10,"确认信号"],
         ["成交量",10,"参与度验证"],
         ["背离",5,"风险预警"],
-    ], columns=["因子","满分","作用"]), hide_index=True, use_container_width=True)
+    ], columns=["因子","满分","作用"]), hide_index=True, width="stretch")
     st.caption("有周线时总分 = 日线45% + 周线55%。缺少周线时置信度封顶，主动建仓/加仓结论会自动降级。")
 
 with tab_decision:
@@ -307,10 +327,10 @@ with tab_decision:
     )
     if daily_img:
         with st.expander("查看日线截图"):
-            st.image(daily_img, use_container_width=True)
+            st.image(daily_img, width="stretch")
     if weekly_img:
         with st.expander("查看周线截图"):
-            st.image(weekly_img, use_container_width=True)
+            st.image(weekly_img, width="stretch")
 
     st.subheader("② 标的与投资前提")
     symbol = st.text_input("股票/ETF名称或代码", placeholder="例如：腾讯控股 / 0700.HK")
@@ -340,7 +360,7 @@ with tab_decision:
     st.subheader("④ 分析精度")
     mode = st.radio("DeepSeek模式",["省钱模式","标准模式","精细模式"],index=1,horizontal=True)
 
-    if st.button("🚀 生成中长线决策", type="primary", use_container_width=True):
+    if st.button("🚀 生成中长线决策", type="primary", width="stretch"):
         key = os.getenv("DEEPSEEK_API_KEY","") or st.session_state.get("api_key","")
         if not daily_img:
             st.error("请至少上传日线截图。")
@@ -448,6 +468,10 @@ with tab_decision:
             st.warning("中长线系统缺少周线截图：当前结论只适合做日线观察，主动建仓/加仓会被自动降级。")
         if conf < 70:
             st.warning("证据置信度低于70%。建议上传更清晰、指标更完整的截图后再做仓位决策。")
+        if daily.get("image_quality",0) and int(daily.get("image_quality",0)) < 65:
+            st.warning("日线截图质量偏低：关键数值可能识别错误，建议重新截图。")
+        if weekly.get("visible") and int(weekly.get("image_quality",0) or 0) < 65:
+            st.warning("周线截图质量偏低：中长线判断可靠性下降。")
 
         st.subheader("1. 多周期结构")
         r1,r2 = st.columns(2)
@@ -475,7 +499,7 @@ with tab_decision:
         score_rows = []
         for k,v in bd.items():
             score_rows.append([k,v,(bw or {}).get(k,"—")])
-        st.dataframe(pd.DataFrame(score_rows,columns=["因子","日线得分","周线得分"]),hide_index=True,use_container_width=True)
+        st.dataframe(pd.DataFrame(score_rows,columns=["因子","日线得分","周线得分"]),hide_index=True,width="stretch")
 
         st.subheader("3. 关键位与执行条件")
         key_rows = [
@@ -491,7 +515,7 @@ with tab_decision:
                 ["周线支撑",fmt_num(weekly.get("support_1"))],
                 ["周线压力",fmt_num(weekly.get("resistance_1"))],
             ]
-        st.dataframe(pd.DataFrame(key_rows,columns=["关键位","数值"]),hide_index=True,use_container_width=True)
+        st.dataframe(pd.DataFrame(key_rows,columns=["关键位","数值"]),hide_index=True,width="stretch")
 
         if pos_ref:
             st.markdown("### 风险预算仓位参考")
@@ -511,7 +535,7 @@ with tab_decision:
             ["大盘/行业",market_regime,"弱势环境提高进攻门槛"],
             ["当前仓位",position_level,"重仓时即便强势也优先控制集中度"],
         ],columns=["维度","当前输入","系统纪律"])
-        st.dataframe(constraints,hide_index=True,use_container_width=True)
+        st.dataframe(constraints,hide_index=True,width="stretch")
 
         if compare_text:
             st.subheader("5. 与上次相比")
@@ -575,7 +599,7 @@ with tab_decision:
             report.encode("utf-8"),
             file_name=f"{symbol or 'analysis'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
             mime="text/markdown",
-            use_container_width=True
+            width="stretch"
         )
 
 with tab_history:
@@ -588,7 +612,7 @@ with tab_history:
         chosen = st.selectbox("筛选标的",symbols)
         view = df if chosen=="全部" else df[df["symbol"]==chosen]
         cols = ["created_at","symbol","score","rating","action","stage","daily_score","weekly_score","confidence","decision"]
-        st.dataframe(view[cols],hide_index=True,use_container_width=True)
+        st.dataframe(view[cols],hide_index=True,width="stretch")
         if chosen!="全部" and len(view)>=2:
             chart = view.sort_values("created_at")[["created_at","score"]].copy()
             st.line_chart(chart.set_index("created_at")["score"],height=230)
@@ -598,7 +622,7 @@ with tab_history:
             view.to_csv(index=False).encode("utf-8-sig"),
             "medium_term_history.csv",
             "text/csv",
-            use_container_width=True
+            width="stretch"
         )
 
 with tab_backtest:
@@ -619,7 +643,7 @@ with tab_backtest:
         slow = st.number_input("MACD慢线",15,50,26)
         sig = st.number_input("MACD信号线",5,20,9)
 
-    if csv_file and st.button("运行回测",type="primary",use_container_width=True):
+    if csv_file and st.button("运行回测",type="primary",width="stretch"):
         try:
             x = pd.read_csv(csv_file)
             bt = backtest(x,fee,boll_n,int(fast),int(slow),int(sig))
