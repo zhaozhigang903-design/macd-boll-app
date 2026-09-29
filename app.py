@@ -80,7 +80,7 @@ WATCH=观察，修复/测试/震荡/冲突；
 REDUCE=减仓，明显转弱；
 AVOID=回避，趋势动能双弱。
 
-先输出一个JSON代码块，字段严格为：
+必须只输出一个合法 JSON 对象，不要 Markdown 代码块，不要在 JSON 前后添加任何文字。字段严格为：
 {
  "rating":"",
  "state":"",
@@ -103,17 +103,21 @@ AVOID=回避，趋势动能双弱。
  "key_level":"",
  "upgrade_condition":"",
  "downgrade_condition":"",
- "confidence":0
+ "confidence":0,
+ "essence":"",
+ "boll_analysis":"",
+ "macd_analysis":"",
+ "resonance":"",
+ "comparison":"",
+ "action_1":"",
+ "action_2":"",
+ "action_3":"",
+ "risk_1":"",
+ "risk_2":"",
+ "risk_3":"",
+ "decision_model":""
 }
-
-JSON后输出：
-## 1. 本质分析
-## 2. 结构化决策
-## 3. 明确结论
-## 4. 可执行行动
-### 风险提示 Top 3
-### 一句话判断模型
-
+所有字符串用简洁中文；confidence 为 0-100 的整数。
 不要承诺收益，不使用“必涨/必跌/稳赚”。
 """
 
@@ -150,15 +154,30 @@ def to_data_url(file):
     return f"data:{mime};base64,{base64.b64encode(file.getvalue()).decode('utf-8')}"
 
 def parse_result(text):
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
-    if not m:
-        return None, text
+    text = (text or "").strip()
+    # 1) DeepSeek JSON Output: expected path
     try:
-        obj = json.loads(m.group(1))
+        obj = json.loads(text)
+        return obj, ""
     except Exception:
-        return None, text
-    body = re.sub(r"```json\s*\{.*?\}\s*```", "", text, count=1, flags=re.S).strip()
-    return obj, body
+        pass
+
+    # 2) Fallback: fenced JSON
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S | re.I)
+    if m:
+        try:
+            return json.loads(m.group(1)), ""
+        except Exception:
+            pass
+
+    # 3) Fallback: first balanced-looking JSON object
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end+1]), ""
+        except Exception:
+            pass
+    return None, text
 
 def previous(symbol):
     if not symbol:
@@ -303,6 +322,7 @@ with tab1:
                 resp = client.chat.completions.create(
                     model="deepseek-flash",
                     max_tokens=max_tokens,
+                    response_format={"type":"json_object"},
                     messages=[
                         {"role":"system","content":SYSTEM_PROMPT},
                         {
@@ -327,7 +347,7 @@ with tab1:
 
         parsed, body = parse_result(raw)
         if not parsed:
-            st.warning("结果已生成，但结构化JSON解析失败，本次不保存历史。")
+            st.warning("DeepSeek 返回格式异常，已保留原始结果但本次不保存历史。请再点一次分析。")
             st.markdown(body)
         else:
             save(symbol.strip(), market, parsed, raw)
@@ -340,14 +360,44 @@ with tab1:
             c4.metric("置信度", f"{parsed.get('confidence',0)}%")
 
             st.markdown(f"<div class='decision'><b>一句话结论</b><br>{parsed.get('one_line','')}</div>", unsafe_allow_html=True)
+
+            st.markdown("## 1. 本质分析")
+            st.write(parsed.get("essence",""))
+            st.markdown(f"**BOLL：** {parsed.get('boll_analysis','')}")
+            st.markdown(f"**MACD：** {parsed.get('macd_analysis','')}")
+            st.markdown(f"**共振/冲突：** {parsed.get('resonance','')}")
+            if parsed.get("comparison"):
+                st.markdown(f"**与上次相比：** {parsed.get('comparison','')}")
+
+            st.markdown("## 2. 结构化决策")
+            decision_df = pd.DataFrame([
+                ["BOLL中轨", parsed.get("boll_mid_direction","未知"), parsed.get("boll_mid","未知")],
+                ["价格位置", parsed.get("price_vs_mid","未知"), parsed.get("price","未知")],
+                ["MACD零轴", parsed.get("macd_zero_zone","未知"), parsed.get("cross","未知")],
+                ["柱体动能", parsed.get("bar_momentum","未知"), parsed.get("macd_bar","未知")],
+            ], columns=["维度","当前状态","关键数据"])
+            st.dataframe(decision_df, use_container_width=True, hide_index=True)
+
+            st.markdown("## 3. 明确结论")
+            st.info(f"评级 {parsed.get('rating','未知')} · 状态 {parsed.get('state','未知')} · 阶段：{parsed.get('stage','未知')}")
             st.markdown("**关键观察位**")
             st.info(parsed.get("key_level","未知"))
             st.markdown("**升级条件**")
             st.success(parsed.get("upgrade_condition","未知"))
             st.markdown("**降级条件**")
             st.warning(parsed.get("downgrade_condition","未知"))
-            st.divider()
-            st.markdown(body)
+
+            st.markdown("## 4. 可执行行动")
+            st.markdown(f"1. {parsed.get('action_1','')}")
+            st.markdown(f"2. {parsed.get('action_2','')}")
+            st.markdown(f"3. {parsed.get('action_3','')}")
+
+            st.markdown("### 风险提示 Top 3")
+            st.markdown(f"- {parsed.get('risk_1','')}")
+            st.markdown(f"- {parsed.get('risk_2','')}")
+            st.markdown(f"- {parsed.get('risk_3','')}")
+            st.markdown("### 一句话判断模型")
+            st.write(parsed.get("decision_model",""))
 
 with tab2:
     st.subheader("历史记录")
