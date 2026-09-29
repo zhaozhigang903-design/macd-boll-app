@@ -44,7 +44,11 @@ div[data-testid="stMetric"]{border:1px solid rgba(128,128,128,.22);border-radius
  h1{font-size:1.38rem!important}
  .stTextInput input,.stTextArea textarea{font-size:16px!important}
  button[kind="primary"]{min-height:50px;font-size:1.03rem}
+ div[data-testid="stMetric"]{padding:7px 8px}
+ .hero{padding:11px;margin:6px 0 9px}
 }
+.compactline{font-size:.92rem;line-height:1.45;margin:.3rem 0}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -123,7 +127,7 @@ EXTRACT_PROMPT = """
 }
 要求：
 - data_quality 是0-100整数，衡量截图是否足够清晰、周期/指标是否可判断。
-- 所有解释字段简洁，单项尽量不超过100个汉字。
+- 输出必须适合手机阅读：essence不超过60个汉字，其余解释字段尽量不超过45个汉字。
 - 宁可写未知，也不要编造。
 """
 
@@ -168,9 +172,16 @@ def init_db():
     conn.commit()
     conn.close()
 
-def data_url(file):
-    mime = getattr(file, "type", None) or "image/png"
-    return f"data:{mime};base64,{base64.b64encode(file.getvalue()).decode('utf-8')}"
+def data_url_bytes(blob, mime="image/png"):
+    return f"data:{mime};base64,{base64.b64encode(blob).decode('utf-8')}"
+
+def reset_uploads():
+    for k in [
+        "daily_bytes","daily_mime","daily_name",
+        "weekly_bytes","weekly_mime","weekly_name"
+    ]:
+        st.session_state.pop(k, None)
+    st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
 
 def parse_json(text):
     text = (text or "").strip()
@@ -327,18 +338,18 @@ def stage_from(score, d, weekly_ok):
 def state_from(score, rating, quality, intraday, weekly_ok, position_state, fundamentals_ok, hard_bear):
     holding = position_state != "未持有"
     if quality < 65:
-        return "WATCH", "截图质量不足，先复核数据"
+        return "观察", "截图质量不足，先复核数据"
     if hard_bear or score < 35:
-        return ("REDUCE" if holding else "AVOID"), "趋势与动能处于明显弱势"
+        return ("减仓" if holding else "回避"), "趋势与动能处于明显弱势"
     if holding and score < 48:
-        return "REDUCE", "中长线结构转弱，优先控制风险"
+        return "减仓", "中长线结构转弱，优先控制风险"
     if score >= 78 and weekly_ok and not intraday:
         if fundamentals_ok:
-            return "BUY CANDIDATE", "技术面进入高质量候选区"
-        return "WATCH", "技术面较强，但中长线仍需基本面/估值独立验证"
+            return "买入候选", "技术面进入高质量候选区"
+        return "观察", "技术面较强，但中长线仍需基本面/估值独立验证"
     if holding and score >= 58:
-        return "HOLD", "趋势尚未破坏，等待升级或降级条件"
-    return "WATCH", "证据尚不足，等待关键确认"
+        return "持有", "趋势尚未破坏，等待升级或降级条件"
+    return "观察", "证据尚不足，等待关键确认"
 
 def confidence_from(x, weekly_uploaded):
     q = int(x.get("data_quality", 0) or 0)
@@ -407,13 +418,13 @@ st.caption("DeepSeek 国内版 · 先读图 → 再规则评分 → 最后给行
 tab1, tab2, tab3, tab4 = st.tabs(["📷 分析", "📚 历史", "🧠 方法", "⚙️ 设置"])
 
 with tab4:
-    st.subheader("API 设置")
+    st.subheader("接口设置")
     env_key = os.getenv("DEEPSEEK_API_KEY", "")
     if env_key:
-        st.success("服务器已配置 DeepSeek API Key，无需重复输入。")
+        st.success("服务器已配置 DeepSeek 接口密钥，无需重复输入。")
     else:
         st.info("服务器尚未配置 Key。可在这里临时输入；仅保存在当前会话。")
-    temp = st.text_input("DeepSeek API Key", type="password", key="temp_key")
+    temp = st.text_input("DeepSeek 接口密钥", type="password", key="temp_key")
     if temp:
         st.session_state["api_key"] = temp
         st.success("本次会话已启用临时 Key。")
@@ -442,16 +453,44 @@ with tab3:
 
 with tab1:
     st.subheader("① 上传图表")
-    st.caption("固定模板建议：主图 BOLL(20,2)；副图1 MACD(12,26,9)；副图2 VOL + MA5 + MA10。日线和周线保持一致。")
+    st.caption("模板：BOLL(20,2) + MACD(12,26,9) + VOL/MA5/MA10。")
+    nonce = st.session_state.get("upload_nonce", 0)
     c1, c2 = st.columns(2)
     with c1:
-        daily_img = st.file_uploader("日线截图（必填）", type=["png","jpg","jpeg","webp"], key="daily")
-        if daily_img:
-            st.image(daily_img, use_container_width=True)
+        daily_upload = st.file_uploader(
+            "日线（必填）",
+            type=["png","jpg","jpeg","webp"],
+            key=f"daily_{nonce}"
+        )
+        if daily_upload is not None:
+            st.session_state["daily_bytes"] = daily_upload.getvalue()
+            st.session_state["daily_mime"] = getattr(daily_upload, "type", None) or "image/png"
+            st.session_state["daily_name"] = getattr(daily_upload, "name", "日线截图")
+        if st.session_state.get("daily_bytes"):
+            st.success("✅ 日线已载入")
+            with st.expander("查看日线截图"):
+                st.image(st.session_state["daily_bytes"], use_container_width=True)
     with c2:
-        weekly_img = st.file_uploader("周线截图（推荐，中长线过滤器）", type=["png","jpg","jpeg","webp"], key="weekly")
-        if weekly_img:
-            st.image(weekly_img, use_container_width=True)
+        weekly_upload = st.file_uploader(
+            "周线（推荐）",
+            type=["png","jpg","jpeg","webp"],
+            key=f"weekly_{nonce}"
+        )
+        if weekly_upload is not None:
+            st.session_state["weekly_bytes"] = weekly_upload.getvalue()
+            st.session_state["weekly_mime"] = getattr(weekly_upload, "type", None) or "image/png"
+            st.session_state["weekly_name"] = getattr(weekly_upload, "name", "周线截图")
+        if st.session_state.get("weekly_bytes"):
+            st.success("✅ 周线已载入")
+            with st.expander("查看周线截图"):
+                st.image(st.session_state["weekly_bytes"], use_container_width=True)
+
+    if st.button("🗑️ 清空已上传图片", use_container_width=True):
+        reset_uploads()
+        st.rerun()
+
+    daily_ready = bool(st.session_state.get("daily_bytes"))
+    weekly_ready = bool(st.session_state.get("weekly_bytes"))
 
     st.subheader("② 决策上下文")
     symbol = st.text_input("股票/ETF名称或代码", placeholder="例如：腾讯控股 / 0700.HK")
@@ -472,11 +511,11 @@ with tab1:
 
     if st.button("🚀 生成中长线决策", type="primary", use_container_width=True):
         key = os.getenv("DEEPSEEK_API_KEY","") or st.session_state.get("api_key","")
-        if not daily_img:
+        if not daily_ready:
             st.error("请先上传日线截图。")
             st.stop()
         if not key:
-            st.error("请先在“设置”配置 DeepSeek API Key。")
+            st.error("请先在“设置”配置 DeepSeek 接口密钥。")
             st.stop()
 
         prev = previous(symbol.strip())
@@ -488,7 +527,7 @@ with tab1:
             f"当前仓位：{position_state}",
             f"持仓成本：{cost or '未填写'}",
             f"补充说明：{notes or '无'}",
-            f"周线截图：{'有' if weekly_img else '无'}",
+            f"周线截图：{'有' if weekly_ready else '无'}",
         ]
         if prev:
             prompt_lines += [
@@ -502,9 +541,27 @@ with tab1:
         max_tokens = 2500 if mode == "省钱模式" else (4200 if mode == "标准模式" else 6000)
 
         content = [{"type":"text","text":"\n".join(prompt_lines)}]
-        content.append({"type":"image_url","image_url":{"url":data_url(daily_img),"detail":detail}})
-        if weekly_img:
-            content.append({"type":"image_url","image_url":{"url":data_url(weekly_img),"detail":detail}})
+        content.append({
+            "type":"image_url",
+            "image_url":{
+                "url":data_url_bytes(
+                    st.session_state["daily_bytes"],
+                    st.session_state.get("daily_mime","image/png")
+                ),
+                "detail":detail
+            }
+        })
+        if weekly_ready:
+            content.append({
+                "type":"image_url",
+                "image_url":{
+                    "url":data_url_bytes(
+                        st.session_state["weekly_bytes"],
+                        st.session_state.get("weekly_mime","image/png")
+                    ),
+                    "detail":detail
+                }
+            })
 
         client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
 
@@ -540,10 +597,10 @@ with tab1:
             st.error("DeepSeek 连续返回了不完整结构，请重新分析一次。")
             st.stop()
 
-        metrics = score_engine(x, weekly_img is not None)
+        metrics = score_engine(x, weekly_ready)
         score, trend, momentum, weekly_score, confirm, hard_bear, strong_bull = metrics
         weekly_ok = weekly_score is not None and weekly_score >= 60
-        confidence = confidence_from(x, weekly_img is not None)
+        confidence = confidence_from(x, weekly_ready)
         rating = grade(score, weekly_ok, confidence)
         stage = stage_from(score, x.get("daily",{}), weekly_ok)
         state, state_reason = state_from(
@@ -555,126 +612,118 @@ with tab1:
             "symbol":symbol.strip(), "market":market, "horizon":horizon,
             "position_state":position_state, "rating":rating, "state":state,
             "stage":stage, "confidence":confidence, "mode":mode,
-            "weekly_used":weekly_img is not None
+            "weekly_used":weekly_ready
         }
         save_result(meta, x, metrics, raw)
 
-        st.subheader("④ 决策总览")
+        st.subheader("④ 结论")
+        d = x.get("daily",{}) or {}
+
         st.markdown(
-            f"<div class='hero'><b>{signal_color(score)} {state}</b><br>"
-            f"<span style='font-size:1.25rem;font-weight:700'>技术质量分 {score:.1f}/100 · {rating}</span><br>"
-            f"{stage}<br><span class='muted'>{state_reason}</span></div>",
+            f"<div class='hero'><b>{signal_color(score)} {state} · {rating}</b><br>"
+            f"<span style='font-size:1.18rem;font-weight:700'>{stage}</span><br>"
+            f"<span class='muted'>技术分 {score:.0f} · 置信度 {confidence}% · {state_reason}</span></div>",
             unsafe_allow_html=True
         )
 
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("趋势", f"{trend:.0f}")
-        m2.metric("动能", f"{momentum:.0f}")
-        m3.metric("周线", "未提供" if weekly_score is None else f"{weekly_score:.0f}")
-        m4.metric("置信度", f"{confidence}%")
+        weekly_txt = "—" if weekly_score is None else f"{weekly_score:.0f}"
+        st.markdown(
+            f"<div class='compactline'><b>趋势</b> {trend:.0f}　"
+            f"<b>动能</b> {momentum:.0f}　"
+            f"<b>周线</b> {weekly_txt}　"
+            f"<b>量能</b> {confirm:.0f}</div>",
+            unsafe_allow_html=True
+        )
+
+        if x.get("essence"):
+            st.info(x.get("essence",""))
 
         if bool(x.get("is_intraday")):
-            st.warning("这是盘中截图：日K与指标尚未定型，系统已自动降低置信度。")
-        if cat((x.get("daily") or {}).get("volume_state")) == "异常放量":
-            st.warning("检测到异常放量：它不是自动利多/利空信号，必须结合价格位于中轨上/下、是否突破/跌破关键位来解释。")
+            st.warning("盘中截图：信号未定型，已降低置信度。")
         if confidence < 65:
-            st.error(f"截图质量不足（{confidence}%）。缺失/模糊：{x.get('missing_or_unclear','未说明')}。不建议依据本次结果采取中长线动作。")
+            st.error("截图清晰度不足，本次只作观察，不据此执行。")
 
-        st.markdown("### 核心判断")
-        st.write(x.get("essence",""))
-        st.markdown(f"**BOLL：** {x.get('boll_analysis','')}")
-        st.markdown(f"**MACD：** {x.get('macd_analysis','')}")
-        if weekly_img:
-            st.markdown(f"**周线：** {x.get('weekly_analysis','')}")
-        st.markdown(f"**共振/冲突：** {x.get('resonance','')}")
-
-        st.markdown("### 技术证据表")
-        d = x.get("daily",{}) or {}
-        rows = [
-            ["BOLL中轨", d.get("boll_mid_direction","未知"), "主趋势方向"],
-            ["价格位置", d.get("price_vs_mid","未知"), f"现价 {d.get('price','未知')} / 中轨 {d.get('boll_mid','未知')}"],
-            ["BOLL带宽", d.get("boll_band_state","未知"), "趋势扩张/收敛"],
-            ["MACD零轴", d.get("macd_zero_zone","未知"), "环境强弱"],
-            ["DIF方向", d.get("dif_direction","未知"), "趋势动能方向"],
-            ["交叉", d.get("cross","未知"), "确认信号"],
-            ["柱体", d.get("bar_momentum","未知"), "动能加减速"],
-            ["成交量", d.get("volume_state","未知"), "参与度确认"],
-            ["VOL vs MA5", d.get("vol_vs_ma5","未知"), "短期量能强弱"],
-            ["VOL vs MA10", d.get("vol_vs_ma10","未知"), "中短期量能基准"],
-            ["量能趋势", d.get("volume_trend","未知"), "近期参与度变化"],
-            ["背离", d.get("divergence","未知"), "仅作风险提示"],
-        ]
-        st.dataframe(pd.DataFrame(rows, columns=["证据","当前状态","作用"]), use_container_width=True, hide_index=True)
-
-        st.markdown("### 关键价位")
         k1,k2 = st.columns(2)
-        k1.info(f"支撑：{x.get('key_support','未知')}")
-        k2.warning(f"压力：{x.get('key_resistance','未知')}")
+        k1.caption("关键支撑")
+        k1.write(x.get("key_support","未知"))
+        k2.caption("关键压力")
+        k2.write(x.get("key_resistance","未知"))
 
-        st.markdown("### 升级 / 降级条件")
         daily_mid = d.get("boll_mid","未知")
         upgrade_parts = []
         downgrade_parts = []
         if d.get("boll_mid_direction") != "向上":
-            upgrade_parts.append("BOLL中轨由走平/向下转为向上")
+            upgrade_parts.append("中轨转向上")
         if d.get("price_vs_mid") != "中轨上":
-            upgrade_parts.append(f"价格有效站上中轨 {daily_mid}")
+            upgrade_parts.append(f"站稳中轨 {daily_mid}")
         if d.get("macd_zero_zone") != "零轴上":
-            upgrade_parts.append("DIF/DEA向零轴上方迁移")
+            upgrade_parts.append("MACD回到零轴上")
         if weekly_score is None:
-            upgrade_parts.append("补充周线并获得同向确认")
+            upgrade_parts.append("补周线确认")
         elif weekly_score < 60:
-            upgrade_parts.append("周线由弱转强并确认日线")
+            upgrade_parts.append("周线转强")
 
         if d.get("price_vs_mid") != "中轨下":
-            downgrade_parts.append(f"有效跌破/持续运行在中轨 {daily_mid} 下方")
+            downgrade_parts.append(f"失守中轨 {daily_mid}")
         if d.get("bar_momentum") != "绿柱放大":
-            downgrade_parts.append("MACD绿柱明显放大")
-        downgrade_parts.append("周线同步转弱或关键支撑失守")
+            downgrade_parts.append("MACD绿柱放大")
+        downgrade_parts.append("关键支撑失守")
 
-        st.success("升级：" + "；".join(upgrade_parts[:4]) if upgrade_parts else "升级：当前已处于较强共振区，重点观察趋势延续。")
-        st.warning("降级：" + "；".join(downgrade_parts[:3]))
+        up_text = "；".join(upgrade_parts[:2]) if upgrade_parts else "维持强势并继续确认"
+        down_text = "；".join(downgrade_parts[:2])
+        st.success("升级：" + up_text)
+        st.warning("降级：" + down_text)
 
         if prev and prev.get("score") is not None:
             try:
                 delta = score - float(prev.get("score"))
                 arrow = "↑" if delta > 3 else ("↓" if delta < -3 else "→")
-                st.markdown(f"### 与上次相比：{arrow} {delta:+.1f} 分")
-                st.caption(f"上次 {prev.get('score')} / {prev.get('rating')} / {prev.get('stage')} → 本次 {score} / {rating} / {stage}")
+                st.caption(f"较上次 {arrow} {delta:+.1f} 分")
             except Exception:
                 pass
 
-        with st.expander("🧮 风险预算 / 仓位计算器"):
-            st.caption("这是风险控制计算，不是收益承诺。输入计划入场价与失效价，系统按最大可承受亏损反推仓位。")
+        with st.expander("查看详细技术证据"):
+            rows = [
+                ["中轨", d.get("boll_mid_direction","未知")],
+                ["价格位置", d.get("price_vs_mid","未知")],
+                ["MACD零轴", d.get("macd_zero_zone","未知")],
+                ["DIF", d.get("dif_direction","未知")],
+                ["交叉", d.get("cross","未知")],
+                ["柱体", d.get("bar_momentum","未知")],
+                ["成交量", d.get("volume_state","未知")],
+                ["量能趋势", d.get("volume_trend","未知")],
+                ["背离", d.get("divergence","未知")],
+            ]
+            st.dataframe(
+                pd.DataFrame(rows, columns=["证据","状态"]),
+                use_container_width=True,
+                hide_index=True
+            )
+            if x.get("boll_analysis"):
+                st.caption("BOLL：" + x.get("boll_analysis",""))
+            if x.get("macd_analysis"):
+                st.caption("MACD：" + x.get("macd_analysis",""))
+            if weekly_ready and x.get("weekly_analysis"):
+                st.caption("周线：" + x.get("weekly_analysis",""))
+            if x.get("resonance"):
+                st.caption("共振：" + x.get("resonance",""))
+
+        with st.expander("仓位风险计算器"):
             rc1, rc2 = st.columns(2)
             with rc1:
-                capital = st.number_input("用于该账户的资金", min_value=0.0, value=100000.0, step=10000.0)
+                capital = st.number_input("账户资金", min_value=0.0, value=100000.0, step=10000.0)
                 risk_pct = st.number_input("单次最大风险 %", min_value=0.1, max_value=5.0, value=0.8, step=0.1)
             with rc2:
                 entry = st.number_input("计划入场价", min_value=0.0, value=0.0, step=0.1)
-                stop = st.number_input("技术失效价/止损参考", min_value=0.0, value=0.0, step=0.1)
+                stop = st.number_input("技术失效价", min_value=0.0, value=0.0, step=0.1)
             if entry > 0 and stop > 0 and entry > stop:
                 risk_cash = capital * risk_pct / 100
                 shares = int(risk_cash / (entry-stop))
                 position_value = shares * entry
                 pct = (position_value/capital*100) if capital else 0
-                st.info(f"风险预算约 {risk_cash:,.0f}；理论最大股数约 {shares:,}；对应仓位约 {position_value:,.0f}（{pct:.1f}%）。")
-            else:
-                st.caption("入场价需要高于失效价，才能计算多头仓位。")
+                st.info(f"风险预算 {risk_cash:,.0f}；理论上限约 {shares:,} 股；约占资金 {pct:.1f}%")
 
-        st.markdown("### 执行纪律")
-        if state == "BUY CANDIDATE":
-            st.write("技术面达到中长线候选标准，但更适合分批进入而不是一次性满仓；后续只在升级条件兑现时提高暴露。")
-        elif state == "HOLD":
-            st.write("继续持有的前提是中轨/周线结构不被破坏；不要因为单日波动频繁交易。")
-        elif state == "REDUCE":
-            st.write("当前重点是降低组合回撤，而不是猜底；等待趋势重新修复后再提高仓位。")
-        elif state == "AVOID":
-            st.write("当前技术证据不足以支持中长线新增风险暴露，优先等待结构重建。")
-        else:
-            st.write("保持观察。等趋势、动能与周线形成更高质量共振，再考虑提高风险暴露。")
-
-        st.caption("评分不是上涨概率。技术图表不能替代基本面、估值、行业和组合风险管理。")
+        st.caption("技术分不是上涨概率；中长线仍需结合基本面、估值与组合风险。")
 
 with tab2:
     st.subheader("历史记录与信号演化")
@@ -696,7 +745,7 @@ with tab2:
             st.line_chart(chart[["score","trend_score","momentum_score"]], height=250)
             st.caption("曲线用于看技术状态是否持续升级，不代表未来收益。")
         st.download_button(
-            "⬇️ 导出历史 CSV",
+            "⬇️ 导出历史记录",
             view.to_csv(index=False).encode("utf-8-sig"),
             "mid_long_history.csv",
             "text/csv",
