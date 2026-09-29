@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import tushare as ts
+import baostock as bs
 from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
@@ -702,30 +702,69 @@ def render_cockpit(report):
     st.caption(f"置信度 {report.get('confidence',0)}% · 同一组截图复用同一识别结果；技术分不是上涨概率。")
 
 
-def get_tushare_token():
-    return os.getenv("TUSHARE_TOKEN","") or st.session_state.get("tushare_token","")
+def _rs_to_df(rs):
+    rows = []
+    while rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+    return pd.DataFrame(rows, columns=rs.fields)
 
-def tushare_pro():
-    token = get_tushare_token()
-    if not token:
-        return None
-    return ts.pro_api(token)
+def normalize_code(code):
+    s = str(code or "").strip().lower()
+    if not s:
+        return ""
+    if s.startswith(("sh.","sz.")):
+        return s
+    digits = re.sub(r"\D","",s)
+    if len(digits) != 6:
+        return s
+    if digits.startswith(("5","6","9")):
+        return "sh." + digits
+    return "sz." + digits
 
-def normalize_daily(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    out["trade_date"] = pd.to_datetime(out["trade_date"])
-    out = out.sort_values("trade_date").reset_index(drop=True)
-    for col in ["open","high","low","close","vol","amount"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out
+def display_code(code):
+    s = str(code or "")
+    return s.split(".")[-1].upper() if "." in s else s.upper()
+
+def bs_login():
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError("BaoStock登录失败：" + lg.error_msg)
+    return lg
+
+def stock_basic_name(code):
+    rs = bs.query_stock_basic(code=code)
+    df = _rs_to_df(rs)
+    if df.empty:
+        return display_code(code)
+    for col in ["code_name","name"]:
+        if col in df.columns and str(df.iloc[0][col]).strip():
+            return str(df.iloc[0][col]).strip()
+    return display_code(code)
+
+def fetch_stock_daily(code, years=3):
+    code = normalize_code(code)
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (pd.Timestamp.today() - pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    fields = "date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus,isST"
+    rs = bs.query_history_k_data_plus(
+        code, fields, start_date=start, end_date=end, frequency="d", adjustflag="2"
+    )
+    df = _rs_to_df(rs)
+    if df.empty:
+        return df
+    df = df.rename(columns={"date":"trade_date","volume":"vol"})
+    for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    if "tradestatus" in df.columns:
+        df = df[df["tradestatus"].astype(str) == "1"]
+    return df.sort_values("trade_date").reset_index(drop=True)
 
 def add_indicators(df):
-    d = normalize_daily(df)
-    if d.empty:
-        return d
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy().sort_values("trade_date").reset_index(drop=True)
     close = d["close"]
     d["boll_mid"] = close.rolling(20).mean()
     std = close.rolling(20).std(ddof=0)
@@ -740,21 +779,20 @@ def add_indicators(df):
     d["vol_ma10"] = d["vol"].rolling(10).mean()
     d["boll_slope"] = d["boll_mid"] - d["boll_mid"].shift(3)
     d["dif_slope"] = d["dif"] - d["dif"].shift(3)
+    d["high20"] = d["high"].rolling(20).max()
+    d["low20"] = d["low"].rolling(20).min()
     return d
 
 def weekly_from_daily(df):
     if df is None or df.empty:
         return pd.DataFrame()
-    d = normalize_daily(df).set_index("trade_date")
-    w = pd.DataFrame({
-        "open": d["open"].resample("W-FRI").first(),
-        "high": d["high"].resample("W-FRI").max(),
-        "low": d["low"].resample("W-FRI").min(),
-        "close": d["close"].resample("W-FRI").last(),
-        "vol": d["vol"].resample("W-FRI").sum(),
-        "amount": d["amount"].resample("W-FRI").sum() if "amount" in d.columns else np.nan,
-    }).dropna(subset=["close"]).reset_index()
-    w["trade_date"] = w["trade_date"].dt.normalize()
+    d = df.copy().set_index("trade_date")
+    agg = {
+        "open":"first","high":"max","low":"min","close":"last","vol":"sum"
+    }
+    if "amount" in d.columns:
+        agg["amount"] = "sum"
+    w = d.resample("W-FRI").agg(agg).dropna(subset=["close"]).reset_index()
     return add_indicators(w)
 
 def numeric_score(latest_d, latest_w=None):
@@ -801,7 +839,8 @@ def numeric_score(latest_d, latest_w=None):
     vol = latest_d.get("vol",np.nan)
     v5, v10 = latest_d.get("vol_ma5",np.nan), latest_d.get("vol_ma10",np.nan)
     if pd.notna(vol) and pd.notna(v5) and pd.notna(v10):
-        if vol > v5 and vol > v10: confirm += 20
+        if vol > v5*1.35 and vol > v10*1.35: confirm += 20
+        elif vol > v5 and vol > v10: confirm += 12
         elif vol < v5 and vol < v10: confirm -= 8
         else: confirm += 5
     confirm = clamp(confirm)
@@ -821,51 +860,111 @@ def numeric_score(latest_d, latest_w=None):
     overall = (0.50*trend + 0.35*momentum + 0.15*confirm) if weekly is None else (0.38*trend + 0.30*momentum + 0.22*weekly + 0.10*confirm)
     return round(overall,1), round(trend,1), round(momentum,1), (round(weekly,1) if weekly is not None else None), round(confirm,1)
 
-def fetch_stock_daily(pro, code, years=3):
-    end = datetime.now().strftime("%Y%m%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=365*years+120)).strftime("%Y%m%d")
-    df = pro.daily(ts_code=code, start_date=start, end_date=end)
-    return normalize_daily(df)
+def deterministic_report(code, name, df, position_state, fundamentals_ok):
+    di = add_indicators(df)
+    wi = weekly_from_daily(df)
+    if len(di) < 60:
+        raise RuntimeError("历史数据不足，无法计算指标")
+    drow = di.iloc[-1].to_dict()
+    drow["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
+    wrow = wi.iloc[-1].to_dict() if len(wi) >= 20 else None
+    score, trend, momentum, weekly, confirm = numeric_score(drow, wrow)
+    weekly_ok = weekly is not None and weekly >= 60
+    rating = grade(score, weekly_ok, 100)
+    stage = stage_from(score, {}, weekly_ok)
 
-def fetch_index_members(pro, index_code, limit_n):
-    today = datetime.now().strftime("%Y%m%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=120)).strftime("%Y%m%d")
-    w = pro.index_weight(index_code=index_code, start_date=start, end_date=today)
-    if w is None or w.empty:
+    hard_bear = (
+        pd.notna(drow.get("boll_slope")) and drow.get("boll_slope") < 0
+        and pd.notna(drow.get("boll_mid")) and drow.get("close") < drow.get("boll_mid")
+        and pd.notna(drow.get("dif")) and drow.get("dif") < 0
+        and pd.notna(drow.get("dea")) and drow.get("dif") < drow.get("dea")
+    )
+    state, reason = state_from(score, rating, 100, False, weekly_ok, position_state, fundamentals_ok, hard_bear)
+
+    mid = drow.get("boll_mid",np.nan)
+    support = drow.get("low20",np.nan)
+    resistance = drow.get("high20",np.nan)
+    if pd.notna(mid) and pd.notna(support):
+        support_txt = f"{support:.2f}（20日低点）/ {mid:.2f}（中轨）"
+    else:
+        support_txt = "未知"
+    resistance_txt = f"{resistance:.2f}（20日高点）" if pd.notna(resistance) else "未知"
+
+    boll_dir = "向上" if drow.get("boll_slope",0) > 0 else ("向下" if drow.get("boll_slope",0) < 0 else "走平")
+    pos = "中轨上" if pd.notna(mid) and drow.get("close") > mid else "中轨下"
+    zero = "零轴上" if drow.get("dif",0) > 0 and drow.get("dea",0) > 0 else "零轴下/附近"
+    cross = "金叉" if drow.get("dif",0) > drow.get("dea",0) else "死叉"
+
+    essence = f"日线中轨{boll_dir}、价格位于{pos}；MACD处于{zero}并呈{cross}。"
+    if weekly is not None:
+        essence += f" 周线分{weekly:.0f}/100。"
+
+    up = []
+    down = []
+    if boll_dir != "向上": up.append("日线中轨转向上")
+    if pos != "中轨上" and pd.notna(mid): up.append(f"收盘站稳中轨{mid:.2f}")
+    if zero != "零轴上": up.append("MACD回到零轴上")
+    if weekly is not None and weekly < 60: up.append("周线分升至60以上")
+    down.append(f"失守20日低点{support:.2f}" if pd.notna(support) else "关键支撑失守")
+    if pd.notna(mid): down.append(f"持续运行于中轨{mid:.2f}下方")
+
+    return {
+        "updated_at": datetime.now().strftime("%m-%d %H:%M"),
+        "symbol": f"{name} / {display_code(code)}",
+        "state":state, "rating":rating, "stage":stage, "state_reason":reason,
+        "score":score, "trend":trend, "momentum":momentum, "weekly_score":weekly,
+        "confirm":confirm, "confidence":100, "essence":essence,
+        "support":support_txt, "resistance":resistance_txt,
+        "upgrade":"；".join(up[:2]) if up else "维持强势并继续确认",
+        "downgrade":"；".join(down[:2]), "delta":None, "intraday":False,
+        "daily":{
+            "boll_mid_direction":boll_dir, "price_vs_mid":pos,
+            "macd_zero_zone":zero, "dif_direction":"向上" if drow.get("dif_slope",0)>0 else "向下",
+            "cross":cross,
+            "bar_momentum":"红柱" if drow.get("macd",0)>0 else "绿柱",
+            "volume_state":"高于MA5/MA10" if pd.notna(drow.get("vol_ma5")) and drow.get("vol")>drow.get("vol_ma5") and drow.get("vol")>drow.get("vol_ma10") else "普通/缩量",
+            "volume_trend":"—","divergence":"未做自动背离判定"
+        },
+        "boll_analysis":f"中轨{boll_dir}，收盘{drow.get('close',np.nan):.2f}，中轨{mid:.2f}。" if pd.notna(mid) else "",
+        "macd_analysis":f"DIF {drow.get('dif',np.nan):.3f}，DEA {drow.get('dea',np.nan):.3f}，{cross}。",
+        "weekly_analysis":f"周线技术分 {weekly:.0f}/100。" if weekly is not None else "",
+        "resonance":"数据计算模式：全部指标由OHLCV直接计算，不依赖图片识别。",
+        "_df":di
+    }
+
+def fetch_index_members(kind, limit_n):
+    if kind == "沪深300":
+        rs = bs.query_hs300_stocks()
+    elif kind == "中证500":
+        rs = bs.query_zz500_stocks()
+    else:
+        rs = bs.query_sz50_stocks()
+    df = _rs_to_df(rs)
+    if df.empty:
         return []
-    latest = w["trade_date"].max()
-    x = w[w["trade_date"]==latest].sort_values("weight", ascending=False)
-    return x["con_code"].drop_duplicates().head(limit_n).tolist()
+    code_col = "code" if "code" in df.columns else df.columns[0]
+    return df[code_col].drop_duplicates().head(limit_n).tolist()
 
-def stock_name_map(pro):
-    try:
-        b = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
-        return dict(zip(b["ts_code"], b["name"]))
-    except Exception:
-        return {}
-
-def screen_codes(pro, codes, name_map):
+def screen_codes(codes):
     rows = []
-    for i, code in enumerate(codes):
+    for code in codes:
         try:
-            d = fetch_stock_daily(pro, code, years=2)
+            d = fetch_stock_daily(code, years=2)
             if len(d) < 150:
                 continue
+            name = stock_basic_name(code)
             di = add_indicators(d)
             wi = weekly_from_daily(d)
-            if di.empty or wi.empty:
-                continue
             lr = di.iloc[-1].to_dict()
             lr["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
-            wr = wi.iloc[-1].to_dict()
+            wr = wi.iloc[-1].to_dict() if not wi.empty else None
             score, trend, momentum, weekly, confirm = numeric_score(lr, wr)
             if score >= 62 and (weekly is None or weekly >= 50):
                 rows.append({
-                    "代码":code, "名称":name_map.get(code,code),
+                    "代码":display_code(code), "名称":name,
                     "技术分/100":score, "趋势/100":trend, "动能/100":momentum,
                     "周线/100":weekly, "量能/100":confirm,
-                    "收盘":round(float(lr["close"]),2),
-                    "中轨":round(float(lr["boll_mid"]),2) if pd.notna(lr["boll_mid"]) else np.nan
+                    "收盘":round(float(lr["close"]),2)
                 })
         except Exception:
             continue
@@ -880,21 +979,14 @@ def run_backtest(df, entry_score=78, exit_score=48, fee_bps=8):
         return pd.DataFrame(), {}
     w2 = w[["trade_date","boll_mid","boll_slope","close","dif","dea"]].copy()
     w2.columns = ["w_date","w_boll_mid","w_boll_slope","w_close","w_dif","w_dea"]
-    m = pd.merge_asof(
-        d.sort_values("trade_date"),
-        w2.sort_values("w_date"),
-        left_on="trade_date", right_on="w_date", direction="backward"
-    )
+    m = pd.merge_asof(d.sort_values("trade_date"), w2.sort_values("w_date"), left_on="trade_date", right_on="w_date", direction="backward")
     scores = []
     for i,row in m.iterrows():
         r = row.to_dict()
         r["macd_prev"] = m.iloc[i-1]["macd"] if i>0 else np.nan
         wr = None
         if pd.notna(row.get("w_date")):
-            wr = {
-                "boll_slope":row.get("w_boll_slope"), "close":row.get("w_close"),
-                "boll_mid":row.get("w_boll_mid"), "dif":row.get("w_dif"), "dea":row.get("w_dea")
-            }
+            wr = {"boll_slope":row.get("w_boll_slope"),"close":row.get("w_close"),"boll_mid":row.get("w_boll_mid"),"dif":row.get("w_dif"),"dea":row.get("w_dea")}
         scores.append(numeric_score(r,wr)[0])
     m["score"] = scores
     m["signal"] = 0
@@ -902,12 +994,11 @@ def run_backtest(df, entry_score=78, exit_score=48, fee_bps=8):
     for i in range(len(m)):
         s = m.iloc[i]["score"]
         if not in_pos and s >= entry_score:
-            m.iloc[i, m.columns.get_loc("signal")] = 1
+            m.at[m.index[i],"signal"] = 1
             in_pos = True
         elif in_pos and s <= exit_score:
-            m.iloc[i, m.columns.get_loc("signal")] = -1
+            m.at[m.index[i],"signal"] = -1
             in_pos = False
-
     m["position"] = m["signal"].replace(0,np.nan).replace(-1,0).ffill().fillna(0).shift(1).fillna(0)
     m["ret"] = m["close"].pct_change().fillna(0)
     turnover = m["position"].diff().abs().fillna(m["position"])
@@ -915,17 +1006,14 @@ def run_backtest(df, entry_score=78, exit_score=48, fee_bps=8):
     m["strategy_ret"] = m["position"]*m["ret"] - turnover*fee
     m["净值"] = (1+m["strategy_ret"]).cumprod()
     m["买入持有"] = (1+m["ret"]).cumprod()
-
     eq = m["净值"]
     total = eq.iloc[-1]-1
-    n_years = max((m["trade_date"].iloc[-1]-m["trade_date"].iloc[0]).days/365.25, 0.01)
+    n_years = max((m["trade_date"].iloc[-1]-m["trade_date"].iloc[0]).days/365.25,0.01)
     annual = eq.iloc[-1]**(1/n_years)-1
     dd = (eq/eq.cummax()-1).min()
-    trades = int((m["signal"]==1).sum())
-    bh = m["买入持有"].iloc[-1]-1
     metrics = {
-        "累计收益": total, "年化收益": annual, "最大回撤": dd,
-        "交易次数": trades, "买入持有": bh
+        "累计收益":total, "年化收益":annual, "最大回撤":dd,
+        "交易次数":int((m["signal"]==1).sum()), "买入持有":m["买入持有"].iloc[-1]-1
     }
     return m, metrics
 
@@ -955,15 +1043,8 @@ with tab6:
         st.session_state["api_key"] = temp
         st.success("本次会话已启用临时 Key。")
 
-    st.markdown("**行情数据接口（选股/回测）**")
-    tushare_env = os.getenv("TUSHARE_TOKEN","")
-    if tushare_env:
-        st.success("服务器已配置 Tushare Token。")
-    else:
-        ttemp = st.text_input("Tushare Token", type="password", key="tushare_temp")
-        if ttemp:
-            st.session_state["tushare_token"] = ttemp
-            st.success("本次会话已启用 Tushare Token。")
+    st.markdown("**行情数据接口**")
+    st.success("A股行情已切换为 BaoStock，无需 Token 或会员。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
     st.info("中长线工具的核心不是预测下一根K线，而是：只在趋势、动能、周期一致时提高风险暴露，在结构破坏时降低风险。")
 
@@ -996,7 +1077,63 @@ with tab1:
     render_cockpit(st.session_state.get("last_report"))
     st.divider()
 
-    st.subheader("① 上传图表")
+    st.subheader("① 自动数据分析")
+    st.caption("输入A股代码即可。系统自动获取日K、聚合周K，并计算BOLL/MACD/VOL；无需上传截图。")
+    a1,a2 = st.columns([1.2,1])
+    with a1:
+        auto_code = st.text_input("A股代码", placeholder="例如 600519 / 000001 / 300750", key="auto_code")
+    with a2:
+        auto_horizon = st.selectbox("持有周期", ["2–8周","2–6个月","6–18个月"], index=1, key="auto_horizon")
+    a3,a4 = st.columns(2)
+    with a3:
+        auto_position = st.selectbox("当前仓位", ["未持有","轻仓≤25%","中等25–50%","重仓>50%"], key="auto_position")
+    with a4:
+        auto_fund = st.checkbox("基本面/估值已验证", value=False, key="auto_fund")
+
+    if st.button("⚡ 自动生成决策", type="primary", use_container_width=True):
+        if not auto_code.strip():
+            st.error("请输入A股代码。")
+        else:
+            with st.spinner("正在获取行情并计算日线/周线指标..."):
+                try:
+                    bs_login()
+                    code = normalize_code(auto_code)
+                    df_auto = fetch_stock_daily(code, years=3)
+                    name = stock_basic_name(code)
+                    report = deterministic_report(code, name, df_auto, auto_position, auto_fund)
+                    prev = previous(report["symbol"])
+                    if prev and prev.get("score") is not None:
+                        try: report["delta"] = report["score"] - float(prev.get("score"))
+                        except Exception: pass
+                    st.session_state["last_report"] = report
+                    xsave = {
+                        "data_quality":100,
+                        "daily":{
+                            "price":str(report["_df"].iloc[-1]["close"]),
+                            "boll_mid":str(report["_df"].iloc[-1]["boll_mid"]),
+                        },
+                        "key_support":report["support"],
+                        "key_resistance":report["resistance"],
+                    }
+                    meta = {
+                        "symbol":report["symbol"],"market":"A股","horizon":auto_horizon,
+                        "position_state":auto_position,"rating":report["rating"],"state":report["state"],
+                        "stage":report["stage"],"confidence":100,"mode":"BaoStock自动数据",
+                        "weekly_used":True
+                    }
+                    metrics = (report["score"],report["trend"],report["momentum"],report["weekly_score"],report["confirm"],False,False)
+                    save_result(meta,xsave,metrics,json.dumps({"source":"BaoStock"},ensure_ascii=False))
+                    report.pop("_df",None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"自动分析失败：{e}")
+                finally:
+                    try: bs.logout()
+                    except Exception: pass
+
+    st.divider()
+    st.caption("备用：下面仍保留截图分析，适合特殊指标或数据源未覆盖的情况。")
+    st.subheader("② 上传图表")
     st.caption("模板：BOLL(20,2) + MACD(12,26,9) + VOL/MA5/MA10。")
     nonce = st.session_state.get("upload_nonce", 0)
     c1, c2 = st.columns(2)
@@ -1250,75 +1387,72 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("当前版本先支持A股。使用与个股分析一致的 BOLL + MACD + 周线 + 量能规则进行规则化筛选。")
-    pro = tushare_pro()
-    if pro is None:
-        st.info("请先在“设置”里配置 Tushare Token。")
-    else:
-        universe = st.selectbox("选股范围", ["沪深300","中证500","中证1000"], index=0)
-        count = st.select_slider("扫描数量", options=[20,50,100,200], value=50)
-        index_code = {"沪深300":"000300.SH","中证500":"000905.SH","中证1000":"000852.SH"}[universe]
-        if st.button("🔎 开始选股", type="primary", use_container_width=True):
-            with st.spinner(f"正在扫描{universe}前{count}只成分股..."):
-                try:
-                    codes = fetch_index_members(pro,index_code,count)
-                    names = stock_name_map(pro)
-                    result = screen_codes(pro,codes,names)
-                    st.session_state["screen_result"] = result
-                except Exception as e:
-                    st.error(f"选股失败：{e}")
-        result = st.session_state.get("screen_result")
-        if isinstance(result,pd.DataFrame):
-            if result.empty:
-                st.warning("本次没有筛到满足条件的标的。")
-            else:
-                st.success(f"筛出 {len(result)} 只候选")
-                st.dataframe(result.head(30), use_container_width=True, hide_index=True)
-                st.caption("总分是技术证据质量分，不是上涨概率。建议再进入“分析”页做截图/基本面复核。")
+    st.caption("数据源：BaoStock。按与个股分析一致的日线+周线+BOLL+MACD+量能规则筛选。")
+    universe = st.selectbox("选股范围", ["沪深300","中证500","上证50"], index=0)
+    count = st.select_slider("扫描数量", options=[20,50,100], value=50)
+    if st.button("🔎 开始选股", type="primary", use_container_width=True):
+        with st.spinner(f"正在扫描{universe}前{count}只成分股..."):
+            try:
+                bs_login()
+                codes = fetch_index_members(universe,count)
+                result = screen_codes(codes)
+                st.session_state["screen_result"] = result
+            except Exception as e:
+                st.error(f"选股失败：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
+    result = st.session_state.get("screen_result")
+    if isinstance(result,pd.DataFrame):
+        if result.empty:
+            st.warning("本次没有筛到满足条件的标的。")
+        else:
+            st.success(f"筛出 {len(result)} 只候选")
+            st.dataframe(result.head(30), use_container_width=True, hide_index=True)
+            st.caption("总分是技术证据质量分，不是上涨概率；候选股仍需基本面与估值复核。")
 
 with tab3:
     st.subheader("策略回测")
-    st.caption("按历史日线自动计算 BOLL/MACD/周线过滤，信号在收盘后形成，并从下一交易日开始计入持仓，避免未来函数。")
-    pro = tushare_pro()
-    if pro is None:
-        st.info("请先在“设置”里配置 Tushare Token。")
-    else:
-        bt_code = st.text_input("A股代码", placeholder="例如 600519.SH", key="bt_code")
-        b1,b2,b3 = st.columns(3)
-        with b1:
-            years = st.selectbox("回测年限",[2,3,5],index=1)
-        with b2:
-            entry_score = st.slider("入场分数",65,90,78)
-        with b3:
-            exit_score = st.slider("退出分数",30,65,48)
-        fee_bps = st.number_input("单边交易成本（万分之一）", min_value=0.0, max_value=30.0, value=8.0, step=1.0)
-        if st.button("🧪 开始回测", type="primary", use_container_width=True):
-            if not bt_code.strip():
-                st.error("请输入A股代码。")
-            else:
-                with st.spinner("正在下载历史行情并回测..."):
-                    try:
-                        df_bt = fetch_stock_daily(pro, bt_code.strip().upper(), years=years)
-                        curve, m = run_backtest(df_bt, entry_score, exit_score, fee_bps)
-                        st.session_state["bt_curve"] = curve
-                        st.session_state["bt_metrics"] = m
-                    except Exception as e:
-                        st.error(f"回测失败：{e}")
-        m = st.session_state.get("bt_metrics")
-        curve = st.session_state.get("bt_curve")
-        if isinstance(m,dict) and m:
-            a,b,c1,c2 = st.columns(4)
-            a.metric("累计收益", f"{m['累计收益']:.1%}")
-            b.metric("年化收益", f"{m['年化收益']:.1%}")
-            c1.metric("最大回撤", f"{m['最大回撤']:.1%}")
-            c2.metric("交易次数", str(m["交易次数"]))
-            st.caption(f"同期买入持有：{m['买入持有']:.1%}")
-            if isinstance(curve,pd.DataFrame) and not curve.empty:
-                show = curve.set_index("trade_date")[["净值","买入持有"]]
-                st.line_chart(show, height=280)
-                with st.expander("查看最近信号"):
-                    st.dataframe(curve[["trade_date","close","score","signal","position"]].tail(60), use_container_width=True, hide_index=True)
-            st.warning("回测只说明历史规则表现，不代表未来收益；结果仍需考虑滑点、停牌、涨跌停、分红复权和样本外验证。")
+    st.caption("BaoStock历史日线 → 自动聚合周线 → 计算同一套技术分。信号收盘后形成，下一交易日生效。")
+    bt_code = st.text_input("A股代码", placeholder="例如 600519", key="bt_code")
+    b1,b2,b3 = st.columns(3)
+    with b1:
+        years = st.selectbox("回测年限",[2,3,5],index=1)
+    with b2:
+        entry_score = st.slider("入场分数",65,90,78)
+    with b3:
+        exit_score = st.slider("退出分数",30,65,48)
+    fee_bps = st.number_input("单边交易成本（万分之一）", min_value=0.0, max_value=30.0, value=8.0, step=1.0)
+    if st.button("🧪 开始回测", type="primary", use_container_width=True):
+        if not bt_code.strip():
+            st.error("请输入A股代码。")
+        else:
+            with st.spinner("正在下载历史行情并回测..."):
+                try:
+                    bs_login()
+                    df_bt = fetch_stock_daily(bt_code.strip(), years=years)
+                    curve, m = run_backtest(df_bt, entry_score, exit_score, fee_bps)
+                    st.session_state["bt_curve"] = curve
+                    st.session_state["bt_metrics"] = m
+                except Exception as e:
+                    st.error(f"回测失败：{e}")
+                finally:
+                    try: bs.logout()
+                    except Exception: pass
+    m = st.session_state.get("bt_metrics")
+    curve = st.session_state.get("bt_curve")
+    if isinstance(m,dict) and m:
+        a,b,c1,c2 = st.columns(4)
+        a.metric("累计收益", f"{m['累计收益']:.1%}")
+        b.metric("年化收益", f"{m['年化收益']:.1%}")
+        c1.metric("最大回撤", f"{m['最大回撤']:.1%}")
+        c2.metric("交易次数", str(m["交易次数"]))
+        st.caption(f"同期买入持有：{m['买入持有']:.1%}")
+        if isinstance(curve,pd.DataFrame) and not curve.empty:
+            st.line_chart(curve.set_index("trade_date")[["净值","买入持有"]], height=280)
+            with st.expander("查看最近信号"):
+                st.dataframe(curve[["trade_date","close","score","signal","position"]].tail(60), use_container_width=True, hide_index=True)
+        st.warning("回测不代表未来收益；尚未完整模拟滑点、涨跌停、停牌、分红税等真实交易约束。")
 
 with tab4:
     st.subheader("历史记录与信号演化")
