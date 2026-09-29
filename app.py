@@ -1224,19 +1224,38 @@ def _save_daily_cache(df, code, adjustflag="2"):
     conn.close()
 
 def _mark_cache_checked(code):
-    today = datetime.now().strftime("%Y-%m-%d")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_PATH)
+    now=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO market_cache_meta(code,last_checked,updated_at)
            VALUES(?,?,?)
            ON CONFLICT(code) DO UPDATE SET
              last_checked=excluded.last_checked,
              updated_at=excluded.updated_at""",
-        (code,today,now)
+        (code,now,now)
     )
     conn.commit()
     conn.close()
+
+def _should_refresh_cache(last_checked,cache_max):
+    now=datetime.utcnow()
+    today=now.strftime("%Y-%m-%d")
+    if not last_checked:
+        return True
+    raw=str(last_checked)
+    checked_date=raw[:10]
+    if checked_date<today:
+        return True
+    if cache_max and str(cache_max)>=today:
+        return False
+    # 亚洲市场收盘后若当天曾过早检查，至少间隔2小时再重试一次。
+    try:
+        checked=pd.Timestamp(raw)
+        age=(pd.Timestamp(now)-checked).total_seconds()/3600
+    except Exception:
+        age=0
+    return now.hour>=8 and age>=2
+
 
 def _download_a_daily(code,start,end):
     if start > end:
@@ -1336,7 +1355,7 @@ def fetch_stock_daily(code,years=3):
             pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             older = _download_daily(code,start,pre_end)
             _save_daily_cache(older,code,cache_flag)
-        if last_checked != today:
+        if _should_refresh_cache(last_checked,cache_max):
             next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             newer = _download_daily(code,next_start,end)
             _save_daily_cache(newer,code,cache_flag)
@@ -1375,7 +1394,7 @@ def fetch_benchmark_daily(years=5,code="sh.000300"):
             pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             older = _download_index_daily(code,start,pre_end)
             _save_daily_cache(older,code,"3")
-        if last_checked != today:
+        if _should_refresh_cache(last_checked,cache_max):
             next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             newer = _download_index_daily(code,next_start,end)
             _save_daily_cache(newer,code,"3")
@@ -1452,7 +1471,7 @@ def fetch_hk_benchmark_daily(years=5):
             pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             older = _download_hk_benchmark(start,pre_end)
             _save_daily_cache(older,key,flag)
-        if last_checked != today:
+        if _should_refresh_cache(last_checked,cache_max):
             next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             newer = _download_hk_benchmark(next_start,end)
             _save_daily_cache(newer,key,flag)
@@ -3035,6 +3054,127 @@ def recent_analyses(limit=12):
     conn.close()
     return df
 
+def load_forward_signals(limit=300):
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        """SELECT * FROM forward_signals
+           ORDER BY signal_date DESC,id DESC LIMIT ?""",
+        conn,params=(limit,)
+    )
+    conn.close()
+    return df
+
+def _evaluate_forward_signal_row(sig):
+    code=normalize_code(sig["code"])
+    signal_date=pd.Timestamp(sig["signal_date"])
+    df=fetch_stock_daily(code,years=5)
+    benchmark=fetch_benchmark_for_code(code,years=5)
+    m=prepare_strategy_frame(df,benchmark)
+    if m.empty:
+        return "tracking",np.nan,None
+
+    dates=pd.to_datetime(m["trade_date"])
+    hits=np.where(dates.dt.normalize()==signal_date.normalize())[0]
+    if len(hits)==0:
+        hits=np.where(dates>=signal_date)[0]
+    if len(hits)==0:
+        return "tracking",np.nan,None
+    signal_i=int(hits[0])
+    if signal_i>=len(m)-1:
+        return "tracking",np.nan,None
+
+    entry_i=signal_i+1
+    entry_row=m.iloc[entry_i]
+    raw_entry=float(entry_row["open"]) if pd.notna(entry_row.get("open")) and entry_row.get("open")>0 else float(entry_row["close"])
+    stop=sig.get("risk_price",np.nan)
+    if pd.isna(stop) or raw_entry<=float(stop):
+        return "cancelled",np.nan,pd.Timestamp(entry_row["trade_date"]).strftime("%Y-%m-%d")
+
+    fee_bps,slip_bps=trade_cost_profile(code)
+    friction=(fee_bps+slip_bps)/10000.0
+    entry_fill=raw_entry*(1+friction)
+    initial_risk=entry_fill-float(stop)
+    if initial_risk<=0:
+        return "cancelled",np.nan,pd.Timestamp(entry_row["trade_date"]).strftime("%Y-%m-%d")
+
+    peak=float(sig.get("technical_score",m.iloc[signal_i].get("score",0)) or 0)
+    last_r=np.nan
+    for j in range(entry_i,len(m)):
+        row=m.iloc[j]
+        peak=max(peak,float(row.get("score",0) or 0))
+        day_open=float(row["open"]) if pd.notna(row.get("open")) and row.get("open")>0 else float(row["close"])
+        day_low=float(row["low"]) if pd.notna(row.get("low")) else day_open
+
+        if day_low<=float(stop):
+            raw_exit=day_open if day_open<float(stop) else float(stop)
+            exit_fill=raw_exit*(1-friction)
+            r=(exit_fill-entry_fill)/initial_risk
+            return "closed",float(r),pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d")
+
+        if j<len(m)-1 and holding_exit_condition(row,peak):
+            nxt=m.iloc[j+1]
+            raw_exit=float(nxt["open"]) if pd.notna(nxt.get("open")) and nxt.get("open")>0 else float(nxt["close"])
+            exit_fill=raw_exit*(1-friction)
+            r=(exit_fill-entry_fill)/initial_risk
+            return "closed",float(r),pd.Timestamp(nxt["trade_date"]).strftime("%Y-%m-%d")
+
+        current_exit=float(row["close"])*(1-friction)
+        last_r=(current_exit-entry_fill)/initial_risk
+
+    return "tracking",float(last_r) if pd.notna(last_r) else np.nan,None
+
+def refresh_forward_tests(max_items=25):
+    conn=sqlite3.connect(DB_PATH)
+    pending=pd.read_sql_query(
+        """SELECT * FROM forward_signals
+           WHERE status='tracking'
+           ORDER BY signal_date ASC LIMIT ?""",
+        conn,params=(int(max_items),)
+    )
+    conn.close()
+    if pending.empty:
+        return 0,0,[]
+
+    updated=closed=0
+    errors=[]
+    for _,sig in pending.iterrows():
+        try:
+            status,r_value,exit_date=_evaluate_forward_signal_row(sig)
+            conn=sqlite3.connect(DB_PATH)
+            conn.execute(
+                """UPDATE forward_signals SET
+                   status=?,realized_r=?,exit_date=?,updated_at=?
+                   WHERE id=?""",
+                (
+                    status,
+                    float(r_value) if pd.notna(r_value) else None,
+                    exit_date,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    int(sig["id"])
+                )
+            )
+            conn.commit(); conn.close()
+            updated+=1
+            if status=="closed":
+                closed+=1
+        except Exception as e:
+            errors.append(f"{sig.get('name') or sig.get('code')}: {e}")
+    return updated,closed,errors
+
+def forward_test_summary():
+    df=load_forward_signals(1000)
+    if df.empty:
+        return {"总信号":0,"已完成":0,"跟踪中":0,"EV_R":np.nan,"胜率":np.nan},df
+    closed=df[df["status"]=="closed"].copy()
+    vals=pd.to_numeric(closed["realized_r"],errors="coerce").dropna()
+    return {
+        "总信号":int(len(df)),
+        "已完成":int(len(closed)),
+        "跟踪中":int((df["status"]=="tracking").sum()),
+        "EV_R":float(vals.mean()) if len(vals) else np.nan,
+        "胜率":float((vals>0).mean()) if len(vals) else np.nan
+    },df
+
 def history(limit=300):
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM analyses ORDER BY id DESC LIMIT ?", conn, params=(limit,))
@@ -3067,6 +3207,20 @@ with tab7:
         st.success("行情缓存已清空。")
         st.rerun()
     st.warning("当前缓存位于Render本机SQLite：重新部署/重建实例时可能被清空。持仓数据后续应迁移到持久数据库。")
+    st.markdown("**核心数据备份**")
+    backup_pos=load_positions(False)
+    backup_ft=load_forward_signals(5000)
+    bkp1,bkp2=st.columns(2)
+    bkp1.download_button(
+        "⬇️ 导出全部持仓",
+        backup_pos.to_csv(index=False).encode("utf-8-sig"),
+        "positions_backup.csv","text/csv",use_container_width=True
+    )
+    bkp2.download_button(
+        "⬇️ 导出Forward Test",
+        backup_ft.to_csv(index=False).encode("utf-8-sig"),
+        "forward_test_backup.csv","text/csv",use_container_width=True
+    )
     st.caption("持仓截图识别使用已配置的DeepSeek视觉接口；截图只提取持仓字段，不参与技术评分。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
 
@@ -3082,16 +3236,16 @@ with tab6:
 
 **总技术分也是100分制：**
 - 有周线：趋势38% + 动能30% + 周线22% + 量能10%
-- 无周线：趋势50% + 动能35% + 量能15%  
+- 中长线模式必须有确认周线，不再提供“无周线”评分。  
 
 **选股目标：寻找交易机会，不是寻找最高技术分。**
 
 - **技术分**：这只股票的趋势/动能是否值得关注。
 - **买点分**：当前价格位置是否适合介入，越追高分数越低。
 - **盈亏比**：以中轨/20日低点作为风险参考，以20日高点/BOLL上轨作为压力参考。
-- **历史胜率**：该股票过去出现相似技术分和买点分时，未来20日获得正收益的比例。
-- **机会分**：技术25% + 买点25% + 盈亏比15% + 历史相似信号20% + 大盘10% + 相对强度5%。
-- **自动门槛**：用户不再手调技术分/买点分/盈亏比。系统根据大盘强弱动态设门槛，并分成“优先机会/候选观察”两层；优先机会还要结合盈亏平衡胜率、安全边际和历史期望，避免阈值过严导致全市场零候选。
+- **机会分**：只描述当前结构，权重为技术30% + 买点30% + 结构盈亏比15% + 市场15% + 相对强度10%；不再把历史结果重复塞进机会分。
+- **真实交易EV**：历史信号按同一套“次日入场 → 初始风险位 → 技术分/周线/市场退出”逐笔模拟，以R倍数衡量。
+- **自动门槛**：用户不手调技术分/买点分/盈亏比。门槛只随市场环境按预设规则变化，不会因为当天没有候选就临时放宽。
 - **市场环境**：A股以沪深300、港股以恒生指数的BOLL、MACD、MA60及20/60日收益评估“顺风/中性/偏弱/逆风”。
 - **相对强度**：A股相对沪深300、港股相对恒生指数比较20/60日表现，避免只买“随市场被动上涨”的股票。
 - **历史EV**：不再用“20/40/60日后是否上涨”冒充策略胜率。历史信号按同一套入场、风险位和技术退出规则逐笔模拟，统一换算为R倍数。
@@ -3247,7 +3401,7 @@ with tab2:
             f"当前{bench_label}：{scan_market[1]} {scan_market[0]}/100。系统基础门槛自动调整为："
             f"技术≥{p['技术']}、买点≥{p['买点']}、周线≥{p['周线']}、"
             f"盈亏比≥{p['盈亏比']:.2f}、相对强度≥{p['相对强度']}、机会≥{p['机会']}。"
-            "历史样本足够时，还必须满足“历史综合胜率 > 盈亏平衡胜率 + 安全边际”且综合期望收益>0。"
+            "结构通过后再计算5年真实交易EV；优先机会要求EV、保守EV和2倍成本压力EV为正。"
         )
 
     sb1,sb2 = st.columns(2)
@@ -3638,6 +3792,40 @@ with tab4:
                 ] if x in curve.columns]
                 st.dataframe(curve[cols].tail(100),use_container_width=True,hide_index=True)
         st.warning("回测用于检验历史期望，不保证未来收益；5年单股样本仍可能有限，重点看盈亏因子、回撤、交易次数和稳定性，而不是只看累计收益。")
+
+    st.divider()
+    st.subheader("Forward Test · 实盘前向验证")
+    st.caption("选股模块出现“优先机会/候选观察”时会自动记录当时信号。这里按之后真实行情和同一退出规则更新结果，避免只看回测。")
+    ft1,ft2=st.columns(2)
+    refresh_ft=ft1.button("🔄 更新前向验证",use_container_width=True)
+    ft2.caption("每次最多更新25条跟踪中信号，避免一次请求过多行情。")
+    if refresh_ft:
+        with st.spinner("正在用后续真实行情更新Forward Test..."):
+            try:
+                bs_login()
+                ucnt,ccnt,ferrs=refresh_forward_tests(25)
+                st.success(f"已更新 {ucnt} 条，其中完成交易 {ccnt} 条。")
+                if ferrs:
+                    st.warning("部分更新失败："+"；".join(ferrs[:5]))
+            except Exception as e:
+                st.error(f"Forward Test更新失败：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
+
+    fsum,fdf=forward_test_summary()
+    q1,q2,q3,q4=st.columns(4)
+    q1.metric("累计信号",str(fsum["总信号"]))
+    q2.metric("已完成",str(fsum["已完成"]))
+    q3.metric("实盘样本EV",f"{fsum['EV_R']:+.2f}R" if pd.notna(fsum["EV_R"]) else "—")
+    q4.metric("实盘样本胜率",f"{fsum['胜率']:.0%}" if pd.notna(fsum["胜率"]) else "—")
+    if isinstance(fdf,pd.DataFrame) and not fdf.empty:
+        fs=fdf.head(80).copy()
+        cols=[x for x in [
+            "signal_date","market","code","name","tier","ev_r","ev_lcb_r",
+            "stress_ev_r","ev_samples","status","realized_r","exit_date"
+        ] if x in fs.columns]
+        st.dataframe(fs[cols],use_container_width=True,hide_index=True)
 
 with tab5:
     st.subheader("历史记录与信号演化")
