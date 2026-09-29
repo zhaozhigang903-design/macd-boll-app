@@ -536,6 +536,66 @@ def init_db():
       PRIMARY KEY(code,stock_date,benchmark_date,rule_version)
     )
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS research_runs(
+      run_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      universe TEXT NOT NULL,
+      years INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      total INTEGER NOT NULL DEFAULT 0,
+      rule_version TEXT NOT NULL,
+      benchmark_name TEXT,
+      note TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS research_stock_results(
+      run_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      name TEXT,
+      market TEXT,
+      trade_count INTEGER,
+      ev_r REAL,
+      conservative_ev_r REAL,
+      win_rate REAL,
+      avg_win_r REAL,
+      avg_loss_r REAL,
+      profit_factor REAL,
+      oos_ev_r REAL,
+      oos_stability TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id,code)
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS research_trades(
+      run_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      name TEXT,
+      market TEXT,
+      signal_date TEXT,
+      entry_date TEXT,
+      exit_date TEXT,
+      return_pct REAL,
+      r_multiple REAL,
+      holding_days INTEGER,
+      technical_score REAL,
+      buy_score REAL,
+      weekly_score REAL,
+      rr REAL,
+      market_score REAL,
+      rs_score REAL,
+      opportunity_score REAL,
+      exit_reason TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_research_trades_run_date
+    ON research_trades(run_id,signal_date)
+    """)
     fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
     if "rule_version" not in fcols:
         conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
