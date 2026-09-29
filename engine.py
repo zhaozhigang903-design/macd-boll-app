@@ -206,6 +206,85 @@ def parse_num(v):
     try: return float(m.group())
     except: return None
 
+def validate_extraction(daily, weekly):
+    issues = []
+    penalty = 0
+
+    def check_tf(name, x):
+        nonlocal penalty
+        lower = parse_num(x.get("boll_lower"))
+        mid = parse_num(x.get("boll_mid"))
+        upper = parse_num(x.get("boll_upper"))
+        price = parse_num(x.get("price"))
+        q = int(x.get("image_quality",0) or 0)
+
+        if q < 60:
+            issues.append(f"{name}截图清晰度偏低")
+            penalty += 10
+        if lower is not None and mid is not None and upper is not None:
+            if not (lower <= mid <= upper):
+                issues.append(f"{name}BOLL数值关系异常")
+                penalty += 18
+        if price is not None and lower is not None and upper is not None and lower > 0:
+            if price > upper*1.6 or price < lower*0.55:
+                issues.append(f"{name}价格与BOLL区间疑似识别错位")
+                penalty += 12
+
+    check_tf("日线", daily)
+    if weekly.get("visible"):
+        check_tf("周线", weekly)
+        dp = parse_num(daily.get("price"))
+        wp = parse_num(weekly.get("price"))
+        if dp and wp and max(dp,wp)>0:
+            gap = abs(dp-wp)/max(dp,wp)
+            if gap > 0.08:
+                issues.append("日线与周线最新价格差异过大，可能不是同一时点/同一标的截图")
+                penalty += 15
+
+    return issues, min(40, penalty)
+
+def transition_conditions(daily, weekly):
+    upgrades = []
+    downgrades = []
+
+    if daily.get("price_vs_mid") != "above":
+        upgrades.append("日线重新站稳BOLL中轨")
+    if daily.get("mid_direction") != "up":
+        upgrades.append("日线中轨由走平/向下转为向上")
+    if daily.get("zero_zone") != "above":
+        upgrades.append("DIF/DEA向零轴上方迁移")
+    if daily.get("cross") != "golden":
+        upgrades.append("MACD形成有效金叉而非零轴附近粘合")
+    if daily.get("bar_momentum") in ("green_expanding","green_shrinking"):
+        upgrades.append("绿柱继续收敛并转红")
+
+    if weekly.get("visible"):
+        if weekly.get("price_vs_mid") != "above":
+            upgrades.append("周线站稳BOLL中轨")
+        if weekly.get("mid_direction") != "up":
+            upgrades.append("周线中轨走平后转上")
+        if weekly.get("zero_zone") != "above":
+            upgrades.append("周线MACD向零轴上方迁移")
+
+    if daily.get("price_vs_mid") in ("above","near"):
+        mid = daily.get("boll_mid") or "日线中轨"
+        downgrades.append(f"日线有效跌破{mid}")
+    if daily.get("cross") in ("golden","adhesion"):
+        downgrades.append("MACD死叉且绿柱持续放大")
+    if daily.get("divergence") == "top":
+        downgrades.append("顶背离后出现中轨破位")
+
+    inv = daily.get("invalidation_price")
+    if inv:
+        downgrades.append(f"跌破结构失效位 {inv}")
+
+    if weekly.get("visible") and weekly.get("price_vs_mid") in ("above","near"):
+        wmid = weekly.get("boll_mid") or "周线中轨"
+        downgrades.append(f"周线有效跌破{wmid}并且中轨转下")
+
+    # Keep the interface concise.
+    return upgrades[:3], downgrades[:3]
+
 def risk_position_reference(daily, risk_budget_pct, max_single_pct):
     price = parse_num(daily.get("price"))
     inv = parse_num(daily.get("invalidation_price"))
