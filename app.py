@@ -3682,7 +3682,7 @@ st.markdown("<div style='height:.15rem'></div>", unsafe_allow_html=True)
 st.title("📈 日线 × 周线 中长线决策引擎")
 st.caption("数据驱动版 · 机会发现 → 买点评估 → 持仓管理 → 回测验证。")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 分析", "🔎 选股", "💼 持仓", "🧪 回测", "📚 历史", "🧠 方法", "⚙️ 设置"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 分析", "🔎 选股", "💼 持仓", "🧪 回测", "📚 历史", "🧠 方法", "⚙️ 设置", "🧬 研究"])
 
 with tab7:
     st.subheader("数据设置")
@@ -4357,6 +4357,190 @@ with tab4:
             "stress_ev_r","ev_samples","status","realized_r","exit_date"
         ] if x in fs.columns]
         st.dataframe(fs[cols],use_container_width=True,hide_index=True)
+
+with tab8:
+    st.subheader("组合级研究回测")
+    st.caption("用于回答EV1.0在多股票、多年份下是否真的具有正期望。任务按批次运行并保存进度，不需要一次把几千只股票全部算完。")
+
+    r1,r2,r3=st.columns(3)
+    with r1:
+        research_universe=st.selectbox(
+            "研究股票池",
+            ["沪深300","中证500","全A股（沪深）","港股主板"],
+            index=0,key="research_universe"
+        )
+    with r2:
+        research_years=st.selectbox("历史长度",[3,5,10],index=1,key="research_years")
+    with r3:
+        research_batch=st.selectbox("每批计算",[10,20,30],index=1,key="research_batch")
+
+    st.info(
+        "研究口径固定：EV1.0规则、次日执行、确认周线、流动性过滤、真实风险位与技术退出。"
+        "股票池在创建任务时冻结。"
+    )
+    st.warning(
+        "当前阶段使用“任务创建时可取得的当前成分/当前上市股票池”，因此仍可能存在幸存者偏差。"
+        "先用于判断Edge是否值得继续验证；后续历史成分股数据库接入后再做最终无偏验证。"
+    )
+
+    runs=load_research_runs(30)
+    rb1,rb2=st.columns([1.25,1])
+    create_research=rb1.button("🧬 新建研究任务",type="primary",use_container_width=True)
+    rb2.caption("建议顺序：沪深300 5年 → 中证500 5年 → 港股主板5年 → 全A股5年。")
+
+    if create_research:
+        with st.spinner("正在冻结股票池并创建研究任务..."):
+            try:
+                bs_login()
+                rid,total_count=create_research_run(research_universe,research_years)
+                st.session_state["research_run_id"]=rid
+                st.success(f"研究任务已创建：{total_count}只股票。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"创建研究任务失败：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
+
+    runs=load_research_runs(30)
+    if runs.empty:
+        st.info("暂无研究任务。建议先创建“沪深300 · 5年”。")
+    else:
+        options=[]
+        labels={}
+        for _,rr in runs.iterrows():
+            rid=str(rr["run_id"])
+            label=(
+                f"{rr['universe']} · {int(rr['years'])}年 · "
+                f"{int(rr['cursor'])}/{int(rr['total'])} · {rr['status']} · {rid}"
+            )
+            options.append(rid); labels[rid]=label
+
+        preferred=st.session_state.get("research_run_id")
+        default_index=options.index(preferred) if preferred in options else 0
+        selected_run=st.selectbox(
+            "研究任务",options,index=default_index,
+            format_func=lambda x:labels.get(x,x),key="research_run_select"
+        )
+        st.session_state["research_run_id"]=selected_run
+        run=get_research_run(selected_run)
+
+        done=int(run.get("cursor",0) or 0)
+        total=int(run.get("total",0) or 0)
+        pct=done/total if total else 0
+        st.progress(min(pct,1.0),text=f"研究进度 {done:,}/{total:,}（{pct:.1%}）")
+
+        rc1,rc2=st.columns([1.25,1])
+        run_batch_btn=rc1.button(
+            "▶️ 继续计算下一批",
+            type="primary",use_container_width=True,
+            disabled=(run.get("status")=="completed")
+        )
+        rc2.caption(f"每次处理 {research_batch} 只；完成后结果会保留，可随时继续。")
+
+        if run_batch_btn:
+            prog=st.progress(0.0,text="准备研究批次...")
+            status_box=st.empty()
+            with st.spinner("正在执行多股票历史交易回放..."):
+                try:
+                    bs_login()
+                    def _research_progress(local_done,local_total,overall_done,overall_total,code,name,stage):
+                        p=local_done/local_total if local_total else 0
+                        prog.progress(
+                            min(p,1.0),
+                            text=f"本批 {local_done}/{local_total} · 总进度 {overall_done}/{overall_total}"
+                        )
+                        status_box.caption(f"当前：{display_code(code)} {name} · {stage}")
+
+                    batch_out=run_research_batch(
+                        selected_run,batch_size=int(research_batch),
+                        progress_callback=_research_progress
+                    )
+                    if batch_out.get("errors"):
+                        st.warning(
+                            f"本批完成，但有 {len(batch_out['errors'])} 只数据不足/异常。"
+                            +"；".join(batch_out["errors"][:4])
+                        )
+                    else:
+                        st.success(f"本批完成 {batch_out.get('processed',0)} 只。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"研究批次失败：{e}")
+                finally:
+                    try: bs.logout()
+                    except Exception: pass
+
+        summary,stock_results,research_trades,portfolio_curve=research_summary(selected_run)
+        if summary is not None:
+            st.markdown("### 系统级核心结果")
+            s1,s2,s3,s4=st.columns(4)
+            s1.metric("已完成股票",str(summary.get("股票数",0)))
+            s2.metric("历史交易数",str(summary.get("交易数",0)))
+            s3.metric("系统净EV",f"{summary['EV_R']:+.2f}R" if pd.notna(summary.get("EV_R")) else "—")
+            s4.metric("保守EV",f"{summary['保守EV_R']:+.2f}R" if pd.notna(summary.get("保守EV_R")) else "—")
+
+            s5,s6,s7,s8=st.columns(4)
+            s5.metric("交易胜率",f"{summary['胜率']:.1%}" if pd.notna(summary.get("胜率")) else "—")
+            s6.metric("真实盈亏比",f"{summary['真实盈亏比']:.2f}" if pd.notna(summary.get("真实盈亏比")) else "—")
+            pf=summary.get("盈亏因子")
+            s7.metric("Profit Factor",f"{pf:.2f}" if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else "—"))
+            s8.metric("OOS EV",f"{summary['OOS_EV_R']:+.2f}R" if pd.notna(summary.get("OOS_EV_R")) else "—")
+            st.caption(
+                f"平均盈利 {summary.get('平均盈利R'):+.2f}R" if pd.notna(summary.get("平均盈利R")) else "平均盈利 —"
+            )
+            if pd.notna(summary.get("平均亏损R")):
+                st.caption(
+                    f"平均亏损 {summary['平均亏损R']:+.2f}R · "
+                    f"OOS稳定性：{summary.get('OOS稳定性','样本不足')}"
+                )
+
+            if summary.get("交易数",0)>=20:
+                if (
+                    pd.notna(summary.get("EV_R")) and summary["EV_R"]>0 and
+                    pd.notna(summary.get("保守EV_R")) and summary["保守EV_R"]>0 and
+                    pd.notna(summary.get("OOS_EV_R")) and summary["OOS_EV_R"]>0
+                ):
+                    st.success("当前已完成样本中：净EV、保守EV和OOS EV均为正。继续扩大股票数与年份验证稳定性。")
+                else:
+                    st.warning("当前已完成样本尚不能同时证明净EV、保守EV和OOS EV为正。不要根据少量局部结果调参数。")
+
+            st.markdown("### 10仓等权组合近似")
+            p1,p2,p3,p4=st.columns(4)
+            p1.metric("累计收益",f"{summary['组合累计收益']:.1%}" if pd.notna(summary.get("组合累计收益")) else "—")
+            p2.metric("年化收益",f"{summary['组合年化收益']:.1%}" if pd.notna(summary.get("组合年化收益")) else "—")
+            p3.metric("近似最大回撤",f"{summary['组合最大回撤']:.1%}" if pd.notna(summary.get("组合最大回撤")) else "—")
+            p4.metric("组合采用交易",str(summary.get("组合交易数",0)))
+            st.caption("组合收益/回撤目前是10个并发仓位、等权占用的事件级近似；系统级EV、胜率、真实盈亏比和PF来自逐笔真实规则交易，优先参考这些指标。")
+            if isinstance(portfolio_curve,pd.DataFrame) and not portfolio_curve.empty:
+                st.line_chart(portfolio_curve.set_index("date")[["equity"]],height=240)
+
+            if isinstance(stock_results,pd.DataFrame) and not stock_results.empty:
+                with st.expander("查看单股研究结果"):
+                    view=stock_results.copy()
+                    view=view.rename(columns={
+                        "code":"代码","name":"名称","trade_count":"交易数",
+                        "ev_r":"EV(R)","conservative_ev_r":"保守EV(R)",
+                        "win_rate":"胜率","avg_win_r":"平均盈利R","avg_loss_r":"平均亏损R",
+                        "profit_factor":"PF","oos_ev_r":"OOS EV(R)","oos_stability":"OOS稳定性"
+                    })
+                    cols=[x for x in [
+                        "代码","名称","交易数","EV(R)","保守EV(R)","胜率",
+                        "平均盈利R","平均亏损R","PF","OOS EV(R)","OOS稳定性"
+                    ] if x in view.columns]
+                    st.dataframe(view[cols].head(200),use_container_width=True,hide_index=True)
+
+            if isinstance(research_trades,pd.DataFrame) and not research_trades.empty:
+                dl1,dl2=st.columns(2)
+                dl1.download_button(
+                    "⬇️ 导出全部研究交易",
+                    research_trades.to_csv(index=False).encode("utf-8-sig"),
+                    f"research_trades_{selected_run}.csv","text/csv",use_container_width=True
+                )
+                dl2.download_button(
+                    "⬇️ 导出单股汇总",
+                    stock_results.to_csv(index=False).encode("utf-8-sig"),
+                    f"research_stocks_{selected_run}.csv","text/csv",use_container_width=True
+                )
 
 with tab5:
     st.subheader("历史记录与信号演化")
