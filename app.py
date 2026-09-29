@@ -4883,6 +4883,10 @@ with tab6:
 - **EV校准**：每笔交易的预测EV只使用当时已经结束的历史交易，检查预测EV的排序能力。
 - **日级组合回测**：每日按真实收盘盯市，计算CAGR、最大回撤、Sharpe、Sortino、Calmar和换手。
 - **风险预算仓位**：默认每笔承担0.5% NAV风险，按技术失效距离反推仓位，单票上限10%、最多10仓。
+- **策略优化实验室**：每次只允许研究一个模块（选股门槛 / 买入质量 / 持仓退出 / 因子消融），固定60%训练、20%验证、20%最终测试。
+- **参数平台优先**：不选择单一历史最高点；要求相邻参数在训练与验证区间共同保持正EV，寻找稳定区域。
+- **最终测试锁定**：参数筛选只使用训练+验证数据；最后20%默认不可见，实验完成并停止调参后才解锁。
+- **候选版本机制**：实验结果只能保存为候选，不会自动替换EV1.0。正式升级必须再经过最终测试与Forward Test。
 
 **规则版本与冻结原则**
 - 当前版本：**EV1.0**。Forward Test会记录规则版本；后续若改变核心入场/退出逻辑，应升级版本而不是覆盖历史结果。
@@ -5727,6 +5731,241 @@ with tab8:
                     stock_results.to_csv(index=False).encode("utf-8-sig"),
                     f"research_stocks_{selected_run}.csv","text/csv",use_container_width=True
                 )
+
+        st.divider()
+        st.subheader("🧪 策略优化实验室")
+        st.caption(
+            "回测不只看收益，而是用于优化“选股 → 买入 → 持仓/退出”。"
+            "每次只改一个模块，固定60%训练、20%验证、20%最终测试；最终测试默认锁定。"
+        )
+
+        lab1,lab2=st.columns(2)
+        with lab1:
+            experiment_module=st.selectbox(
+                "本次只研究一个模块",
+                ["选股门槛","买入质量","持仓退出","因子消融"],
+                key="strategy_experiment_module"
+            )
+        with lab2:
+            experiment_batch=st.selectbox(
+                "实验每批股票数",[3,5,10],index=1,
+                key="strategy_experiment_batch"
+            )
+
+        st.info(
+            "程序会自动跑有限、可解释的参数变体，但不会把“历史最优参数”直接改成实盘规则。"
+            "候选方案只按训练+验证数据产生；最终20%测试集在实验完成前保持锁定。"
+        )
+
+        eb1,eb2=st.columns([1.2,1])
+        create_exp=eb1.button(
+            "➕ 新建单模块实验",
+            use_container_width=True,key="create_strategy_experiment"
+        )
+        eb2.caption("优先找参数稳定平台，而不是找某个历史最高点。")
+
+        if create_exp:
+            try:
+                exp_id=create_strategy_experiment(selected_run,experiment_module)
+                st.session_state["strategy_experiment_id"]=exp_id
+                st.success(f"已创建：{experiment_module}实验。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"创建策略实验失败：{e}")
+
+        experiments=load_strategy_experiments(selected_run,30)
+        if experiments.empty:
+            st.caption("这个研究任务还没有策略优化实验。")
+        else:
+            exp_options=[]; exp_labels={}
+            for _,er in experiments.iterrows():
+                eid=str(er["experiment_id"])
+                exp_options.append(eid)
+                exp_labels[eid]=(
+                    f"{er['module']} · {int(er['cursor'])}/{int(er['total'])} · "
+                    f"{er['status']} · {eid}"
+                )
+
+            pref_exp=st.session_state.get("strategy_experiment_id")
+            exp_index=exp_options.index(pref_exp) if pref_exp in exp_options else 0
+            selected_exp=st.selectbox(
+                "选择实验",exp_options,index=exp_index,
+                format_func=lambda x:exp_labels.get(x,x),
+                key="strategy_experiment_select"
+            )
+            st.session_state["strategy_experiment_id"]=selected_exp
+            exp=get_strategy_experiment(selected_exp)
+
+            edone=int(exp.get("cursor",0) or 0)
+            etotal=int(exp.get("total",0) or 0)
+            epct=edone/etotal if etotal else 0
+            st.progress(
+                min(epct,1.0),
+                text=f"实验进度 {edone:,}/{etotal:,}（{epct:.1%}）"
+            )
+            st.caption(
+                f"训练截止 {exp['train_end']} · 验证截止 {exp['validation_end']} · "
+                f"最终测试：{'已解锁' if int(exp.get('test_revealed',0) or 0) else '🔒 锁定'}"
+            )
+
+            ex1,ex2=st.columns([1.25,1])
+            run_exp=ex1.button(
+                "▶️ 继续实验下一批",
+                type="primary",use_container_width=True,
+                disabled=(exp.get("status")=="completed"),
+                key="run_strategy_experiment_batch"
+            )
+            ex2.caption(
+                f"每只股票共享一次指标计算，再运行多个参数方案；本批 {experiment_batch} 只。"
+            )
+
+            if run_exp:
+                eprog=st.progress(0.0,text="准备策略实验...")
+                estat=st.empty()
+                with st.spinner("正在执行参数敏感性/消融回放..."):
+                    try:
+                        bs_login()
+                        def _exp_progress(local_done,local_total,overall_done,overall_total,code,name,stage):
+                            pp=local_done/local_total if local_total else 0
+                            eprog.progress(
+                                min(pp,1.0),
+                                text=(
+                                    f"本批 {local_done}/{local_total} · "
+                                    f"总进度 {overall_done}/{overall_total}"
+                                )
+                            )
+                            estat.caption(
+                                f"当前：{display_code(code)} {name} · {stage}"
+                            )
+
+                        exp_out=run_strategy_experiment_batch(
+                            selected_exp,batch_size=int(experiment_batch),
+                            progress_callback=_exp_progress
+                        )
+                        if exp_out.get("errors"):
+                            st.warning(
+                                f"本批完成，有 {len(exp_out['errors'])} 只异常："
+                                +"；".join(exp_out["errors"][:4])
+                            )
+                        else:
+                            st.success(
+                                f"本批实验完成 {exp_out.get('processed',0)} 只。"
+                            )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"策略实验运行失败：{e}")
+                    finally:
+                        try: bs.logout()
+                        except Exception: pass
+
+            exp_table,candidate=strategy_experiment_summary(selected_exp)
+            if not exp_table.empty:
+                st.markdown("#### 训练 + 验证结果")
+                show=exp_table.copy()
+                for col in [
+                    "训练EV(R)","验证EV(R)","验证保守EV(R)",
+                    "验证胜率","验证PF","稳健分","邻域验证EV","相对基准EV"
+                ]:
+                    if col in show.columns:
+                        show[col]=pd.to_numeric(show[col],errors="coerce")
+                cols=[
+                    "方案","训练样本","训练EV(R)","验证样本","验证EV(R)",
+                    "验证保守EV(R)","验证胜率","验证PF",
+                    "邻域验证EV","稳定区域","相对基准EV","稳健分"
+                ]
+                if int(exp.get("test_revealed",0) or 0):
+                    cols += [
+                        "最终测试样本","最终测试EV(R)",
+                        "最终测试保守EV(R)","最终测试胜率","最终测试PF"
+                    ]
+                st.dataframe(
+                    show[[x for x in cols if x in show.columns]],
+                    use_container_width=True,hide_index=True
+                )
+
+                if exp["module"]!="因子消融":
+                    stable_rows=show[show["稳定区域"]==True] if "稳定区域" in show.columns else pd.DataFrame()
+                    if not stable_rows.empty:
+                        st.success(
+                            "发现参数稳定区域："
+                            +" / ".join(stable_rows["方案"].astype(str).tolist())
+                            +"。优先关注整个区域，而不是单一最高值。"
+                        )
+                    else:
+                        st.warning(
+                            "目前没有形成连续正EV的参数平台。即使某个参数单点很好，也不应据此升级实盘规则。"
+                        )
+                else:
+                    st.caption(
+                        "消融实验看“去掉某因子后验证EV如何变化”。相对基准EV明显为负，说明该因子更可能贡献有效Edge；"
+                        "明显为正则说明该门槛可能冗余或有害。"
+                    )
+
+                if candidate:
+                    st.markdown("#### 研究候选")
+                    st.info(
+                        f"训练+验证阶段候选：**{candidate['方案']}** · "
+                        f"验证EV {candidate.get('验证EV(R)',np.nan):+.2f}R · "
+                        f"验证保守EV {candidate.get('验证保守EV(R)',np.nan):+.2f}R。"
+                        "这不是实盘升级结论。"
+                    )
+                    save_cand=st.button(
+                        "💾 保存为候选版本（不应用实盘）",
+                        use_container_width=True,key="save_strategy_candidate_btn"
+                    )
+                    if save_cand:
+                        try:
+                            cid=save_strategy_candidate(
+                                selected_exp,candidate["config_id"]
+                            )
+                            st.success(f"已保存候选版本 {cid}；EV1.0实盘规则未改变。")
+                        except Exception as e:
+                            st.error(f"保存候选失败：{e}")
+                else:
+                    st.caption(
+                        "当前训练/验证数据没有产生同时满足正EV和最小样本要求的候选方案。"
+                    )
+
+                if exp.get("status")=="completed" and not int(exp.get("test_revealed",0) or 0):
+                    st.warning(
+                        "最终20%测试集仍锁定。只有在你决定“停止调参、接受当前候选”后再解锁。"
+                        "一旦看过最终测试，不应再用同一测试区间继续改参数。"
+                    )
+                    reveal=st.button(
+                        "🔓 锁定参数后，解锁最终测试",
+                        use_container_width=True,key="reveal_strategy_final_test"
+                    )
+                    if reveal:
+                        reveal_strategy_test(selected_exp)
+                        st.rerun()
+
+                if int(exp.get("test_revealed",0) or 0):
+                    st.warning(
+                        "该实验最终测试已经看过。后续如果继续修改逻辑，应创建新的策略版本和新的未见测试区间，"
+                        "不要反复用这20%数据挑参数。"
+                    )
+
+            candidates=load_strategy_candidates(20)
+            if not candidates.empty:
+                relevant=candidates[
+                    candidates["experiment_id"].isin(
+                        experiments["experiment_id"].astype(str).tolist()
+                    )
+                ].copy()
+                if not relevant.empty:
+                    with st.expander("候选策略版本库"):
+                        cv=relevant[[
+                            "created_at","module","config_id","status","note"
+                        ]].rename(columns={
+                            "created_at":"保存时间","module":"模块",
+                            "config_id":"方案","status":"状态","note":"说明"
+                        })
+                        st.dataframe(cv,use_container_width=True,hide_index=True)
+
+        st.caption(
+            "优化闭环：基准EV1.0 → 单模块实验 → 训练/验证筛选 → 参数稳定区 → 锁定方案 → "
+            "最终测试 → 保存候选版本 → Forward Test。程序不会自动把回测冠军替换为实盘规则。"
+        )
 
 with tab5:
     st.subheader("历史记录与信号演化")
