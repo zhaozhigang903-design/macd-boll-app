@@ -2,3 +2,4 @@ streamlit>=1.39
 pandas>=2.1
 numpy>=1.26
 baostock>=0.8.9
+openpyxl>=3.1
