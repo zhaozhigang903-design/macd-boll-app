@@ -491,6 +491,38 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_position_snapshots_code_date
     ON position_snapshots(code, snapshot_date)
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS forward_signals(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL,
+      name TEXT,
+      market TEXT,
+      signal_date TEXT NOT NULL,
+      price REAL,
+      tier TEXT,
+      technical_score REAL,
+      buy_score REAL,
+      weekly_score REAL,
+      rr REAL,
+      market_score REAL,
+      rs_score REAL,
+      ev_r REAL,
+      ev_lcb_r REAL,
+      stress_ev_r REAL,
+      ev_samples INTEGER,
+      risk_price REAL,
+      status TEXT NOT NULL DEFAULT 'tracking',
+      realized_r REAL,
+      exit_date TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(code, signal_date)
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_forward_signals_status_date
+    ON forward_signals(status, signal_date)
+    """)
     conn.commit()
     conn.close()
 
@@ -1445,119 +1477,139 @@ def clear_market_cache():
 def add_indicators(df):
     if df is None or df.empty:
         return pd.DataFrame()
-    d = df.copy().sort_values("trade_date").reset_index(drop=True)
-    close = d["close"]
-    d["boll_mid"] = close.rolling(20).mean()
-    std = close.rolling(20).std(ddof=0)
-    d["boll_up"] = d["boll_mid"] + 2*std
-    d["boll_low"] = d["boll_mid"] - 2*std
-    d["ma60"] = close.rolling(60).mean()
+    d=df.copy().sort_values("trade_date").reset_index(drop=True)
+    close=d["close"]
+    d["ret1"]=close.pct_change()
+    d["boll_mid"]=close.rolling(20).mean()
+    std=close.rolling(20).std(ddof=0)
+    d["boll_up"]=d["boll_mid"]+2*std
+    d["boll_low"]=d["boll_mid"]-2*std
+    d["ma60"]=close.rolling(60).mean()
 
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    d["dif"] = ema12 - ema26
-    d["dea"] = d["dif"].ewm(span=9, adjust=False).mean()
-    d["macd"] = 2*(d["dif"]-d["dea"])
+    ema12=close.ewm(span=12,adjust=False).mean()
+    ema26=close.ewm(span=26,adjust=False).mean()
+    d["dif"]=ema12-ema26
+    d["dea"]=d["dif"].ewm(span=9,adjust=False).mean()
+    d["macd"]=2*(d["dif"]-d["dea"])
 
-    d["vol_ma5"] = d["vol"].rolling(5).mean()
-    d["vol_ma10"] = d["vol"].rolling(10).mean()
-    d["boll_slope"] = d["boll_mid"] - d["boll_mid"].shift(3)
-    d["dif_slope"] = d["dif"] - d["dif"].shift(3)
+    d["vol_ma5"]=d["vol"].rolling(5).mean()
+    d["vol_ma10"]=d["vol"].rolling(10).mean()
+    if "amount" in d.columns:
+        d["amount_ma20"]=d["amount"].rolling(20).mean()
+        d["amount_median20"]=d["amount"].rolling(20).median()
+    else:
+        d["amount_ma20"]=np.nan
+        d["amount_median20"]=np.nan
 
-    d["high20"] = d["high"].rolling(20).max()
-    d["low20"] = d["low"].rolling(20).min()
-    d["high20_prev"] = d["high"].shift(1).rolling(20).max()
-    d["high60_prev"] = d["high"].shift(1).rolling(60).max()
-    d["low10_prev"] = d["low"].shift(1).rolling(10).min()
-    d["low20_prev"] = d["low"].shift(1).rolling(20).min()
+    d["boll_slope"]=d["boll_mid"]-d["boll_mid"].shift(3)
+    d["dif_slope"]=d["dif"]-d["dif"].shift(3)
+    d["high20"]=d["high"].rolling(20).max()
+    d["low20"]=d["low"].rolling(20).min()
+    d["high20_prev"]=d["high"].shift(1).rolling(20).max()
+    d["high60_prev"]=d["high"].shift(1).rolling(60).max()
+    d["low10_prev"]=d["low"].shift(1).rolling(10).min()
+    d["low20_prev"]=d["low"].shift(1).rolling(20).min()
 
-    prev_close = close.shift(1)
-    tr = pd.concat([
+    prev_close=close.shift(1)
+    tr=pd.concat([
         d["high"]-d["low"],
         (d["high"]-prev_close).abs(),
         (d["low"]-prev_close).abs()
-    ], axis=1).max(axis=1)
-    d["atr14"] = tr.rolling(14).mean()
-    d["ret20"] = close/close.shift(20)-1
-    d["ret60"] = close/close.shift(60)-1
+    ],axis=1).max(axis=1)
+    d["atr14"]=tr.rolling(14).mean()
+    d["ret20"]=close/close.shift(20)-1
+    d["ret60"]=close/close.shift(60)-1
     return d
 
-def weekly_from_daily(df):
+def weekly_from_daily(df,completed_only=True):
     if df is None or df.empty:
         return pd.DataFrame()
-    d = df.copy().set_index("trade_date")
-    agg = {
-        "open":"first","high":"max","low":"min","close":"last","vol":"sum"
-    }
+    src=df.copy().sort_values("trade_date")
+    latest_daily=pd.Timestamp(src["trade_date"].max()).normalize()
+    d=src.set_index("trade_date")
+    agg={"open":"first","high":"max","low":"min","close":"last","vol":"sum"}
     if "amount" in d.columns:
-        agg["amount"] = "sum"
-    w = d.resample("W-FRI").agg(agg).dropna(subset=["close"]).reset_index()
-    return add_indicators(w)
+        agg["amount"]="sum"
+    w=d.resample("W-FRI").agg(agg).dropna(subset=["close"]).reset_index()
+    if completed_only and not w.empty:
+        w=w[pd.to_datetime(w["trade_date"]).dt.normalize()<=latest_daily]
+    return add_indicators(w.reset_index(drop=True))
 
-def numeric_score(latest_d, latest_w=None):
-    trend = 0
-    slope = latest_d.get("boll_slope", np.nan)
-    if pd.isna(slope): trend += 15
-    elif slope > 0: trend += 45
-    elif abs(slope) <= max(abs(latest_d.get("boll_mid",0))*0.001, 1e-9): trend += 24
-    else: trend += 5
+def numeric_score(latest_d,latest_w=None):
+    trend=0
+    slope=latest_d.get("boll_slope",np.nan)
+    if pd.isna(slope): trend+=15
+    elif slope>0: trend+=45
+    elif abs(slope)<=max(abs(latest_d.get("boll_mid",0))*0.001,1e-9): trend+=24
+    else: trend+=5
 
-    close = latest_d.get("close", np.nan)
-    mid = latest_d.get("boll_mid", np.nan)
+    close=latest_d.get("close",np.nan)
+    mid=latest_d.get("boll_mid",np.nan)
     if pd.notna(close) and pd.notna(mid):
-        if close > mid*1.005: trend += 35
-        elif close < mid*0.995: trend += 4
-        else: trend += 20
-    else: trend += 12
-
-    up, low = latest_d.get("boll_up",np.nan), latest_d.get("boll_low",np.nan)
-    band = ((up-low)/mid) if pd.notna(up) and pd.notna(low) and pd.notna(mid) and mid else np.nan
-    trend += 20 if pd.notna(band) and band > 0.12 else (8 if pd.notna(band) and band < 0.05 else 13)
-    trend = clamp(trend)
-
-    momentum = 0
-    dif, dea, macd = latest_d.get("dif",np.nan), latest_d.get("dea",np.nan), latest_d.get("macd",np.nan)
-    if pd.notna(dif) and pd.notna(dea):
-        if dif > 0 and dea > 0: momentum += 35
-        elif abs(dif) < max(abs(close)*0.002 if pd.notna(close) else 0.01,0.01): momentum += 21
-        else: momentum += 5
-        ds = latest_d.get("dif_slope",np.nan)
-        momentum += 25 if pd.notna(ds) and ds > 0 else (13 if pd.isna(ds) or abs(ds) < 1e-9 else 3)
-        momentum += 17 if dif > dea else 2
-        prev_macd = latest_d.get("macd_prev", np.nan)
-        if pd.notna(macd):
-            if macd > 0 and (pd.isna(prev_macd) or macd >= prev_macd): momentum += 23
-            elif macd > 0: momentum += 15
-            elif pd.notna(prev_macd) and macd > prev_macd: momentum += 12
-            else: momentum += 1
+        if close>mid*1.005: trend+=35
+        elif close<mid*0.995: trend+=4
+        else: trend+=20
     else:
-        momentum = 38
-    momentum = clamp(momentum)
+        trend+=12
+    up,low=latest_d.get("boll_up",np.nan),latest_d.get("boll_low",np.nan)
+    band=((up-low)/mid) if pd.notna(up) and pd.notna(low) and pd.notna(mid) and mid else np.nan
+    trend+=20 if pd.notna(band) and band>0.12 else (8 if pd.notna(band) and band<0.05 else 13)
+    trend=clamp(trend)
 
-    confirm = 45
-    vol = latest_d.get("vol",np.nan)
-    v5, v10 = latest_d.get("vol_ma5",np.nan), latest_d.get("vol_ma10",np.nan)
-    if pd.notna(vol) and pd.notna(v5) and pd.notna(v10):
-        if vol > v5*1.35 and vol > v10*1.35: confirm += 20
-        elif vol > v5 and vol > v10: confirm += 12
-        elif vol < v5 and vol < v10: confirm -= 8
-        else: confirm += 5
-    confirm = clamp(confirm)
+    momentum=0
+    dif,dea,macd=latest_d.get("dif",np.nan),latest_d.get("dea",np.nan),latest_d.get("macd",np.nan)
+    if pd.notna(dif) and pd.notna(dea):
+        if dif>0 and dea>0: momentum+=35
+        elif abs(dif)<max(abs(close)*0.002 if pd.notna(close) else 0.01,0.01): momentum+=21
+        else: momentum+=5
+        ds=latest_d.get("dif_slope",np.nan)
+        momentum+=25 if pd.notna(ds) and ds>0 else (13 if pd.isna(ds) or abs(ds)<1e-9 else 3)
+        momentum+=17 if dif>dea else 2
+        prev_macd=latest_d.get("macd_prev",np.nan)
+        if pd.notna(macd):
+            if macd>0 and (pd.isna(prev_macd) or macd>=prev_macd): momentum+=23
+            elif macd>0: momentum+=15
+            elif pd.notna(prev_macd) and macd>prev_macd: momentum+=12
+            else: momentum+=1
+    else:
+        momentum=38
+    momentum=clamp(momentum)
 
-    weekly = None
+    vol=latest_d.get("vol",np.nan)
+    v5,v10=latest_d.get("vol_ma5",np.nan),latest_d.get("vol_ma10",np.nan)
+    ret1=latest_d.get("ret1",np.nan)
+    confirm=50
+    if pd.notna(vol) and pd.notna(v5) and pd.notna(v10) and max(v5,v10)>0:
+        ratio=vol/max(v5,v10)
+        rising=pd.notna(ret1) and ret1>0
+        if rising:
+            if ratio>=1.60: confirm=92
+            elif ratio>=1.20: confirm=82
+            elif ratio>=0.95: confirm=68
+            elif ratio>=0.70: confirm=54
+            else: confirm=42
+        else:
+            if ratio>=1.60: confirm=24
+            elif ratio>=1.20: confirm=34
+            elif ratio>=0.95: confirm=45
+            elif ratio>=0.70: confirm=52
+            else: confirm=58
+    confirm=clamp(confirm)
+
+    weekly=None
     if latest_w is not None:
-        weekly = 0
-        ws = latest_w.get("boll_slope",np.nan)
-        weekly += 40 if pd.notna(ws) and ws > 0 else (22 if pd.isna(ws) or abs(ws)<1e-9 else 4)
-        wc, wm = latest_w.get("close",np.nan), latest_w.get("boll_mid",np.nan)
-        weekly += 30 if pd.notna(wc) and pd.notna(wm) and wc > wm else (18 if pd.notna(wc) and pd.notna(wm) and wc >= wm*0.99 else 3)
-        wd, we = latest_w.get("dif",np.nan), latest_w.get("dea",np.nan)
-        weekly += 20 if pd.notna(wd) and pd.notna(we) and wd > 0 and we > 0 else (12 if pd.notna(wd) and abs(wd)<0.05 else 2)
-        weekly += 10 if pd.notna(wd) and pd.notna(we) and wd > we else 1
-        weekly = clamp(weekly)
+        weekly=0
+        ws=latest_w.get("boll_slope",np.nan)
+        weekly+=40 if pd.notna(ws) and ws>0 else (22 if pd.isna(ws) or abs(ws)<1e-9 else 4)
+        wc,wm=latest_w.get("close",np.nan),latest_w.get("boll_mid",np.nan)
+        weekly+=30 if pd.notna(wc) and pd.notna(wm) and wc>wm else (18 if pd.notna(wc) and pd.notna(wm) and wc>=wm*0.99 else 3)
+        wd,we=latest_w.get("dif",np.nan),latest_w.get("dea",np.nan)
+        weekly+=20 if pd.notna(wd) and pd.notna(we) and wd>0 and we>0 else (12 if pd.notna(wd) and abs(wd)<0.05 else 2)
+        weekly+=10 if pd.notna(wd) and pd.notna(we) and wd>we else 1
+        weekly=clamp(weekly)
 
-    overall = (0.50*trend + 0.35*momentum + 0.15*confirm) if weekly is None else (0.38*trend + 0.30*momentum + 0.22*weekly + 0.10*confirm)
-    return round(overall,1), round(trend,1), round(momentum,1), (round(weekly,1) if weekly is not None else None), round(confirm,1)
+    overall=(0.50*trend+0.35*momentum+0.15*confirm) if weekly is None else (0.38*trend+0.30*momentum+0.22*weekly+0.10*confirm)
+    return round(overall,1),round(trend,1),round(momentum,1),(round(weekly,1) if weekly is not None else None),round(confirm,1)
 
 def deterministic_report(code, name, df, position_state, fundamentals_ok, benchmark_df=None):
     di = add_indicators(df)
@@ -1771,39 +1823,36 @@ def relative_strength(stock_df, benchmark_df):
     return int(clamp(score)), ex20, ex60
 
 def build_score_series(df):
-    d = add_indicators(df)
-    w = weekly_from_daily(df)
+    d=add_indicators(df)
+    w=weekly_from_daily(df,completed_only=True)
     if d.empty or w.empty:
         return pd.DataFrame()
-    w2 = w[["trade_date","boll_mid","boll_slope","close","dif","dea"]].copy()
-    w2.columns = ["w_date","w_boll_mid","w_boll_slope","w_close","w_dif","w_dea"]
-    m = pd.merge_asof(
-        d.sort_values("trade_date"),
-        w2.sort_values("w_date"),
-        left_on="trade_date", right_on="w_date", direction="backward"
+    w2=w[["trade_date","boll_mid","boll_slope","close","dif","dea"]].copy()
+    w2.columns=["w_date","w_boll_mid","w_boll_slope","w_close","w_dif","w_dea"]
+    m=pd.merge_asof(
+        d.sort_values("trade_date"),w2.sort_values("w_date"),
+        left_on="trade_date",right_on="w_date",direction="backward"
     )
-    scores, weekly_scores, buy_scores, rr_list = [], [], [], []
+    scores=[]; weekly_scores=[]; buy_scores=[]; rr_list=[]; stops=[]; targets=[]
     for i,row in m.iterrows():
-        r = row.to_dict()
-        r["macd_prev"] = m.iloc[i-1]["macd"] if i>0 else np.nan
-        wr = None
+        r=row.to_dict()
+        r["macd_prev"]=m.iloc[i-1]["macd"] if i>0 else np.nan
+        wr=None
         if pd.notna(row.get("w_date")):
-            wr = {
-                "boll_slope":row.get("w_boll_slope"), "close":row.get("w_close"),
-                "boll_mid":row.get("w_boll_mid"), "dif":row.get("w_dif"), "dea":row.get("w_dea")
+            wr={
+                "boll_slope":row.get("w_boll_slope"),"close":row.get("w_close"),
+                "boll_mid":row.get("w_boll_mid"),"dif":row.get("w_dif"),"dea":row.get("w_dea")
             }
-        metric = numeric_score(r,wr)
-        tech = metric[0]
-        weekly_score = metric[3]
-        bp, rr, _, _ = entry_quality(r)
-        scores.append(tech)
-        weekly_scores.append(weekly_score if weekly_score is not None else np.nan)
-        buy_scores.append(bp)
-        rr_list.append(rr)
-    m["score"] = scores
-    m["weekly_score"] = weekly_scores
-    m["buy_score"] = buy_scores
-    m["rr"] = rr_list
+        metric=numeric_score(r,wr)
+        bp,rr,stop,target=entry_quality(r)
+        scores.append(metric[0]); weekly_scores.append(metric[3] if metric[3] is not None else np.nan)
+        buy_scores.append(bp); rr_list.append(rr); stops.append(stop); targets.append(target)
+    m["score"]=scores
+    m["weekly_score"]=weekly_scores
+    m["buy_score"]=buy_scores
+    m["rr"]=rr_list
+    m["stop_ref"]=stops
+    m["target_ref"]=targets
     return m
 
 def entry_quality(r):
