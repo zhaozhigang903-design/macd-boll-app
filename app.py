@@ -2724,6 +2724,19 @@ def refresh_positions():
     out["_ord"] = out["管理状态"].map(order).fillna(9)
     return out.sort_values(["_ord","技术分/100"],ascending=[True,True],na_position="last").drop(columns="_ord").reset_index(drop=True)
 
+def recent_analyses(limit=12):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """SELECT created_at,symbol,market,horizon,position_state,state,rating,
+                  score,trend_score,momentum_score,weekly_score,confirm_score,model_mode
+           FROM analyses
+           WHERE model_mode LIKE '%自动数据'
+           ORDER BY id DESC LIMIT ?""",
+        conn, params=(limit,)
+    )
+    conn.close()
+    return df
+
 def history(limit=300):
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM analyses ORDER BY id DESC LIMIT ?", conn, params=(limit,))
@@ -2796,24 +2809,38 @@ with tab6:
     st.warning("评分是“技术证据质量分”，不是上涨概率，也不是收益率预测。真正的收益来自正期望：胜率 × 盈亏比 × 仓位纪律 × 足够样本。")
 
 with tab1:
-    st.subheader("决策驾驶舱")
-    render_cockpit(st.session_state.get("last_report"))
-    st.divider()
+    st.subheader("股票分析")
+    st.caption("一次只保留一个“当前分析结果”。分析下一只股票时会自动替换上一只；历史结果集中放在页面底部。")
 
-    st.subheader("① 自动数据分析")
-    st.caption("支持A股和港股。可输入6位A股代码、5位港股代码或股票名称；系统自动识别市场并使用对应基准。")
-    a1,a2 = st.columns([1.2,1])
+    a1,a2 = st.columns([1.35,1])
     with a1:
-        auto_code = st.text_input("股票代码或名称", placeholder="例如 600519 / 贵州茅台 / 0700 / 腾讯控股", key="auto_code")
+        auto_code = st.text_input(
+            "股票代码或名称",
+            placeholder="例如 600519 / 贵州茅台 / 0700 / 腾讯控股",
+            key="auto_code"
+        )
     with a2:
-        auto_horizon = st.selectbox("持有周期", ["2–8周","2–6个月","6–18个月"], index=1, key="auto_horizon")
+        auto_horizon = st.selectbox(
+            "持有周期",["2–8周","2–6个月","6–18个月"],index=1,key="auto_horizon"
+        )
+
     a3,a4 = st.columns(2)
     with a3:
-        auto_position = st.selectbox("当前仓位", ["未持有","轻仓≤25%","中等25–50%","重仓>50%"], key="auto_position")
+        auto_position = st.selectbox(
+            "当前仓位",["未持有","轻仓≤25%","中等25–50%","重仓>50%"],key="auto_position"
+        )
     with a4:
-        auto_fund = st.checkbox("基本面/估值已验证", value=False, key="auto_fund")
+        auto_fund = st.checkbox("基本面/估值已验证",value=False,key="auto_fund")
 
-    if st.button("⚡ 自动生成决策", type="primary", use_container_width=True):
+    act1,act2 = st.columns([2,1])
+    run_analysis = act1.button("⚡ 生成 / 替换当前分析",type="primary",use_container_width=True)
+    clear_analysis = act2.button("🧹 清空当前结果",use_container_width=True)
+
+    if clear_analysis:
+        st.session_state.pop("last_report",None)
+        st.rerun()
+
+    if run_analysis:
         if not auto_code.strip():
             st.error("请输入A股或港股代码/名称。")
         else:
@@ -2821,13 +2848,18 @@ with tab1:
                 try:
                     bs_login()
                     code,name = resolve_symbol_input(auto_code)
-                    df_auto = fetch_stock_daily(code, years=3)
+                    df_auto = fetch_stock_daily(code,years=3)
                     benchmark_df = fetch_benchmark_for_code(code,years=3)
-                    report = deterministic_report(code, name, df_auto, auto_position, auto_fund, benchmark_df)
+                    report = deterministic_report(
+                        code,name,df_auto,auto_position,auto_fund,benchmark_df
+                    )
                     prev = previous(report["symbol"])
                     if prev and prev.get("score") is not None:
-                        try: report["delta"] = report["score"] - float(prev.get("score"))
-                        except Exception: pass
+                        try:
+                            report["delta"] = report["score"]-float(prev.get("score"))
+                        except Exception:
+                            pass
+
                     st.session_state["last_report"] = report
                     xsave = {
                         "data_quality":100,
@@ -2839,38 +2871,58 @@ with tab1:
                         "key_resistance":report["resistance"],
                     }
                     meta = {
-                        "symbol":report["symbol"],"market":market_of_code(code),"horizon":auto_horizon,
-                        "position_state":auto_position,"rating":report["rating"],"state":report["state"],
-                        "stage":report["stage"],"confidence":100,"mode":f"{data_source_for_code(code)}自动数据",
+                        "symbol":report["symbol"],"market":market_of_code(code),
+                        "horizon":auto_horizon,"position_state":auto_position,
+                        "rating":report["rating"],"state":report["state"],
+                        "stage":report["stage"],"confidence":100,
+                        "mode":f"{data_source_for_code(code)}自动数据",
                         "weekly_used":True
                     }
-                    metrics = (report["score"],report["trend"],report["momentum"],report["weekly_score"],report["confirm"],False,False)
-                    save_result(meta,xsave,metrics,json.dumps({"source":data_source_for_code(code),"market":market_of_code(code)},ensure_ascii=False))
+                    metrics = (
+                        report["score"],report["trend"],report["momentum"],
+                        report["weekly_score"],report["confirm"],False,False
+                    )
+                    save_result(
+                        meta,xsave,metrics,
+                        json.dumps(
+                            {"source":data_source_for_code(code),"market":market_of_code(code)},
+                            ensure_ascii=False
+                        )
+                    )
                     report.pop("_df",None)
                     st.rerun()
                 except Exception as e:
                     st.error(f"自动分析失败：{e}")
                 finally:
-                    try: bs.logout()
-                    except Exception: pass
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
 
     st.divider()
-    st.caption("当前仅保留数据驱动模式：日K直接获取，周K由同一套日K聚合生成，避免截图识别误差。")
+    st.subheader("当前分析结果")
+    render_cockpit(st.session_state.get("last_report"))
 
-    with st.expander("仓位风险计算器"):
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            capital = st.number_input("账户资金", min_value=0.0, value=100000.0, step=10000.0, key="risk_capital")
-            risk_pct = st.number_input("单次最大风险 %", min_value=0.1, max_value=5.0, value=0.8, step=0.1, key="risk_pct")
-        with rc2:
-            entry = st.number_input("计划入场价", min_value=0.0, value=0.0, step=0.1, key="risk_entry")
-            stop = st.number_input("技术失效价", min_value=0.0, value=0.0, step=0.1, key="risk_stop")
-        if entry > 0 and stop > 0 and entry > stop:
-            risk_cash = capital * risk_pct / 100
-            shares = int(risk_cash / (entry-stop))
-            position_value = shares * entry
-            pct = (position_value/capital*100) if capital else 0
-            st.info(f"风险预算 {risk_cash:,.0f}；理论上限约 {shares:,} 股；约占资金 {pct:.1f}%")
+    st.divider()
+    st.subheader("最近分析")
+    recent = recent_analyses(12)
+    if recent.empty:
+        st.caption("暂无历史分析。")
+    else:
+        recent_show = recent.rename(columns={
+            "created_at":"时间","symbol":"股票","market":"市场","horizon":"周期",
+            "position_state":"仓位","state":"状态","rating":"评级",
+            "score":"技术分","trend_score":"趋势","momentum_score":"动能",
+            "weekly_score":"周线","confirm_score":"量能"
+        })
+        show_cols = [
+            "时间","股票","市场","状态","技术分","趋势","动能","周线","量能","周期","仓位"
+        ]
+        st.dataframe(
+            recent_show[[x for x in show_cols if x in recent_show.columns]],
+            use_container_width=True,hide_index=True
+        )
+        st.caption("这里只显示最近12次数据驱动分析；清空“当前结果”不会删除这些历史记录。")
 
 with tab2:
     st.subheader("自动选股")
