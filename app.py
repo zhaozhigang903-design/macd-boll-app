@@ -747,6 +747,27 @@ with tab_backtest:
             try:
                 x = pd.read_csv(file)
                 bt = backtest(x,fee,boll_n,int(fast),int(slow),int(sig),weekly_filter)
+
+                variants = [
+                    (max(10,boll_n-2), int(fast), int(slow), int(sig)),
+                    (boll_n, int(fast), int(slow), int(sig)),
+                    (min(40,boll_n+2), int(fast), int(slow), int(sig)),
+                    (boll_n, max(5,int(fast)-2), int(slow), int(sig)),
+                    (boll_n, min(20,int(fast)+2), int(slow), int(sig)),
+                ]
+                robust_good = 0
+                robust_total = 0
+                for vb,vf,vs,vg in variants:
+                    try:
+                        vbt = backtest(x,fee,vb,vf,vs,vg,weekly_filter)
+                        robust_total += 1
+                        oos_ok = (not vbt["oos"]) or (vbt["oos"]["return"] > 0)
+                        if vbt["total_return"] > 0 and vbt["profit_factor"] > 1 and oos_ok:
+                            robust_good += 1
+                    except Exception:
+                        pass
+                robust_rate = robust_good/robust_total if robust_total else float("nan")
+
                 summaries.append({
                     "标的":file.name.rsplit(".",1)[0],
                     "总收益":bt["total_return"],
@@ -761,6 +782,7 @@ with tab_backtest:
                     "盈亏比":bt["payoff"],
                     "暴露":bt["exposure"],
                     "样本外收益":bt["oos"]["return"] if bt["oos"] else float("nan"),
+                    "参数稳健率":robust_rate,
                 })
                 curves[file.name] = bt["curve"]
             except Exception as e:
@@ -770,7 +792,7 @@ with tab_backtest:
             summary = pd.DataFrame(summaries)
             st.subheader("跨标的结果")
             display = summary.copy()
-            for col in ["总收益","买入持有","年化","最大回撤","胜率","期望/笔","暴露","样本外收益"]:
+            for col in ["总收益","买入持有","年化","最大回撤","胜率","期望/笔","暴露","样本外收益","参数稳健率"]:
                 display[col] = display[col].map(lambda x: "—" if pd.isna(x) else f"{x:.1%}")
             for col in ["ProfitFactor","MAR","盈亏比"]:
                 display[col] = display[col].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
@@ -783,6 +805,7 @@ with tab_backtest:
             valid_oos = summary["样本外收益"].dropna()
             oos_positive = (valid_oos>0).mean() if len(valid_oos) else float("nan")
             v4.metric("样本外为正占比",pct(oos_positive))
+            st.caption(f"参数扰动稳健率中位数：{summary['参数稳健率'].median():.0%}。规则对小幅参数变化越不敏感，越不容易是过拟合。")
 
             if len(summary)==1:
                 first_name = csv_files[0].name
