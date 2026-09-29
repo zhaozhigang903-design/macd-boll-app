@@ -1,5 +1,4 @@
 streamlit>=1.39
-openai>=1.55
 pandas>=2.1
 numpy>=1.26
 baostock>=0.8.9
