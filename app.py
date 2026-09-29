@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import baostock as bs
+from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "analysis_history.db"
@@ -205,6 +206,84 @@ div[data-testid="stExpander"]{
 }
 </style>
 """, unsafe_allow_html=True)
+
+HOLDINGS_SCREENSHOT_PROMPT = """
+你是一个严谨的A股持仓列表读取器。请从用户上传的券商/行情App持仓截图中提取持仓，不要猜测看不清的数据。
+
+只输出合法JSON：
+{
+  "positions":[
+    {
+      "symbol":"股票代码，若可见则6位；否则空字符串",
+      "name":"股票名称，若可见则填写；否则空字符串",
+      "entry_price": null,
+      "shares": null,
+      "entry_date":"",
+      "initial_stop": null,
+      "note":""
+    }
+  ],
+  "unclear":""
+}
+
+规则：
+- entry_price 只填截图明确显示的“成本价/持仓成本/买入均价”，不要把现价误当成本价。
+- shares 只填明确显示的“持仓数量/持股数/可用数量”中的持仓数量；若不确定填null。
+- 截图通常不显示买入日期和技术失效价，没显示就留空/null，禁止猜测。
+- 若一张图有多只股票，逐只输出。
+- 同一股票若在多张图重复出现，只保留一条，优先采用信息更完整的一条。
+- 不要输出现金、基金、债券、港股、美股；这里只处理沪深A股。
+- 看不清就留空/null，不要编造。
+"""
+
+def extract_holdings_from_images(files):
+    api_key = os.getenv("DEEPSEEK_API_KEY","").strip()
+    if not api_key:
+        raise RuntimeError("服务器未配置持仓截图识别接口。")
+    if not files:
+        return pd.DataFrame()
+
+    content = [{"type":"text","text":HOLDINGS_SCREENSHOT_PROMPT}]
+    for f in files:
+        blob = f.getvalue()
+        mime = getattr(f,"type",None) or "image/png"
+        content.append({
+            "type":"image_url",
+            "image_url":{"url":data_url_bytes(blob,mime)}
+        })
+
+    client = OpenAI(api_key=api_key,base_url="https://api.deepseek.com")
+    resp = client.chat.completions.create(
+        model="deepseek-flash",
+        messages=[{"role":"user","content":content}],
+        response_format={"type":"json_object"},
+        temperature=0
+    )
+    raw = resp.choices[0].message.content
+    obj = parse_json(raw)
+    if not obj or not isinstance(obj.get("positions"),list):
+        raise RuntimeError("持仓截图识别结果格式异常。")
+
+    rows = []
+    seen = set()
+    for x in obj["positions"]:
+        symbol = str(x.get("symbol") or "").strip()
+        name = str(x.get("name") or "").strip()
+        key = symbol or name
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "删除":False,
+            "代码或名称":symbol or name,
+            "名称":name,
+            "买入均价":x.get("entry_price"),
+            "持股数量":x.get("shares"),
+            "买入日期":x.get("entry_date") or "",
+            "技术失效价":x.get("initial_stop"),
+            "备注":x.get("note") or ""
+        })
+    return pd.DataFrame(rows)
 
 EXTRACT_PROMPT = """
 你是一个严谨的股票/ETF技术图表读取器。任务不是自由发挥，而是从用户上传的日K/周K截图中提取可验证事实，并做简短技术解释。
@@ -2026,6 +2105,104 @@ def position_action(
 
     return action, reason
 
+def add_screener_rows_to_positions(df):
+    if df is None or df.empty:
+        return 0,[]
+    ok = 0
+    errors = []
+    now_date = pd.Timestamp.today().strftime("%Y-%m-%d")
+    for idx,row in df.iterrows():
+        try:
+            raw = str(row.get("代码","")).strip()
+            if not raw:
+                continue
+            code,name = resolve_symbol_input(raw)
+            price = pd.to_numeric(row.get("收盘"),errors="coerce")
+            if pd.isna(price) or float(price)<=0:
+                raise ValueError("候选缺少有效收盘价")
+            note = "由选股模块一键加入；成本暂用筛选收盘价，请按实际成交修改"
+            upsert_position(code,name,now_date,float(price),0,None,note)
+            tech = pd.to_numeric(row.get("技术分/100"),errors="coerce")
+            mkt_text = str(row.get("大盘",""))
+            mm = re.search(r"(\d+(?:\.\d+)?)/100",mkt_text)
+            mkt = float(mm.group(1)) if mm else None
+            if pd.notna(tech):
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute(
+                    """UPDATE positions SET
+                       entry_score=COALESCE(entry_score,?),
+                       peak_score=CASE
+                         WHEN peak_score IS NULL THEN ?
+                         WHEN peak_score < ? THEN ?
+                         ELSE peak_score END,
+                       last_score=?,last_price=?,last_market_score=COALESCE(?,last_market_score),
+                       updated_at=?
+                       WHERE code=?""",
+                    (
+                        float(tech),float(tech),float(tech),float(tech),
+                        float(tech),float(price),mkt,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),code
+                    )
+                )
+                conn.commit(); conn.close()
+            ok += 1
+        except Exception as e:
+            errors.append(f"第{idx+1}行：{e}")
+    return ok,errors
+
+def editable_positions_frame():
+    df = load_positions(True)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "删除","代码","名称","买入均价","持股数量","买入日期","技术失效价","备注",
+            "技术分/100","峰值技术分","现价","管理状态"
+        ])
+    out = pd.DataFrame({
+        "删除":False,
+        "代码":df["code"].map(display_code),
+        "名称":df["name"],
+        "买入均价":df["entry_price"],
+        "持股数量":df["shares"],
+        "买入日期":df["entry_date"],
+        "技术失效价":df["initial_stop"],
+        "备注":df["note"],
+        "技术分/100":df["last_score"],
+        "峰值技术分":df["peak_score"],
+        "现价":df["last_price"],
+        "管理状态":df["last_action"]
+    })
+    return out
+
+def save_edited_positions(df):
+    if df is None or df.empty:
+        return 0,0,[]
+    saved = deleted = 0
+    errors = []
+    for idx,row in df.iterrows():
+        try:
+            code = normalize_code(str(row.get("代码","")).strip())
+            if not code:
+                continue
+            if bool(row.get("删除",False)):
+                close_position(code)
+                deleted += 1
+                continue
+            name = str(row.get("名称") or "").strip() or stock_basic_name(code)
+            price = pd.to_numeric(row.get("买入均价"),errors="coerce")
+            shares = pd.to_numeric(row.get("持股数量"),errors="coerce")
+            if pd.isna(price) or float(price)<=0:
+                raise ValueError("买入均价必须>0")
+            shares = 0 if pd.isna(shares) else float(shares)
+            entry_date = str(row.get("买入日期") or "").strip() or pd.Timestamp.today().strftime("%Y-%m-%d")
+            stop = pd.to_numeric(row.get("技术失效价"),errors="coerce")
+            stop = float(stop) if pd.notna(stop) and float(stop)>0 else None
+            note = str(row.get("备注") or "")
+            upsert_position(code,name,entry_date,float(price),shares,stop,note)
+            saved += 1
+        except Exception as e:
+            errors.append(f"第{idx+1}行：{e}")
+    return saved,deleted,errors
+
 def upsert_position(code, name, entry_date, entry_price, shares, initial_stop=None, note=""):
     code = normalize_code(code)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2295,6 +2472,7 @@ with tab7:
         st.success("行情缓存已清空。")
         st.rerun()
     st.warning("当前缓存位于Render本机SQLite：日常重复扫描会明显加速，但服务重新部署/重建实例时可能被清空。")
+    st.caption("持仓截图识别使用已配置的DeepSeek视觉接口；截图只用于提取持仓字段，不参与技术评分。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
 
 with tab6:
@@ -2517,7 +2695,43 @@ with tab2:
                 st.warning("已扫描部分暂未出现通过系统自动门槛的交易机会。")
         else:
             st.success(f"当前累计筛出 {len(result)} 只系统通过候选")
-            st.dataframe(result.head(100),use_container_width=True,hide_index=True)
+            pick = result.head(100).copy()
+            pick.insert(0,"加入持仓",False)
+            edited_pick = st.data_editor(
+                pick,
+                use_container_width=True,
+                hide_index=True,
+                disabled=[x for x in pick.columns if x!="加入持仓"],
+                column_config={
+                    "加入持仓":st.column_config.CheckboxColumn("加入持仓",help="勾选后可批量加入持仓")
+                },
+                key="screen_pick_editor"
+            )
+            ab1,ab2 = st.columns(2)
+            add_selected = ab1.button("➕ 加入勾选持仓",type="primary",use_container_width=True)
+            add_all = ab2.button("➕ 全部候选加入持仓",use_container_width=True)
+
+            if add_selected or add_all:
+                chosen = pick if add_all else edited_pick[edited_pick["加入持仓"]==True].drop(columns=["加入持仓"],errors="ignore")
+                if add_all:
+                    chosen = chosen.drop(columns=["加入持仓"],errors="ignore")
+                if chosen.empty:
+                    st.warning("请先勾选要加入持仓的股票。")
+                else:
+                    try:
+                        bs_login()
+                        ok,errs = add_screener_rows_to_positions(chosen)
+                        if ok:
+                            st.success(f"已加入/更新 {ok} 只持仓。加入时暂用筛选收盘价作为成本，可在持仓页直接修改成实际成交价。")
+                            st.session_state.pop("holding_view",None)
+                        if errs:
+                            st.warning("部分加入失败："+"；".join(errs[:8]))
+                    except Exception as e:
+                        st.error(f"加入持仓失败：{e}")
+                    finally:
+                        try: bs.logout()
+                        except Exception: pass
+
             st.download_button(
                 "⬇️ 导出当前候选",
                 result.to_csv(index=False).encode("utf-8-sig"),
@@ -2527,116 +2741,71 @@ with tab2:
 
 with tab3:
     st.subheader("持仓管理")
-    st.caption("买入后不再用“买点分”决定去留，核心改为跟踪技术分、技术分变化、周线和大盘环境。")
+    st.caption("最简流程：选股页一键加入，或直接上传券商持仓截图。识别后可批量校对；日常只需要修改、删除和更新技术分。")
 
     st.markdown("**管理分区**：≥78 强势持有｜65–77 持有｜55–64 谨慎持有｜45–54 减仓候选｜<45 退出候选。技术分从峰值快速回落、周线转弱或大盘逆风会进一步降档。")
 
-    with st.expander("📥 批量导入持仓", expanded=False):
-        st.caption("支持 CSV / XLSX。至少需要：代码或名称 + 买入均价。可选：持股数量、买入日期、技术失效价、备注。")
-        template_df = pd.DataFrame([
-            {"代码或名称":"600519","买入均价":1450.00,"持股数量":100,"买入日期":pd.Timestamp.today().strftime("%Y-%m-%d"),"技术失效价":"","备注":""},
-            {"代码或名称":"宁德时代","买入均价":300.00,"持股数量":200,"买入日期":pd.Timestamp.today().strftime("%Y-%m-%d"),"技术失效价":"","备注":""}
-        ])
-        st.download_button(
-            "⬇️ 下载批量导入模板",
-            template_df.to_csv(index=False).encode("utf-8-sig"),
-            "positions_import_template.csv","text/csv",use_container_width=True
+    with st.expander("📸 上传持仓截图",expanded=True):
+        st.caption("支持一张或多张持仓列表截图。系统只读取股票名称/代码、持仓成本、持股数量；看不清的字段不会猜。识别后先在表格里校对，再保存。")
+        hold_imgs = st.file_uploader(
+            "上传持仓截图",
+            type=["png","jpg","jpeg","webp"],
+            accept_multiple_files=True,
+            key="holding_screenshots"
         )
-        pos_file = st.file_uploader("选择持仓文件",type=["csv","xlsx"],key="positions_batch_file")
-        if pos_file is not None and st.button("📥 批量导入",type="primary",use_container_width=True):
-            try:
-                if str(pos_file.name).lower().endswith(".xlsx"):
-                    imp = pd.read_excel(pos_file)
-                else:
-                    imp = pd.read_csv(pos_file,dtype=str,encoding="utf-8-sig")
-                # “代码或名称”也作为股票字段识别
-                if "代码或名称" in imp.columns and not any(x in imp.columns for x in ["代码","股票代码","code","symbol","股票","名称","股票名称"]):
-                    imp = imp.rename(columns={"代码或名称":"股票"})
-                bs_login()
-                ok,errs = import_positions_dataframe(imp)
-                if ok:
-                    st.success(f"成功导入/更新 {ok} 只持仓。点击“更新全部持仓”生成最新技术分。")
-                if errs:
-                    st.warning("部分行未导入："+"；".join(errs[:8]))
-                st.session_state.pop("holding_view",None)
-            except Exception as e:
-                st.error(f"批量导入失败：{e}")
-            finally:
-                try: bs.logout()
-                except Exception: pass
-
-    with st.expander("➕ 新增 / 更新持仓", expanded=False):
-        candidates = st.session_state.get("scan_results")
-        candidate_opts = ["手动输入"]
-        candidate_map = {}
-        if isinstance(candidates,pd.DataFrame) and not candidates.empty and "代码" in candidates.columns:
-            for _,r in candidates.head(100).iterrows():
-                label = f"{r.get('代码','')} · {r.get('名称','')}"
-                candidate_opts.append(label)
-                candidate_map[label] = str(r.get("代码",""))
-
-        source_pick = st.selectbox("来源",candidate_opts,key="pos_source")
-        default_code = candidate_map.get(source_pick,"")
-        p1,p2,p3 = st.columns(3)
-        with p1:
-            pos_code = st.text_input("股票代码或名称",value=default_code,placeholder="例如 600519 / 贵州茅台",key="pos_code")
-        with p2:
-            pos_price = st.number_input("买入均价",min_value=0.0,value=0.0,step=0.01,key="pos_price")
-        with p3:
-            pos_shares = st.number_input("持股数量",min_value=0.0,value=0.0,step=100.0,key="pos_shares")
-
-        p4,p5 = st.columns(2)
-        with p4:
-            pos_date = st.date_input("买入日期",value=pd.Timestamp.today().date(),key="pos_date")
-        with p5:
-            pos_stop = st.number_input("技术失效价（可选）",min_value=0.0,value=0.0,step=0.01,key="pos_stop")
-        pos_note = st.text_input("备注（可选）",placeholder="例如：首仓/加仓后均价",key="pos_note")
-
-        if st.button("💾 保存到持仓",type="primary",use_container_width=True):
-            if not pos_code.strip() or pos_price<=0:
-                st.error("请填写股票代码和买入均价。")
-            else:
+        if hold_imgs and st.button("🔍 识别持仓截图",type="primary",use_container_width=True):
+            with st.spinner("正在识别持仓列表..."):
                 try:
-                    bs_login()
-                    code,name = resolve_symbol_input(pos_code)
-                    upsert_position(
-                        code,name,str(pos_date),pos_price,pos_shares,
-                        pos_stop if pos_stop>0 else None,pos_note
-                    )
-                    benchmark_df = fetch_benchmark_daily(years=3)
-                    df0 = fetch_stock_daily(code,years=3)
-                    r0 = deterministic_report(code,name,df0,"中等25–50%",True,benchmark_df)
-                    conn = sqlite3.connect(DB_PATH)
-                    conn.execute(
-                        "UPDATE positions SET entry_score=?,peak_score=?,last_score=?,last_price=?,last_market_score=?,updated_at=? WHERE code=?",
-                        (r0["score"],r0["score"],r0["score"],r0["latest_close"],r0["market_score"],
-                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),code)
-                    )
-                    conn.commit(); conn.close()
-                    st.success(f"已加入持仓：{name} / {display_code(code)}，入场技术分 {r0['score']:.0f}/100")
-                    st.rerun()
+                    parsed = extract_holdings_from_images(hold_imgs)
+                    if parsed.empty:
+                        st.warning("没有识别到有效A股持仓。")
+                    else:
+                        st.session_state["holding_import_preview"] = parsed
                 except Exception as e:
-                    st.error(f"保存持仓失败：{e}")
-                finally:
-                    try: bs.logout()
-                    except Exception: pass
+                    st.error(f"截图识别失败：{e}")
 
+        preview = st.session_state.get("holding_import_preview")
+        if isinstance(preview,pd.DataFrame) and not preview.empty:
+            st.markdown("**识别结果 — 请先校对**")
+            preview_edit = st.data_editor(
+                preview,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                column_config={
+                    "删除":st.column_config.CheckboxColumn("删除"),
+                    "买入均价":st.column_config.NumberColumn("买入均价",format="%.3f"),
+                    "持股数量":st.column_config.NumberColumn("持股数量",format="%.0f"),
+                    "技术失效价":st.column_config.NumberColumn("技术失效价",format="%.3f")
+                },
+                key="holding_import_editor"
+            )
+            if st.button("💾 保存识别后的持仓",type="primary",use_container_width=True):
+                work = preview_edit[preview_edit["删除"]!=True].copy()
+                if work.empty:
+                    st.warning("没有可保存的持仓。")
+                else:
+                    try:
+                        bs_login()
+                        # 转成统一导入字段
+                        imp = work.rename(columns={"代码或名称":"股票"})
+                        ok,errs = import_positions_dataframe(imp)
+                        if ok:
+                            st.success(f"成功保存 {ok} 只持仓。")
+                            st.session_state.pop("holding_import_preview",None)
+                            st.session_state.pop("holding_view",None)
+                        if errs:
+                            st.warning("部分未保存："+"；".join(errs[:8]))
+                    except Exception as e:
+                        st.error(f"保存失败：{e}")
+                    finally:
+                        try: bs.logout()
+                        except Exception: pass
+
+    st.divider()
     h1,h2 = st.columns(2)
-    refresh_holdings = h1.button("🔄 更新全部持仓",type="primary",use_container_width=True)
-    active_pos = load_positions(True)
-    close_opts = ["不操作"]
-    close_map = {}
-    if not active_pos.empty:
-        for _,p in active_pos.iterrows():
-            label = f"{display_code(p['code'])} · {p['name']}"
-            close_opts.append(label)
-            close_map[label] = p["code"]
-    close_pick = h2.selectbox("移出持仓",close_opts,key="close_pos_pick")
-    if close_pick != "不操作":
-        if st.button("确认移出持仓",use_container_width=True):
-            close_position(close_map[close_pick])
-            st.success("已移出持仓。")
-            st.rerun()
+    refresh_holdings = h1.button("🔄 更新全部技术分",type="primary",use_container_width=True)
+    h2.caption("持仓表可直接修改成本、数量、日期、失效价和备注；勾选“删除”后保存即可移除。")
 
     if refresh_holdings:
         with st.spinner("正在更新全部持仓的最新技术分和管理状态..."):
@@ -2650,27 +2819,47 @@ with tab3:
                 try: bs.logout()
                 except Exception: pass
 
-    holding_view = st.session_state.get("holding_view")
-    if not isinstance(holding_view,pd.DataFrame):
-        active = load_positions(True)
-        if not active.empty:
-            view_cols = ["code","name","entry_price","shares","entry_score","peak_score","last_score","last_price","last_action"]
-            holding_view = active[[x for x in view_cols if x in active.columns]].copy()
-            holding_view = holding_view.rename(columns={
-                "code":"代码","name":"名称","entry_price":"成本","shares":"持股",
-                "entry_score":"入场技术分","peak_score":"峰值技术分",
-                "last_score":"技术分/100","last_price":"现价","last_action":"管理状态"
-            })
+    edit_df = editable_positions_frame()
+    if not edit_df.empty:
+        st.markdown("### 当前持仓")
+        position_editor = st.data_editor(
+            edit_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "删除":st.column_config.CheckboxColumn("删除"),
+                "买入均价":st.column_config.NumberColumn("买入均价",format="%.3f"),
+                "持股数量":st.column_config.NumberColumn("持股数量",format="%.0f"),
+                "技术失效价":st.column_config.NumberColumn("技术失效价",format="%.3f"),
+                "技术分/100":st.column_config.NumberColumn("技术分/100",format="%.1f"),
+                "峰值技术分":st.column_config.NumberColumn("峰值技术分",format="%.1f"),
+                "现价":st.column_config.NumberColumn("现价",format="%.3f")
+            },
+            disabled=["代码","名称","技术分/100","峰值技术分","现价","管理状态"],
+            key="positions_editor"
+        )
+        if st.button("💾 保存修改 / 删除勾选",type="primary",use_container_width=True):
+            try:
+                bs_login()
+                saved,deleted,errs = save_edited_positions(position_editor)
+                msg = []
+                if saved: msg.append(f"修改/保存 {saved} 只")
+                if deleted: msg.append(f"删除 {deleted} 只")
+                if msg: st.success("；".join(msg))
+                if errs: st.warning("部分处理失败："+"；".join(errs[:8]))
+                st.session_state.pop("holding_view",None)
+                st.rerun()
+            except Exception as e:
+                st.error(f"保存持仓修改失败：{e}")
+            finally:
+                try: bs.logout()
+                except Exception: pass
 
-    if isinstance(holding_view,pd.DataFrame) and not holding_view.empty:
-        show = holding_view.copy()
-        if "收益率" in show.columns:
-            show["收益率"] = show["收益率"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-        st.dataframe(show,use_container_width=True,hide_index=True)
-
-        codes_available = []
-        for _,r in load_positions(True).iterrows():
-            codes_available.append((r["code"],f"{display_code(r['code'])} · {r['name']}"))
+        active_now = load_positions(True)
+        codes_available = [
+            (r["code"],f"{display_code(r['code'])} · {r['name']}")
+            for _,r in active_now.iterrows()
+        ]
         if codes_available:
             label_to_code = {label:code for code,label in codes_available}
             selected_hist = st.selectbox("查看持仓技术分历史",[x[1] for x in codes_available],key="pos_hist")
@@ -2681,9 +2870,9 @@ with tab3:
                 st.line_chart(chart[cols],height=250)
                 st.dataframe(ph.head(30),use_container_width=True,hide_index=True)
             else:
-                st.caption("刷新持仓后开始累计每日技术分快照。")
+                st.caption("点击“更新全部技术分”后开始累计每日持仓快照。")
     else:
-        st.info("暂无持仓。选股后实际买入时，把代码、成本和持股数量加入这里。")
+        st.info("暂无持仓。可以从选股页一键加入，或者直接上传券商持仓截图。")
 
 with tab4:
     st.subheader("自动策略回测")
