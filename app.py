@@ -635,6 +635,56 @@ def init_db():
     }.items():
         if cname not in rtcols:
             conn.execute(f"ALTER TABLE research_trades ADD COLUMN {cname} {ctype}")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS strategy_experiments(
+      experiment_id TEXT PRIMARY KEY,
+      research_run_id TEXT NOT NULL,
+      module TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      status TEXT NOT NULL,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      total INTEGER NOT NULL DEFAULT 0,
+      train_end TEXT NOT NULL,
+      validation_end TEXT NOT NULL,
+      test_revealed INTEGER NOT NULL DEFAULT 0,
+      config_json TEXT NOT NULL,
+      rule_version TEXT NOT NULL,
+      note TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS strategy_experiment_trades(
+      experiment_id TEXT NOT NULL,
+      config_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      signal_date TEXT NOT NULL,
+      entry_date TEXT,
+      exit_date TEXT,
+      r_multiple REAL,
+      return_pct REAL,
+      holding_days INTEGER,
+      opportunity_score REAL,
+      initial_risk_pct REAL,
+      PRIMARY KEY(experiment_id,config_id,code,signal_date)
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_strategy_experiment_trades_exp_cfg_date
+    ON strategy_experiment_trades(experiment_id,config_id,signal_date)
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS strategy_candidates(
+      candidate_id TEXT PRIMARY KEY,
+      experiment_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      module TEXT NOT NULL,
+      config_id TEXT NOT NULL,
+      config_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'candidate',
+      note TEXT
+    )
+    """)
     fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
     if "rule_version" not in fcols:
         conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
