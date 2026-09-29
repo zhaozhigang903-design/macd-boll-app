@@ -950,34 +950,63 @@ def deterministic_report(code, name, df, position_state, fundamentals_ok):
         "_df":di
     }
 
-def fetch_index_members(kind, limit_n):
-    if kind == "沪深300":
-        rs = bs.query_hs300_stocks()
-    elif kind == "中证500":
-        rs = bs.query_zz500_stocks()
-    else:
-        rs = bs.query_sz50_stocks()
+def latest_trade_date():
+    end = pd.Timestamp.today().strftime("%Y-%m-%d")
+    start = (pd.Timestamp.today() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    rs = bs.query_trade_dates(start_date=start, end_date=end)
     df = _rs_to_df(rs)
     if df.empty:
-        return []
-    code_col = "code" if "code" in df.columns else df.columns[0]
-    return df[code_col].drop_duplicates().head(limit_n).tolist()
+        return end
+    if "is_trading_day" in df.columns:
+        df = df[df["is_trading_day"].astype(str) == "1"]
+    if df.empty:
+        return end
+    return str(df["calendar_date"].max())
 
-def screen_codes(codes):
+def fetch_universe(kind):
+    if kind == "沪深300":
+        rs = bs.query_hs300_stocks()
+        df = _rs_to_df(rs)
+    elif kind == "中证500":
+        rs = bs.query_zz500_stocks()
+        df = _rs_to_df(rs)
+    elif kind == "上证50":
+        rs = bs.query_sz50_stocks()
+        df = _rs_to_df(rs)
+    else:
+        day = latest_trade_date()
+        rs = bs.query_all_stock(day=day)
+        df = _rs_to_df(rs)
+        if not df.empty:
+            code_col = "code" if "code" in df.columns else df.columns[0]
+            df = df[df[code_col].astype(str).str.match(r"^(sh\.6|sz\.[03])")]
+            if "tradeStatus" in df.columns:
+                df = df[df["tradeStatus"].astype(str) == "1"]
+
+    if df.empty:
+        return pd.DataFrame(columns=["code","code_name"])
+    code_col = "code" if "code" in df.columns else df.columns[0]
+    name_col = "code_name" if "code_name" in df.columns else ("codeName" if "codeName" in df.columns else None)
+    out = pd.DataFrame({"code":df[code_col].astype(str)})
+    out["code_name"] = df[name_col].astype(str) if name_col else out["code"]
+    return out.drop_duplicates("code").reset_index(drop=True)
+
+def screen_codes(codes, name_map=None, min_score=62):
     rows = []
+    name_map = name_map or {}
     for code in codes:
         try:
-            d = fetch_stock_daily(code, years=2)
+            d = fetch_stock_daily(code, years=1)
             if len(d) < 150:
                 continue
-            name = stock_basic_name(code)
+            name = name_map.get(code) or stock_basic_name(code)
             di = add_indicators(d)
             wi = weekly_from_daily(d)
             lr = di.iloc[-1].to_dict()
             lr["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
             wr = wi.iloc[-1].to_dict() if not wi.empty else None
             score, trend, momentum, weekly, confirm = numeric_score(lr, wr)
-            if score >= 62 and (weekly is None or weekly >= 50):
+            if score >= min_score and (weekly is None or weekly >= 50):
                 rows.append({
                     "代码":display_code(code), "名称":name,
                     "技术分/100":score, "趋势/100":trend, "动能/100":momentum,
@@ -1157,29 +1186,96 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("数据源：BaoStock。按与个股分析一致的日线+周线+BOLL+MACD+量能规则筛选。")
-    universe = st.selectbox("选股范围", ["沪深300","中证500","上证50"], index=0)
-    count = st.select_slider("扫描数量", options=[20,50,100], value=50)
-    if st.button("🔎 开始选股", type="primary", use_container_width=True):
-        with st.spinner(f"正在扫描{universe}前{count}只成分股..."):
+    st.caption("支持全沪深A股，不再只扫描指数前100只。全市场采用分批扫描，避免手机页面超时；可连续扫描直到100%。")
+
+    universe = st.selectbox("选股范围", ["全A股（沪深）","沪深300","中证500","上证50"], index=0)
+    f1,f2,f3 = st.columns(3)
+    with f1:
+        batch_size = st.selectbox("每批扫描", [100,200,300,500], index=2)
+    with f2:
+        min_score = st.slider("最低技术分", 50, 90, 62)
+    with f3:
+        exclude_st = st.checkbox("排除ST/*ST", value=True)
+
+    s1,s2 = st.columns(2)
+    start_scan = s1.button("🔎 开始/重新扫描", type="primary", use_container_width=True)
+    continue_scan = s2.button("➡️ 扫描下一批", use_container_width=True)
+
+    if start_scan:
+        st.session_state["scan_cursor"] = 0
+        st.session_state["scan_results"] = pd.DataFrame()
+        st.session_state["scan_universe"] = universe
+        st.session_state["scan_done"] = False
+
+    if start_scan or continue_scan:
+        with st.spinner("正在获取股票池并扫描本批次..."):
             try:
                 bs_login()
-                codes = fetch_index_members(universe,count)
-                result = screen_codes(codes)
-                st.session_state["screen_result"] = result
+                pool = fetch_universe(universe)
+                if exclude_st and not pool.empty:
+                    pool = pool[~pool["code_name"].str.upper().str.contains(r"(^ST|\*ST)", regex=True, na=False)]
+                pool = pool.reset_index(drop=True)
+
+                total = len(pool)
+                cursor = int(st.session_state.get("scan_cursor",0))
+                if st.session_state.get("scan_universe") != universe:
+                    cursor = 0
+                    st.session_state["scan_results"] = pd.DataFrame()
+                    st.session_state["scan_universe"] = universe
+
+                end_i = min(cursor + int(batch_size), total)
+                batch = pool.iloc[cursor:end_i]
+                codes = batch["code"].tolist()
+                names = dict(zip(batch["code"], batch["code_name"]))
+                batch_result = screen_codes(codes, names, min_score=min_score)
+
+                old_result = st.session_state.get("scan_results")
+                if not isinstance(old_result,pd.DataFrame) or old_result.empty:
+                    merged = batch_result.copy()
+                elif batch_result.empty:
+                    merged = old_result.copy()
+                else:
+                    merged = pd.concat([old_result,batch_result], ignore_index=True)
+                    merged = merged.drop_duplicates("代码", keep="last")
+                    merged = merged.sort_values(["技术分/100","周线/100"], ascending=False).reset_index(drop=True)
+
+                st.session_state["scan_results"] = merged
+                st.session_state["scan_cursor"] = end_i
+                st.session_state["scan_total"] = total
+                st.session_state["scan_done"] = end_i >= total
             except Exception as e:
                 st.error(f"选股失败：{e}")
             finally:
                 try: bs.logout()
                 except Exception: pass
-    result = st.session_state.get("screen_result")
+
+    total = int(st.session_state.get("scan_total",0))
+    cursor = int(st.session_state.get("scan_cursor",0))
+    result = st.session_state.get("scan_results")
+
+    if total > 0:
+        pct = min(cursor/total,1.0)
+        st.progress(pct, text=f"已扫描 {cursor:,} / {total:,} 只（{pct:.1%}）")
+        if cursor < total:
+            st.info(f"还有 {total-cursor:,} 只未扫描。点击“扫描下一批”继续，直到100%。")
+        else:
+            st.success("✅ 当前股票池已全部扫描完成。")
+
     if isinstance(result,pd.DataFrame):
         if result.empty:
-            st.warning("本次没有筛到满足条件的标的。")
+            if cursor > 0:
+                st.warning("已扫描部分暂未发现满足条件的标的。")
         else:
-            st.success(f"筛出 {len(result)} 只候选")
-            st.dataframe(result.head(30), use_container_width=True, hide_index=True)
-            st.caption("总分是技术证据质量分，不是上涨概率；候选股仍需基本面与估值复核。")
+            st.success(f"当前累计筛出 {len(result)} 只候选")
+            st.dataframe(result.head(100), use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ 导出当前候选",
+                result.to_csv(index=False).encode("utf-8-sig"),
+                "screen_candidates.csv",
+                "text/csv",
+                use_container_width=True
+            )
+            st.caption("候选表按技术分排序；技术分不是上涨概率，仍需结合基本面、估值和组合风险。")
 
 with tab3:
     st.subheader("策略回测")
