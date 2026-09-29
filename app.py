@@ -2457,53 +2457,222 @@ def summarize_ev(trades):
         "可信度":confidence
     }
 
-def walk_forward_validation(trades):
-    if trades is None or trades.empty or len(trades)<8:
-        return {"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"样本不足"}
+def purged_walk_forward_validation(trades,purge_days=30,embargo_days=10):
+    if trades is None or trades.empty or len(trades)<10:
+        return {
+            "折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,
+            "稳定性":"样本不足","purge_days":purge_days,"embargo_days":embargo_days
+        }
 
-    t=trades.sort_values("signal_date").reset_index(drop=True)
+    t=trades.copy()
+    t["signal_date"]=pd.to_datetime(t["signal_date"],errors="coerce")
+    t["exit_date"]=pd.to_datetime(t.get("exit_date"),errors="coerce")
+    t=t.dropna(subset=["signal_date"]).sort_values("signal_date").reset_index(drop=True)
     n=len(t)
-    train_min=max(5,int(n*0.45))
-    remain=n-train_min
-    if remain<3:
-        return {"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"样本不足"}
+    if n<10:
+        return {
+            "折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,
+            "稳定性":"样本不足","purge_days":purge_days,"embargo_days":embargo_days
+        }
 
-    folds=min(3,max(1,remain//3))
+    train_min=max(6,int(n*0.45))
+    remain=n-train_min
+    if remain<4:
+        return {
+            "折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,
+            "稳定性":"样本不足","purge_days":purge_days,"embargo_days":embargo_days
+        }
+
+    folds=min(4,max(2,remain//4))
     fold_size=max(1,remain//folds)
     tests=[]
     positive=0
     used=0
+    gap=pd.Timedelta(days=int(purge_days)+int(embargo_days))
 
     for k in range(folds):
-        start=train_min+k*fold_size
-        end=n if k==folds-1 else min(n,start+fold_size)
-        if start>=end:
+        start_i=train_min+k*fold_size
+        end_i=n if k==folds-1 else min(n,start_i+fold_size)
+        if start_i>=end_i:
             continue
-        train=t.iloc[:start]
-        test=t.iloc[start:end]
+
+        test=t.iloc[start_i:end_i].copy()
+        test_start=pd.Timestamp(test["signal_date"].min())
+        cutoff=test_start-gap
+
+        if "exit_date" in t.columns and t["exit_date"].notna().any():
+            train=t[(t.index<start_i) & (t["exit_date"]<cutoff)].copy()
+        else:
+            train=t[(t.index<start_i) & (t["signal_date"]<cutoff)].copy()
+
+        if len(train)<5 or test.empty:
+            continue
+
         train_ev=summarize_ev(train)
         test_ev=summarize_ev(test)
-
-        # 只在过去训练段为正EV时观察下一段；测试段不反向调参。
-        if pd.notna(train_ev["EV_R"]) and train_ev["EV_R"]>0:
+        if pd.notna(train_ev.get("EV_R")) and train_ev["EV_R"]>0:
             tests.append(test)
             used+=1
-            if pd.notna(test_ev["EV_R"]) and test_ev["EV_R"]>0:
+            if pd.notna(test_ev.get("EV_R")) and test_ev["EV_R"]>0:
                 positive+=1
 
     if not tests:
-        return {"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"历史训练段EV非正"}
+        return {
+            "折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,
+            "稳定性":"训练段EV非正或净化后样本不足",
+            "purge_days":purge_days,"embargo_days":embargo_days
+        }
 
     oos=pd.concat(tests,ignore_index=True)
     oe=summarize_ev(oos)
     stability=(
-        "稳定" if used>=2 and positive==used and pd.notna(oe["EV_R"]) and oe["EV_R"]>0
-        else ("一般" if positive>=max(1,used//2) else "不稳定")
+        "稳定" if used>=2 and positive==used and pd.notna(oe.get("EV_R")) and oe["EV_R"]>0
+        else ("一般" if positive>=max(1,(used+1)//2) else "不稳定")
     )
     return {
         "折数":used,"正EV折数":positive,
-        "OOS_EV_R":oe["EV_R"],"OOS胜率":oe["胜率"],"稳定性":stability
+        "OOS_EV_R":oe.get("EV_R"),"OOS胜率":oe.get("胜率"),
+        "稳定性":stability,"purge_days":purge_days,"embargo_days":embargo_days
     }
+
+def walk_forward_validation(trades):
+    # 保留旧函数名，内部升级为Purged Walk-Forward + Embargo。
+    return purged_walk_forward_validation(trades,purge_days=30,embargo_days=10)
+
+def bootstrap_ev_interval(trades,n_boot=600):
+    if trades is None or trades.empty or len(trades)<8:
+        return {
+            "样本":0,"P(EV>0)":np.nan,"EV_P05":np.nan,
+            "EV_P50":np.nan,"EV_P95":np.nan
+        }
+
+    t=trades.copy()
+    t["R"]=pd.to_numeric(t["R"] if "R" in t.columns else t.get("r_multiple"),errors="coerce")
+    t["signal_date"]=pd.to_datetime(t["signal_date"],errors="coerce")
+    t=t.dropna(subset=["R","signal_date"])
+    if len(t)<8:
+        return {
+            "样本":int(len(t)),"P(EV>0)":np.nan,"EV_P05":np.nan,
+            "EV_P50":np.nan,"EV_P95":np.nan
+        }
+
+    # 月度块Bootstrap：保留同一月份内横截面相关性，比逐笔独立重采样更保守。
+    t["month"]=t["signal_date"].dt.to_period("M").astype(str)
+    g=t.groupby("month")["R"].agg(["sum","count"]).reset_index(drop=True)
+    if len(g)<4:
+        arr=t["R"].to_numpy(dtype=float)
+        rng=np.random.default_rng(42)
+        means=np.array([
+            float(np.mean(rng.choice(arr,size=len(arr),replace=True)))
+            for _ in range(int(n_boot))
+        ])
+    else:
+        sums=g["sum"].to_numpy(dtype=float)
+        counts=g["count"].to_numpy(dtype=float)
+        rng=np.random.default_rng(42)
+        means=[]
+        m=len(g)
+        for _ in range(int(n_boot)):
+            idx=rng.integers(0,m,size=m)
+            denom=float(counts[idx].sum())
+            means.append(float(sums[idx].sum()/denom) if denom>0 else np.nan)
+        means=np.asarray(means,dtype=float)
+
+    means=means[np.isfinite(means)]
+    if len(means)==0:
+        return {
+            "样本":int(len(t)),"P(EV>0)":np.nan,"EV_P05":np.nan,
+            "EV_P50":np.nan,"EV_P95":np.nan
+        }
+    return {
+        "样本":int(len(t)),
+        "P(EV>0)":float((means>0).mean()),
+        "EV_P05":float(np.quantile(means,0.05)),
+        "EV_P50":float(np.quantile(means,0.50)),
+        "EV_P95":float(np.quantile(means,0.95))
+    }
+
+def attach_walkforward_pred_ev(trades,min_history=20,embargo_days=10):
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    t=trades.copy()
+    t["signal_date"]=pd.to_datetime(t["signal_date"],errors="coerce")
+    t["exit_date"]=pd.to_datetime(t["exit_date"],errors="coerce")
+    rcol="R" if "R" in t.columns else "r_multiple"
+    t["_R"]=pd.to_numeric(t[rcol],errors="coerce")
+    t["_opp"]=pd.to_numeric(
+        t["opportunity"] if "opportunity" in t.columns else t.get("opportunity_score"),
+        errors="coerce"
+    ).fillna(50)
+    t=t.dropna(subset=["signal_date","_R"]).sort_values("signal_date").reset_index(drop=True)
+    if t.empty:
+        return t
+
+    t["_band"]=(t["_opp"]//10*10).clip(0,90).astype(int)
+    completed=t.dropna(subset=["exit_date"]).sort_values("exit_date").reset_index()
+    ptr=0
+    global_r=[]
+    subgroup={}
+    preds=[]
+    hist_ns=[]
+    cutoff_delta=pd.Timedelta(days=int(embargo_days))
+
+    for _,row in t.iterrows():
+        cutoff=row["signal_date"]-cutoff_delta
+        while ptr<len(completed) and completed.iloc[ptr]["exit_date"]<cutoff:
+            cr=completed.iloc[ptr]
+            rv=float(cr["_R"])
+            global_r.append(rv)
+            key=(str(cr.get("market","")),int(cr["_band"]))
+            subgroup.setdefault(key,[]).append(rv)
+            ptr+=1
+
+        n=len(global_r)
+        hist_ns.append(n)
+        if n<int(min_history):
+            preds.append(np.nan)
+            continue
+
+        global_mean=float(np.mean(global_r))
+        key=(str(row.get("market","")),int(row["_band"]))
+        sub=subgroup.get(key,[])
+        # 经验贝叶斯式收缩：局部样本少时向全局均值收缩。
+        k=12.0
+        pred=(
+            (len(sub)*float(np.mean(sub))+k*global_mean)/(len(sub)+k)
+            if len(sub)>0 else global_mean
+        )
+        preds.append(float(pred))
+
+    t["pred_ev_r"]=preds
+    t["pred_ev_history_n"]=hist_ns
+    return t
+
+def ev_calibration_table(trades):
+    t=attach_walkforward_pred_ev(trades,min_history=20,embargo_days=10)
+    if t.empty or t["pred_ev_r"].notna().sum()<15:
+        return pd.DataFrame()
+
+    v=t.dropna(subset=["pred_ev_r","_R"]).copy()
+    try:
+        q=min(5,max(2,int(len(v)//12)))
+        v["EV分组"]=pd.qcut(v["pred_ev_r"],q=q,duplicates="drop")
+    except Exception:
+        return pd.DataFrame()
+
+    rows=[]
+    for grp,g in v.groupby("EV分组",observed=True):
+        pred=float(g["pred_ev_r"].mean())
+        actual=float(g["_R"].mean())
+        rows.append({
+            "预测EV区间":str(grp),
+            "样本":int(len(g)),
+            "平均预测EV(R)":pred,
+            "实际EV(R)":actual,
+            "实际胜率":float((g["_R"]>0).mean()),
+            "校准误差(R)":actual-pred
+        })
+    return pd.DataFrame(rows)
 
 def reprice_trades_for_cost(trades,code,cost_mult=2.0):
     if trades is None or trades.empty:
