@@ -877,14 +877,27 @@ def render_cockpit(report):
         if ex60 is not None and pd.notna(ex60):
             rs_line += f" · 60日超额 {ex60:.1%}"
         st.caption(rs_line)
-        hist = report.get("historical_edge") or {}
-        parts = []
-        for h in (20,40,60):
-            x = hist.get(h,{})
-            if x.get("样本",0):
-                parts.append(f"{h}日：胜率{x.get('胜率',0):.0%} / 样本{x.get('样本',0)} / 均收益{x.get('平均收益',0):.1%}")
-        if parts:
-            st.caption("历史相似信号 · " + " ｜ ".join(parts))
+        ev = report.get("ev") or {}
+        e1,e2,e3 = st.columns(3)
+        evr = ev.get("EV_R")
+        lcb = ev.get("保守EV_R")
+        stress = ev.get("压力EV_R")
+        e1.metric("历史净EV", f"{evr:+.2f}R" if pd.notna(evr) else "—")
+        e2.metric("保守EV", f"{lcb:+.2f}R" if pd.notna(lcb) else "—")
+        e3.metric("2倍成本EV", f"{stress:+.2f}R" if pd.notna(stress) else "—")
+        win = ev.get("胜率")
+        pf = ev.get("盈亏因子")
+        pf_txt = f"{pf:.2f}" if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else "—")
+        wf = ev.get("walk_forward") or {}
+        line = f"真实交易样本 {ev.get('样本',0)}"
+        if pd.notna(win):
+            line += f" · 胜率 {win:.0%}"
+        line += f" · EV可信度 {ev.get('可信度','不足')} · 盈亏因子 {pf_txt}"
+        st.caption(line)
+        st.caption(
+            f"OOS：{wf.get('稳定性','样本不足')} · "
+            f"正EV折数 {wf.get('正EV折数',0)}/{wf.get('折数',0)}"
+        )
 
     with st.expander("详细技术证据"):
         d = report.get("daily",{}) or {}
@@ -1611,111 +1624,123 @@ def numeric_score(latest_d,latest_w=None):
     overall=(0.50*trend+0.35*momentum+0.15*confirm) if weekly is None else (0.38*trend+0.30*momentum+0.22*weekly+0.10*confirm)
     return round(overall,1),round(trend,1),round(momentum,1),(round(weekly,1) if weekly is not None else None),round(confirm,1)
 
-def deterministic_report(code, name, df, position_state, fundamentals_ok, benchmark_df=None):
-    di = add_indicators(df)
-    wi = weekly_from_daily(df)
-    if len(di) < 60:
+def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_df=None,compute_ev=True):
+    di=add_indicators(df)
+    wi=weekly_from_daily(df,completed_only=True)
+    if len(di)<60:
         raise RuntimeError("历史数据不足，无法计算指标")
-    drow = di.iloc[-1].to_dict()
-    drow["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
-    if len(wi) < 20:
-        raise RuntimeError("周线历史不足，无法生成中长线决策")
-    wrow = wi.iloc[-1].to_dict()
-    score, trend, momentum, weekly, confirm = numeric_score(drow, wrow)
-    if weekly is None:
-        raise RuntimeError("周线计算失败，无法生成中长线决策")
-    weekly_ok = weekly >= 60
-    rating = grade(score, weekly_ok, 100)
-    stage = stage_from(score, {}, weekly_ok)
+    if len(wi)<20:
+        raise RuntimeError("确认周线历史不足，无法生成中长线决策")
 
-    buy_score, rr, risk_price, target_price = entry_quality(drow)
-    benchmark_df = benchmark_df if benchmark_df is not None else pd.DataFrame()
-    mkt_score, mkt_regime = market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
-    rs_score, ex20, ex60 = relative_strength(df,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
-    hist = historical_edge(
-        df, score, buy_score,
-        benchmark_df=benchmark_df,
-        current_market_score=mkt_score
+    drow=di.iloc[-1].to_dict()
+    drow["macd_prev"]=di.iloc[-2]["macd"] if len(di)>1 else np.nan
+    wrow=wi.iloc[-1].to_dict()
+    score,trend,momentum,weekly,confirm=numeric_score(drow,wrow)
+    weekly_ok=weekly is not None and weekly>=60
+    rating=grade(score,weekly_ok,100)
+    stage=stage_from(score,{},weekly_ok)
+
+    buy_score,rr,risk_price,target_price=entry_quality(drow)
+    benchmark_df=benchmark_df if benchmark_df is not None else pd.DataFrame()
+    mkt_score,mkt_regime=market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
+    rs_score,ex20,ex60=relative_strength(df,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
+    opp=opportunity_score(score,buy_score,rr,None,mkt_score,rs_score)
+    liq_ok,amount20,liq_threshold=liquidity_rule(code,drow)
+
+    ev={
+        "样本":0,"胜率":np.nan,"EV_R":np.nan,"保守EV_R":np.nan,"压力EV_R":np.nan,
+        "中位R":np.nan,"平均盈利R":np.nan,"平均亏损R":np.nan,"盈亏因子":np.nan,
+        "平均持有":np.nan,"最大不利R":np.nan,"可信度":"未计算",
+        "walk_forward":{"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"未计算"}
+    }
+    tier="候选观察"
+    ev_reason="持仓管理模式不重复计算历史EV"
+    if compute_ev:
+        ev,_=realized_trade_ev(df,benchmark_df,code)
+        tier,ev_reason,_=ev_opportunity_decision(
+            score,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
+        )
+
+    hard_bear=(
+        pd.notna(drow.get("boll_slope")) and drow.get("boll_slope")<0 and
+        pd.notna(drow.get("boll_mid")) and drow.get("close")<drow.get("boll_mid") and
+        pd.notna(drow.get("dif")) and drow.get("dif")<0 and
+        pd.notna(drow.get("dea")) and drow.get("dif")<drow.get("dea")
     )
-    opp = opportunity_score(score,buy_score,rr,hist,mkt_score,rs_score)
-    opp_label = opportunity_label(opp,buy_score,rr,mkt_score,hist)
+    state,reason=state_from(score,rating,100,False,weekly_ok,position_state,fundamentals_ok,hard_bear)
+    holding=position_state!="未持有"
 
-    hard_bear = (
-        pd.notna(drow.get("boll_slope")) and drow.get("boll_slope") < 0
-        and pd.notna(drow.get("boll_mid")) and drow.get("close") < drow.get("boll_mid")
-        and pd.notna(drow.get("dif")) and drow.get("dif") < 0
-        and pd.notna(drow.get("dea")) and drow.get("dif") < drow.get("dea")
-    )
-    state, reason = state_from(score, rating, 100, False, weekly_ok, position_state, fundamentals_ok, hard_bear)
-
-    holding = position_state != "未持有"
-    if not holding and not hard_bear:
-        if fundamentals_ok and opp >= 76 and buy_score >= 65 and pd.notna(rr) and rr >= 1.2 and mkt_score >= 35:
-            state, reason = "买入候选", f"{opp_label}：买点、盈亏比和市场环境达到候选条件"
-        elif mkt_score < 35:
-            state, reason = "观察", "个股结构需服从逆风市场，等待大盘或相对强度改善"
-        elif buy_score < 60:
-            state, reason = "观察", "技术结构可以，但当前位置并非理想买点"
-        elif pd.notna(rr) and rr < 1.2:
-            state, reason = "观察", "当前潜在收益空间不足以覆盖结构风险"
+    if not holding:
+        if tier=="优先机会" and fundamentals_ok:
+            state,reason="买入候选",ev_reason
+        elif tier=="优先机会":
+            state,reason="观察","技术与EV通过，但基本面/估值尚未独立确认"
+        elif tier=="候选观察":
+            state,reason="观察",ev_reason
+        elif hard_bear:
+            state,reason="回避","趋势与动能处于明显弱势"
         else:
-            state, reason = "观察", f"{opp_label}，等待更多条件共振"
+            state,reason="观察",ev_reason
 
-    mid = drow.get("boll_mid",np.nan)
-    support_txt = (
-        f"{risk_price:.2f}（风险参考） / {mid:.2f}（中轨）"
+    mid=drow.get("boll_mid",np.nan)
+    support_txt=(
+        f"{risk_price:.2f}（初始风险参考） / {mid:.2f}（中轨）"
         if pd.notna(risk_price) and pd.notna(mid)
         else (f"{mid:.2f}（中轨）" if pd.notna(mid) else "未知")
     )
-    resistance_txt = f"{target_price:.2f}（参考压力/波动目标）" if pd.notna(target_price) else "未知"
+    resistance_txt=f"{target_price:.2f}（参考压力，不作为固定止盈）" if pd.notna(target_price) else "未知"
 
-    boll_dir = "向上" if drow.get("boll_slope",0) > 0 else ("向下" if drow.get("boll_slope",0) < 0 else "走平")
-    pos_txt = "中轨上" if pd.notna(mid) and drow.get("close") > mid else "中轨下"
-    zero = "零轴上" if drow.get("dif",0) > 0 and drow.get("dea",0) > 0 else "零轴下/附近"
-    cross = "金叉" if drow.get("dif",0) > drow.get("dea",0) else "死叉"
-    rr_txt = f"{rr:.2f}" if pd.notna(rr) else "—"
+    boll_dir="向上" if drow.get("boll_slope",0)>0 else ("向下" if drow.get("boll_slope",0)<0 else "走平")
+    pos_txt="中轨上" if pd.notna(mid) and drow.get("close")>mid else "中轨下"
+    zero="零轴上" if drow.get("dif",0)>0 and drow.get("dea",0)>0 else "零轴下/附近"
+    cross="金叉" if drow.get("dif",0)>drow.get("dea",0) else "死叉"
+    rr_txt=f"{rr:.2f}" if pd.notna(rr) else "—"
+    ev_txt=f"{ev.get('EV_R'):+.2f}R" if pd.notna(ev.get("EV_R")) else "样本不足"
+    essence=f"{tier} · 历史净EV {ev_txt} · 技术{score:.0f} · 买点{buy_score} · RR {rr_txt} · {mkt_regime}{mkt_score}/100"
 
-    essence = f"机会{opp:.0f}/100，买点{buy_score}/100，盈亏比{rr_txt}；大盘{mkt_regime}{mkt_score}/100。"
-
-    up, down = [], []
-    if buy_score < 65: up.append("买点分升至65以上")
-    if pd.notna(rr) and rr < 1.5: up.append("盈亏比改善至1.5以上")
-    if mkt_score < 50: up.append("大盘环境回到中性以上")
-    if pd.notna(risk_price): down.append(f"跌破风险位{risk_price:.2f}")
-    if mkt_score < 35: down.append("大盘进入逆风区")
-    if pd.notna(mid): down.append(f"持续运行于中轨{mid:.2f}下方")
+    up=[]; down=[]
+    if compute_ev and tier!="优先机会":
+        up.append("等待保守EV与压力EV转正")
+    if buy_score<65:
+        up.append("买点质量继续改善")
+    if pd.notna(risk_price):
+        down.append(f"跌破风险位{risk_price:.2f}")
+    if mkt_score<35:
+        down.append("市场处于逆风区")
+    if pd.notna(mid):
+        down.append(f"持续运行于中轨{mid:.2f}下方")
 
     return {
-        "updated_at": datetime.now().strftime("%m-%d %H:%M"),
-        "symbol": f"{name} / {display_code(code)}",
-        "state":state, "rating":rating, "stage":stage, "state_reason":reason,
-        "score":score, "trend":trend, "momentum":momentum, "weekly_score":weekly,
-        "confirm":confirm, "confidence":100, "essence":essence,
-        "support":support_txt, "resistance":resistance_txt,
-        "upgrade":"；".join(up[:2]) if up else "维持当前共振",
-        "downgrade":"；".join(down[:2]), "delta":None, "intraday":False,
-        "opportunity_score":opp, "opportunity_label":opp_label,
-        "buy_score":buy_score, "rr":rr,
-        "market_score":mkt_score, "market_regime":mkt_regime,
-        "rs_score":rs_score, "excess20":ex20, "excess60":ex60,
-        "historical_edge":hist,
-        "risk_price":risk_price, "target_price":target_price,
+        "updated_at":datetime.now().strftime("%m-%d %H:%M"),
+        "symbol":f"{name} / {display_code(code)}",
+        "state":state,"rating":rating,"stage":stage,"state_reason":reason,
+        "score":score,"trend":trend,"momentum":momentum,"weekly_score":weekly,
+        "confirm":confirm,"confidence":100,"essence":essence,
+        "support":support_txt,"resistance":resistance_txt,
+        "upgrade":"；".join(up[:2]) if up else "维持当前结构",
+        "downgrade":"；".join(down[:2]),"delta":None,"intraday":False,
+        "opportunity_score":opp,"opportunity_label":tier,
+        "buy_score":buy_score,"rr":rr,
+        "market_score":mkt_score,"market_regime":mkt_regime,
+        "rs_score":rs_score,"excess20":ex20,"excess60":ex60,
+        "ev":ev,"liquidity_ok":liq_ok,"amount20":amount20,
+        "risk_price":risk_price,"target_price":target_price,
         "daily":{
-            "boll_mid_direction":boll_dir, "price_vs_mid":pos_txt,
-            "macd_zero_zone":zero, "dif_direction":"向上" if drow.get("dif_slope",0)>0 else "向下",
+            "boll_mid_direction":boll_dir,"price_vs_mid":pos_txt,
+            "macd_zero_zone":zero,"dif_direction":"向上" if drow.get("dif_slope",0)>0 else "向下",
             "cross":cross,
             "bar_momentum":"红柱" if drow.get("macd",0)>0 else "绿柱",
-            "volume_state":"高于MA5/MA10" if pd.notna(drow.get("vol_ma5")) and drow.get("vol")>drow.get("vol_ma5") and drow.get("vol")>drow.get("vol_ma10") else "普通/缩量",
+            "volume_state":f"量能分 {confirm:.0f}/100",
             "volume_trend":"—","divergence":"未做自动背离判定"
         },
         "boll_analysis":f"中轨{boll_dir}，收盘{drow.get('close',np.nan):.2f}，中轨{mid:.2f}。" if pd.notna(mid) else "",
         "macd_analysis":f"DIF {drow.get('dif',np.nan):.3f}，DEA {drow.get('dea',np.nan):.3f}，{cross}。",
-        "weekly_analysis":f"周线技术分 {weekly:.0f}/100。" if weekly is not None else "",
-        "resonance":f"个股相对强度{rs_score}/100；{benchmark_label_for_code(code)}环境{mkt_regime}{mkt_score}/100。",
-        "data_source":data_source_for_code(code), "market":market_of_code(code),
-        "benchmark":benchmark_label_for_code(code), "adjustment":"前复权",
+        "weekly_analysis":f"已确认周线技术分 {weekly:.0f}/100；未完成本周K不用于硬性决策。",
+        "resonance":f"相对强度{rs_score}/100；{benchmark_label_for_code(code)}环境{mkt_regime}{mkt_score}/100。",
+        "data_source":data_source_for_code(code),"market":market_of_code(code),
+        "benchmark":benchmark_label_for_code(code),"adjustment":"前复权",
         "latest_date":di.iloc[-1]["trade_date"].strftime("%Y-%m-%d"),
-        "latest_close":float(di.iloc[-1]["close"]), "_df":di
+        "latest_close":float(di.iloc[-1]["close"]),"_df":di
     }
 
 def latest_trade_date():
@@ -2909,7 +2934,7 @@ def refresh_positions():
                 continue
             name = p["name"] or stock_basic_name(code)
             report = deterministic_report(
-                code,name,df,"中等25–50%",True,benchmark_df
+                code,name,df,"中等25–50%",True,benchmark_df,compute_ev=False
             )
             current = float(report["score"])
             current_price = float(report["latest_close"])
@@ -3069,8 +3094,13 @@ with tab6:
 - **自动门槛**：用户不再手调技术分/买点分/盈亏比。系统根据大盘强弱动态设门槛，并分成“优先机会/候选观察”两层；优先机会还要结合盈亏平衡胜率、安全边际和历史期望，避免阈值过严导致全市场零候选。
 - **市场环境**：A股以沪深300、港股以恒生指数的BOLL、MACD、MA60及20/60日收益评估“顺风/中性/偏弱/逆风”。
 - **相对强度**：A股相对沪深300、港股相对恒生指数比较20/60日表现，避免只买“随市场被动上涨”的股票。
-- **历史统计**：同时看20/40/60日胜率、平均收益和样本量；样本不足时自动降低权重。
-- **回测**：采用下一交易日开盘执行，并且不把“未来才知道的历史胜率”用于过去信号，避免明显未来函数。
+- **历史EV**：不再用“20/40/60日后是否上涨”冒充策略胜率。历史信号按同一套入场、风险位和技术退出规则逐笔模拟，统一换算为R倍数。
+- **保守EV**：历史平均R减去统计误差形成保守下界；只有点估计为正不够。
+- **成本压力测试**：同时计算2倍交易成本/滑点下的EV，检验优势是否脆弱。
+- **OOS验证**：固定规则按时间顺序滚动验证，不用测试段反向调参数。
+- **周线**：硬性决策只使用已确认周线；未完成的当周K不参与选股阈值。
+- **流动性**：A股默认20日中位成交额≥5000万元，港股≥2000万元。
+- **回测**：收盘形成信号，下一交易日执行；止损考虑跳空，不假设一定能按风险位成交。
 - **持仓管理**：买入后“买点分”的意义下降，核心转为技术分及其变化。≥78强势持有、65–77持有、55–64谨慎持有、45–54减仓候选、<45退出候选；技术分较峰值快速回落、周线转弱或大盘逆风会降档。
 
 **关键原则**
@@ -3079,7 +3109,7 @@ with tab6:
 - 日线强、周线弱 = 先观察，不把局部反弹当中长线主升。
 - 技术面只负责“什么时候风险收益更好”，不替代基本面和估值判断。
 """)
-    st.warning("评分是“技术证据质量分”，不是上涨概率，也不是收益率预测。真正的收益来自正期望：胜率 × 盈亏比 × 仓位纪律 × 足够样本。")
+    st.warning("技术分/机会分只是结构描述，不再当作盈利概率。系统核心改为真实交易净EV(R)、保守EV、成本压力EV与OOS稳定性；样本不足时只能观察。")
 
 with tab1:
     st.subheader("股票分析")
@@ -3121,8 +3151,8 @@ with tab1:
                 try:
                     bs_login()
                     code,name = resolve_symbol_input(auto_code)
-                    df_auto = fetch_stock_daily(code,years=3)
-                    benchmark_df = fetch_benchmark_for_code(code,years=3)
+                    df_auto = fetch_stock_daily(code,years=5)
+                    benchmark_df = fetch_benchmark_for_code(code,years=5)
                     report = deterministic_report(
                         code,name,df_auto,auto_position,auto_fund,benchmark_df
                     )
@@ -3235,10 +3265,10 @@ with tab2:
             try:
                 bs_login()
                 if universe == "港股主板":
-                    benchmark_df = fetch_hk_benchmark_daily(years=3)
+                    benchmark_df = fetch_hk_benchmark_daily(years=5)
                     benchmark_name = "恒生指数"
                 else:
-                    benchmark_df = fetch_benchmark_daily(years=3)
+                    benchmark_df = fetch_benchmark_daily(years=5)
                     benchmark_name = "沪深300"
                 current_market_score,current_market_regime = market_environment(benchmark_df)
                 st.session_state["scan_market"] = (current_market_score,current_market_regime,benchmark_name)
@@ -3280,10 +3310,10 @@ with tab2:
                         f"当前：{display_code(code_now)} {name_now} · {stage}"
                     )
                     live_diag.caption(
-                        f"快速初筛 {stats_now.get('快速初筛通过',0)} · "
-                        f"优先机会 {stats_now.get('优先机会',0)} · "
-                        f"候选观察 {stats_now.get('候选观察',0)} · "
-                        f"数据异常 {stats_now.get('数据异常',0)}"
+                        f"结构初筛 {stats_now.get('快速初筛通过',0)} · "
+                        f"EV计算 {stats_now.get('EV阶段',0)} · "
+                        f"优先 {stats_now.get('优先机会',0)} · 观察 {stats_now.get('候选观察',0)} · "
+                        f"流动性不足 {stats_now.get('流动性不足',0)}"
                     )
 
                 batch_result,batch_stats = screen_codes(
@@ -3305,9 +3335,13 @@ with tab2:
                 else:
                     merged = pd.concat([old_result,batch_result],ignore_index=True)
                     merged = merged.drop_duplicates("代码",keep="last")
+                    tier_order={"优先机会":0,"候选观察":1}
+                    merged["_tier"]=merged["机会状态"].map(tier_order).fillna(9)
+                    merged["_evsort"]=pd.to_numeric(merged["保守EV(R)"],errors="coerce").fillna(-999)
                     merged = merged.sort_values(
-                        ["机会分/100","买点分/100","技术分/100"],ascending=False
-                    ).reset_index(drop=True)
+                        ["_tier","_evsort","历史净EV(R)","技术分/100"],
+                        ascending=[True,False,False,False]
+                    ).drop(columns=["_tier","_evsort"]).reset_index(drop=True)
 
                 st.session_state["scan_results"] = merged
                 st.session_state["scan_cursor"] = end_i
@@ -3349,7 +3383,7 @@ with tab2:
             n_priority = int((result["机会状态"]=="优先机会").sum()) if "机会状态" in result.columns else 0
             n_watch = int((result["机会状态"]=="候选观察").sum()) if "机会状态" in result.columns else 0
             st.success(f"当前累计 {len(result)} 只：优先机会 {n_priority} · 候选观察 {n_watch}")
-            pick = result.head(100).copy()
+            pick = result.head(100).drop(columns=["_market_score"],errors="ignore").copy()
             pick.insert(0,"加入持仓",False)
             edited_pick = st.data_editor(
                 pick,
@@ -3388,7 +3422,7 @@ with tab2:
 
             st.download_button(
                 "⬇️ 导出当前候选",
-                result.to_csv(index=False).encode("utf-8-sig"),
+                result.drop(columns=["_market_score"],errors="ignore").to_csv(index=False).encode("utf-8-sig"),
                 "screen_candidates.csv","text/csv",use_container_width=True
             )
             stats_last = st.session_state.get("scan_last_stats") or {}
@@ -3396,10 +3430,11 @@ with tab2:
                 st.caption(
                     f"本批诊断：扫描 {stats_last.get('扫描',0)} · "
                     f"快速初筛通过 {stats_last.get('快速初筛通过',0)} · "
-                    f"进入历史阶段 {stats_last.get('历史阶段',0)} · "
+                    f"进入EV阶段 {stats_last.get('EV阶段',0)} · "
+                    f"流动性不足 {stats_last.get('流动性不足',0)} · "
                     f"数据异常 {stats_last.get('数据异常',0)}"
                 )
-            st.caption("“优先机会”要求结构和历史统计同时更强；“候选观察”表示已接近自动门槛，适合继续跟踪，不等同于买入信号。")
+            st.caption("排序核心已改为保守EV：优先机会要求真实交易EV、保守EV与2倍成本压力EV为正；候选观察表示EV点估计为正但样本或置信度不足。")
 
 with tab3:
     st.subheader("持仓管理")
@@ -3538,7 +3573,7 @@ with tab3:
 
 with tab4:
     st.subheader("自动策略回测")
-    st.caption("这里不再让用户手调技术分、买点分、盈亏比或退出分。回测直接验证选股和持仓管理所使用的同一套自动规则，避免“为了回测好看而调参数”。")
+    st.caption("固定规则回测 + 真实交易R倍数 + 时间外(OOS)验证。用户不能为了回测结果手调阈值；重点看净EV、保守EV、2倍成本EV和OOS稳定性。")
     bt_code = st.text_input("股票代码或名称",placeholder="例如 600519 / 贵州茅台 / 00700 / 腾讯控股",key="bt_code")
 
     st.info("固定口径：5年历史；A股单边成本按万分之8，港股按万分之15保守估算；入场门槛根据当时市场环境自动变化，退出使用同一持仓管理规则。")
@@ -3554,7 +3589,7 @@ with tab4:
                     df_bt = fetch_stock_daily(code,years=5)
                     benchmark_bt = fetch_benchmark_for_code(code,years=5)
                     fee_bps = 15 if market_of_code(code)=="港股" else 8
-                    curve,m = run_backtest(df_bt,benchmark_bt,fee_bps=fee_bps)
+                    curve,m = run_backtest(df_bt,benchmark_bt,code=code,fee_bps=fee_bps)
                     st.session_state["bt_curve"] = curve
                     st.session_state["bt_metrics"] = m
                     st.session_state["bt_symbol"] = f"{name} / {display_code(code)}"
@@ -3584,6 +3619,15 @@ with tab4:
         st.caption(
             f"同期买入持有：{m['买入持有']:.1%}"
             +(f" · 平均持有 {m['平均持有天数']:.0f} 天" if pd.notna(m["平均持有天数"]) else "")
+        )
+        e1,e2,e3,e4 = st.columns(4)
+        e1.metric("净EV",f"{m['EV_R']:+.2f}R" if pd.notna(m.get("EV_R")) else "—")
+        e2.metric("保守EV",f"{m['保守EV_R']:+.2f}R" if pd.notna(m.get("保守EV_R")) else "—")
+        e3.metric("2倍成本EV",f"{m['压力EV_R']:+.2f}R" if pd.notna(m.get("压力EV_R")) else "—")
+        e4.metric("OOS EV",f"{m['OOS_EV_R']:+.2f}R" if pd.notna(m.get("OOS_EV_R")) else "—")
+        st.caption(
+            f"EV可信度：{m.get('EV可信度','不足')} · OOS稳定性：{m.get('OOS稳定性','样本不足')} · "
+            f"OOS正EV折数 {m.get('OOS正EV折数',0)}/{m.get('OOS折数',0)}"
         )
         if isinstance(curve,pd.DataFrame) and not curve.empty:
             st.line_chart(curve.set_index("trade_date")[["净值","买入持有"]],height=280)
