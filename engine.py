@@ -400,6 +400,8 @@ def _strategy_curve(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9, use_w
     close = pd.to_numeric(x[cols["close"]], errors="coerce")
     if len(close) < max(boll_n,slow,signal)+5:
         raise ValueError("数据太少，至少需要约60个交易日。")
+    if use_weekly_filter and len(close) < 150:
+        raise ValueError("启用周线过滤时建议至少提供150个交易日，最好3年以上数据。")
 
     mid = close.rolling(boll_n).mean()
     mid_up = mid.diff() > 0
