@@ -22,12 +22,22 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.block-container{max-width:1050px;padding-top:.8rem;padding-bottom:4rem;padding-left:.7rem;padding-right:.7rem}
+.block-container{
+ max-width:1050px;
+ padding-top:calc(env(safe-area-inset-top, 0px) + 3.2rem);
+ padding-bottom:4rem;
+ padding-left:.7rem;
+ padding-right:.7rem
+}
 h1{font-size:1.55rem!important;margin-bottom:.2rem!important}
 div[data-testid="stMetric"]{border:1px solid rgba(128,128,128,.22);border-radius:12px;padding:9px 10px}
 .decision{border:1px solid rgba(128,128,128,.25);border-radius:14px;padding:14px;margin:8px 0 12px}
 @media(max-width:700px){
- .block-container{padding-left:.5rem;padding-right:.5rem;padding-top:.5rem}
+ .block-container{
+   padding-left:.5rem;
+   padding-right:.5rem;
+   padding-top:calc(env(safe-area-inset-top, 0px) + 3.5rem)
+ }
  h1{font-size:1.35rem!important}
  .stTextInput input,.stTextArea textarea{font-size:16px!important}
  button[kind="primary"]{min-height:48px;font-size:1.02rem}
@@ -188,6 +198,7 @@ def history(limit=100):
 
 init_db()
 
+st.markdown("<div style='height:.2rem'></div>", unsafe_allow_html=True)
 st.title("📈 MACD + BOLL 日线决策")
 st.caption("iPhone版 · 上传截图 → 评级 → 五状态 → 关键位 → 升级/降级条件")
 
