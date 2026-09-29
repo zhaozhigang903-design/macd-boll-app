@@ -3762,8 +3762,9 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
                 except Exception:
                     pass
             trades,_=simulate_structural_trades(df,benchmark,code,cost_mult=1.0)
+            trades=filter_research_trades_by_membership(run_id,code,trades)
             ev=summarize_ev(trades)
-            wf=walk_forward_validation(trades)
+            wf=purged_walk_forward_validation(trades,purge_days=30,embargo_days=10)
             save_research_stock_result(run_id,code,name,market,trades,ev,wf)
         except Exception as e:
             errors.append(f"{display_code(code)} {name}: {e}")
