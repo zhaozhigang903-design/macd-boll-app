@@ -2017,169 +2017,401 @@ def historical_edge(df, current_score, current_buy_score, benchmark_df=None, cur
             }
     return out
 
-def historical_edge_score(hist):
-    weights = {20:0.45,40:0.35,60:0.20}
-    scales = {20:0.08,40:0.12,60:0.18}
-    total = 0.0
-    used = 0.0
-    for h,w in weights.items():
-        x = hist.get(h,{})
-        n = int(x.get("样本",0) or 0)
-        win = x.get("胜率")
-        avg = x.get("平均收益")
-        if n <= 0 or pd.isna(win) or pd.isna(avg):
-            continue
-        win_score = clamp(50 + (win-0.5)*100)
-        ret_score = clamp(50 + (avg/scales[h])*35)
-        raw = 0.7*win_score + 0.3*ret_score
-        reliability = min(n/10.0,1.0)
-        adjusted = 50 + (raw-50)*reliability
-        total += w*adjusted
-        used += w
-    return round(total/used,1) if used > 0 else 50.0
-
-def opportunity_score(technical, buy_score, rr, hist, market_score=50, rs_score=50):
-    rr_score = 35 if pd.isna(rr) else clamp(rr/2.5*100)
-    hist_score = historical_edge_score(hist)
-    score = (
-        0.25*technical +
-        0.25*buy_score +
-        0.15*rr_score +
-        0.20*hist_score +
-        0.10*market_score +
-        0.05*rs_score
+def opportunity_score(technical,buy_score,rr,hist=None,market_score=50,rs_score=50):
+    # 机会分只描述“当前结构”，不再混入历史结果，避免重复计分与循环解释。
+    rr_score=30 if pd.isna(rr) else clamp(rr/2.5*100)
+    score=(
+        0.30*technical+
+        0.30*buy_score+
+        0.15*rr_score+
+        0.15*market_score+
+        0.10*rs_score
     )
-    if market_score < 35:
-        score -= 6
-    if buy_score < 55:
-        score = min(score,65)
-    if pd.notna(rr) and rr < 1.0:
-        score = min(score,60)
+    if market_score<35:
+        score-=6
+    if buy_score<55:
+        score=min(score,64)
+    if pd.notna(rr) and rr<1.0:
+        score=min(score,60)
     return round(float(clamp(score)),1)
 
-def opportunity_label(opp, buy_score, rr, market_score, hist):
-    samples = sum(int(hist.get(h,{}).get("样本",0) or 0) for h in (20,40,60))
-    if market_score < 35:
+def opportunity_label(opp,buy_score,rr,market_score,hist=None):
+    if market_score<35:
         return "逆风观察"
-    if buy_score < 60:
+    if buy_score<60:
         return "等待买点"
-    if pd.notna(rr) and rr < 1.2:
+    if pd.notna(rr) and rr<1.2:
         return "盈亏比不足"
-    if opp >= 76 and buy_score >= 68 and pd.notna(rr) and rr >= 1.5 and samples >= 5:
-        return "重点候选"
-    if opp >= 68:
-        return "候选观察"
+    if opp>=72:
+        return "结构较强"
+    if opp>=64:
+        return "结构可观察"
     return "一般观察"
 
-def historical_edge_summary(hist):
-    weights = {20:0.45,40:0.35,60:0.20}
-    win_total = avg_total = 0.0
-    used = 0.0
-    samples = 0
-    for h,w in weights.items():
-        x = hist.get(h,{})
-        n = int(x.get("样本",0) or 0)
-        win = x.get("胜率")
-        avg = x.get("平均收益")
-        if n <= 0 or pd.isna(win) or pd.isna(avg):
-            continue
-        reliability = min(n/8.0,1.0)
-        adj_win = 0.50 + (float(win)-0.50)*reliability
-        adj_avg = float(avg)*reliability
-        win_total += w*adj_win
-        avg_total += w*adj_avg
-        used += w
-        samples += n
-    if used == 0:
-        return {"综合胜率":np.nan,"综合均收益":np.nan,"样本":0}
-    return {
-        "综合胜率":win_total/used,
-        "综合均收益":avg_total/used,
-        "样本":samples
-    }
-
 def automatic_entry_policy(market_score):
-    # 自动门槛不是“越严越好”：目标是过滤明显低质量机会，同时保留可观察候选。
-    # 市场越弱，技术/买点/盈亏比/相对强度要求逐级提高。
-    if market_score >= 70:
+    # 固定的市场自适应结构门槛；不会因为“今天选不到股票”临时放宽。
+    if market_score>=70:
         return {"技术":56,"买点":56,"周线":48,"盈亏比":1.00,"相对强度":43,"机会":63}
-    if market_score >= 50:
+    if market_score>=50:
         return {"技术":58,"买点":58,"周线":50,"盈亏比":1.10,"相对强度":45,"机会":65}
-    if market_score >= 35:
+    if market_score>=35:
         return {"技术":62,"买点":60,"周线":52,"盈亏比":1.25,"相对强度":48,"机会":68}
     return {"技术":66,"买点":63,"周线":55,"盈亏比":1.40,"相对强度":52,"机会":71}
 
-def automatic_opportunity_decision(
-    technical,buy_score,weekly,rr,market_score,rs_score,hist,opp
-):
-    policy = automatic_entry_policy(market_score)
-    summary = historical_edge_summary(hist)
-    if pd.isna(rr):
-        return "不通过","盈亏比不可计算",policy,summary,np.nan
+def liquidity_rule(code,row):
+    amount20=row.get("amount_median20",np.nan)
+    threshold=20_000_000 if market_of_code(code)=="港股" else 50_000_000
+    if pd.isna(amount20):
+        return False,np.nan,threshold
+    return bool(float(amount20)>=threshold),float(amount20),threshold
 
-    # 盈亏比越高，盈亏平衡胜率越低；系统额外要求安全边际。
-    breakeven = 1.0/(1.0+max(float(rr),0.01))
-    margin = 0.04 if market_score >= 50 else (0.05 if market_score >= 35 else 0.07)
-    required_win = max(0.46,breakeven+margin)
+def trade_cost_profile(code):
+    # 单边bps：费用 + 滑点。压力测试会整体乘2。
+    if market_of_code(code)=="港股":
+        return 15.0,8.0
+    return 8.0,5.0
 
-    base_checks = [
-        technical >= policy["技术"],
-        buy_score >= policy["买点"],
-        weekly is not None and pd.notna(weekly) and weekly >= policy["周线"],
-        rr >= policy["盈亏比"],
-        rs_score >= policy["相对强度"],
-        opp >= policy["机会"]
-    ]
-    base_pass = all(base_checks)
+def prepare_strategy_frame(df,benchmark_df):
+    m=build_score_series(df)
+    if m.empty:
+        return m
+    bm=market_score_series(benchmark_df)
+    if not bm.empty:
+        bm2=bm[["trade_date","ret20","ret60","market_score"]].copy()
+        bm2.columns=["trade_date","bm_ret20","bm_ret60","market_score"]
+        m=pd.merge_asof(
+            m.sort_values("trade_date"),bm2.sort_values("trade_date"),
+            on="trade_date",direction="backward"
+        )
+    else:
+        m["market_score"]=50
+        m["bm_ret20"]=np.nan
+        m["bm_ret60"]=np.nan
 
-    n = int(summary.get("样本",0) or 0)
-    hist_win = summary.get("综合胜率")
-    hist_avg = summary.get("综合均收益")
+    rs_scores=[]
+    opp_scores=[]
+    for _,r in m.iterrows():
+        ex20=r.get("ret20")-r.get("bm_ret20") if pd.notna(r.get("ret20")) and pd.notna(r.get("bm_ret20")) else np.nan
+        ex60=r.get("ret60")-r.get("bm_ret60") if pd.notna(r.get("ret60")) and pd.notna(r.get("bm_ret60")) else np.nan
+        rs=50
+        if pd.notna(ex20):
+            rs+=120*ex20
+        if pd.notna(ex60):
+            rs+=60*ex60
+        rs=clamp(rs)
+        rs_scores.append(rs)
+        opp_scores.append(opportunity_score(
+            r.get("score",0),r.get("buy_score",0),r.get("rr",np.nan),
+            None,float(r.get("market_score",50) or 50),rs
+        ))
+    m["rs_score"]=rs_scores
+    m["opportunity_score"]=opp_scores
+    return m
 
-    # 一级：优先机会。结构达标，并且历史证据足够时必须体现正期望。
-    if base_pass:
-        if n >= 5:
-            if (
-                hist_win is not None and pd.notna(hist_win) and hist_win >= required_win and
-                hist_avg is not None and pd.notna(hist_avg) and hist_avg > 0
-            ):
-                return "优先机会","结构与历史正期望同时通过",policy,summary,required_win
-        else:
-            # 历史样本不足时不假装胜率可靠，只在当前结构明显更强时升为优先。
-            if (
-                technical >= policy["技术"]+3 and
-                buy_score >= policy["买点"]+3 and
-                rr >= policy["盈亏比"]+0.20 and
-                rs_score >= policy["相对强度"]+3 and
-                opp >= policy["机会"]+3
-            ):
-                return "优先机会","历史样本少，但当前结构显著高于自动门槛",policy,summary,required_win
-
-    # 二级：候选观察。允许轻微低于基础门槛，避免自动阈值把市场完全筛空。
-    watch_pass = (
-        technical >= policy["技术"]-4 and
-        buy_score >= policy["买点"]-4 and
-        weekly is not None and pd.notna(weekly) and weekly >= policy["周线"]-4 and
-        rr >= max(0.80,policy["盈亏比"]-0.20) and
-        rs_score >= policy["相对强度"]-5 and
-        opp >= policy["机会"]-4
+def structural_entry_ok(row,code,relax=0):
+    market_score=float(row.get("market_score",50) or 50)
+    p=automatic_entry_policy(market_score)
+    liq_ok,_,_=liquidity_rule(code,row)
+    if not liq_ok:
+        return False
+    rr=row.get("rr",np.nan)
+    weekly=row.get("weekly_score",np.nan)
+    return bool(
+        row.get("score",0)>=p["技术"]-relax and
+        row.get("buy_score",0)>=p["买点"]-relax and
+        pd.notna(weekly) and weekly>=p["周线"]-relax and
+        pd.notna(rr) and rr>=max(0.75,p["盈亏比"]-0.05*relax) and
+        row.get("rs_score",50)>=p["相对强度"]-relax and
+        row.get("opportunity_score",0)>=p["机会"]-relax
     )
-    if watch_pass:
-        # 样本充足且历史显著负期望时仍然剔除。
-        if n >= 5 and hist_avg is not None and pd.notna(hist_avg) and hist_avg < -0.03:
-            return "不通过","历史相似信号明显负期望",policy,summary,required_win
-        if base_pass and n >= 5:
-            return "候选观察","当前结构达标，但历史胜率/期望尚未达到优先门槛",policy,summary,required_win
-        return "候选观察","接近自动门槛，保留观察而不直接判定买入",policy,summary,required_win
 
-    reasons = []
-    if technical < policy["技术"]-4: reasons.append("技术")
-    if buy_score < policy["买点"]-4: reasons.append("买点")
-    if weekly is None or pd.isna(weekly) or weekly < policy["周线"]-4: reasons.append("周线")
-    if rr < max(0.80,policy["盈亏比"]-0.20): reasons.append("盈亏比")
-    if rs_score < policy["相对强度"]-5: reasons.append("相对强度")
-    if opp < policy["机会"]-4: reasons.append("机会分")
-    return "不通过"," / ".join(reasons[:3])+"不足",policy,summary,required_win
+def holding_exit_condition(row,peak_score):
+    score=float(row.get("score",0) or 0)
+    weekly=row.get("weekly_score",np.nan)
+    market_score=float(row.get("market_score",50) or 50)
+    return bool(
+        score<45 or
+        (peak_score-score>=15 and score<65) or
+        (pd.notna(weekly) and float(weekly)<45) or
+        (market_score<25 and score<60)
+    )
+
+def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0):
+    m=prepare_strategy_frame(df,benchmark_df)
+    if m.empty or len(m)<180:
+        return pd.DataFrame(),m
+
+    fee_bps,slip_bps=trade_cost_profile(code)
+    friction=(fee_bps+slip_bps)*cost_mult/10000.0
+    trades=[]
+    i=120
+    n=len(m)
+
+    while i<n-1:
+        signal=m.iloc[i]
+        if not structural_entry_ok(signal,code,relax=0):
+            i+=1
+            continue
+
+        entry_i=i+1
+        entry_row=m.iloc[entry_i]
+        raw_entry=float(entry_row["open"]) if pd.notna(entry_row.get("open")) and entry_row.get("open")>0 else float(entry_row["close"])
+        signal_close=float(signal["close"])
+        stop=signal.get("stop_ref",np.nan)
+        atr=signal.get("atr14",np.nan)
+
+        if pd.isna(stop) or raw_entry<=float(stop):
+            i+=1
+            continue
+        if pd.notna(atr) and atr>0 and abs(raw_entry-signal_close)>1.5*float(atr):
+            i+=1
+            continue
+
+        entry_fill=raw_entry*(1+friction)
+        initial_risk=entry_fill-float(stop)
+        if initial_risk<=0:
+            i+=1
+            continue
+
+        peak_score=float(signal.get("score",0) or 0)
+        exit_i=None
+        raw_exit=None
+        exit_reason=None
+        j=entry_i
+
+        while j<n:
+            row=m.iloc[j]
+            peak_score=max(peak_score,float(row.get("score",0) or 0))
+            day_open=float(row["open"]) if pd.notna(row.get("open")) and row.get("open")>0 else float(row["close"])
+            day_low=float(row["low"]) if pd.notna(row.get("low")) else day_open
+
+            if day_low<=float(stop):
+                raw_exit=day_open if day_open<float(stop) else float(stop)
+                exit_i=j
+                exit_reason="风险位"
+                break
+
+            if j<n-1 and holding_exit_condition(row,peak_score):
+                nxt=m.iloc[j+1]
+                raw_exit=float(nxt["open"]) if pd.notna(nxt.get("open")) and nxt.get("open")>0 else float(nxt["close"])
+                exit_i=j+1
+                exit_reason="技术退出"
+                break
+            j+=1
+
+        # 尚未退出的最后一笔不用于历史EV。
+        if exit_i is None:
+            break
+
+        exit_fill=raw_exit*(1-friction)
+        ret=exit_fill/entry_fill-1
+        r_mult=(exit_fill-entry_fill)/initial_risk
+        path=m.iloc[entry_i:exit_i+1]
+        min_low=float(path["low"].min()) if not path.empty else raw_entry
+        mae_r=(min_low-entry_fill)/initial_risk
+
+        trades.append({
+            "signal_date":pd.Timestamp(signal["trade_date"]),
+            "entry_date":pd.Timestamp(entry_row["trade_date"]),
+            "exit_date":pd.Timestamp(m.iloc[exit_i]["trade_date"]),
+            "signal_index":i,"entry_index":entry_i,"exit_index":exit_i,
+            "entry":entry_fill,"exit":exit_fill,"stop":float(stop),
+            "risk":initial_risk,"return":ret,"R":r_mult,"MAE_R":mae_r,
+            "holding_days":int(exit_i-entry_i+1),"exit_reason":exit_reason,
+            "technical":float(signal.get("score",0)),
+            "buy_score":float(signal.get("buy_score",0)),
+            "weekly":float(signal.get("weekly_score",np.nan)),
+            "rr":float(signal.get("rr",np.nan)),
+            "market_score":float(signal.get("market_score",50)),
+            "rs_score":float(signal.get("rs_score",50)),
+            "opportunity":float(signal.get("opportunity_score",0))
+        })
+        i=exit_i+1
+
+    return pd.DataFrame(trades),m
+
+def summarize_ev(trades):
+    empty={
+        "样本":0,"胜率":np.nan,"EV_R":np.nan,"保守EV_R":np.nan,"中位R":np.nan,
+        "平均盈利R":np.nan,"平均亏损R":np.nan,"盈亏因子":np.nan,"平均持有":np.nan,
+        "最大不利R":np.nan,"可信度":"不足"
+    }
+    if trades is None or trades.empty or "R" not in trades.columns:
+        return empty
+
+    s=pd.to_numeric(trades["R"],errors="coerce").dropna()
+    if s.empty:
+        return empty
+
+    n=len(s)
+    wins=s[s>0]
+    losses=s[s<0]
+    avg=float(s.mean())
+    se=float(s.std(ddof=1)/np.sqrt(n)) if n>=2 else np.nan
+    lcb=avg-1.28*se if pd.notna(se) else np.nan
+    pf=float(wins.sum()/abs(losses.sum())) if len(losses) and abs(losses.sum())>1e-12 else (np.inf if len(wins) else np.nan)
+
+    confidence=(
+        "高" if n>=20 and pd.notna(lcb) and lcb>0 else
+        "中高" if n>=12 and pd.notna(lcb) and lcb>0 else
+        "中" if n>=8 else
+        "低" if n>=5 else "不足"
+    )
+
+    return {
+        "样本":int(n),
+        "胜率":float((s>0).mean()),
+        "EV_R":avg,
+        "保守EV_R":float(lcb) if pd.notna(lcb) else np.nan,
+        "中位R":float(s.median()),
+        "平均盈利R":float(wins.mean()) if len(wins) else np.nan,
+        "平均亏损R":float(losses.mean()) if len(losses) else np.nan,
+        "盈亏因子":pf,
+        "平均持有":float(pd.to_numeric(trades["holding_days"],errors="coerce").mean()) if "holding_days" in trades else np.nan,
+        "最大不利R":float(pd.to_numeric(trades["MAE_R"],errors="coerce").min()) if "MAE_R" in trades else np.nan,
+        "可信度":confidence
+    }
+
+def walk_forward_validation(trades):
+    if trades is None or trades.empty or len(trades)<8:
+        return {"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"样本不足"}
+
+    t=trades.sort_values("signal_date").reset_index(drop=True)
+    n=len(t)
+    train_min=max(5,int(n*0.45))
+    remain=n-train_min
+    if remain<3:
+        return {"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"样本不足"}
+
+    folds=min(3,max(1,remain//3))
+    fold_size=max(1,remain//folds)
+    tests=[]
+    positive=0
+    used=0
+
+    for k in range(folds):
+        start=train_min+k*fold_size
+        end=n if k==folds-1 else min(n,start+fold_size)
+        if start>=end:
+            continue
+        train=t.iloc[:start]
+        test=t.iloc[start:end]
+        train_ev=summarize_ev(train)
+        test_ev=summarize_ev(test)
+
+        # 只在过去训练段为正EV时观察下一段；测试段不反向调参。
+        if pd.notna(train_ev["EV_R"]) and train_ev["EV_R"]>0:
+            tests.append(test)
+            used+=1
+            if pd.notna(test_ev["EV_R"]) and test_ev["EV_R"]>0:
+                positive+=1
+
+    if not tests:
+        return {"折数":0,"正EV折数":0,"OOS_EV_R":np.nan,"OOS胜率":np.nan,"稳定性":"历史训练段EV非正"}
+
+    oos=pd.concat(tests,ignore_index=True)
+    oe=summarize_ev(oos)
+    stability=(
+        "稳定" if used>=2 and positive==used and pd.notna(oe["EV_R"]) and oe["EV_R"]>0
+        else ("一般" if positive>=max(1,used//2) else "不稳定")
+    )
+    return {
+        "折数":used,"正EV折数":positive,
+        "OOS_EV_R":oe["EV_R"],"OOS胜率":oe["胜率"],"稳定性":stability
+    }
+
+def realized_trade_ev(df,benchmark_df,code):
+    trades,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0)
+    stress,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=2.0)
+    base=summarize_ev(trades)
+    stress_s=summarize_ev(stress)
+    base["压力EV_R"]=stress_s.get("EV_R",np.nan)
+    base["walk_forward"]=walk_forward_validation(trades)
+    return base,trades
+
+def ev_opportunity_decision(technical,buy_score,weekly,rr,market_score,rs_score,opp,ev,liq_ok):
+    p=automatic_entry_policy(market_score)
+    if not liq_ok:
+        return "不通过","20日中位成交额不足流动性门槛",p
+
+    base_pass=(
+        technical>=p["技术"] and buy_score>=p["买点"] and
+        pd.notna(weekly) and weekly>=p["周线"] and
+        pd.notna(rr) and rr>=p["盈亏比"] and
+        rs_score>=p["相对强度"] and opp>=p["机会"]
+    )
+    watch_pass=(
+        technical>=p["技术"]-4 and buy_score>=p["买点"]-4 and
+        pd.notna(weekly) and weekly>=p["周线"]-4 and
+        pd.notna(rr) and rr>=max(0.8,p["盈亏比"]-0.2) and
+        rs_score>=p["相对强度"]-5 and opp>=p["机会"]-4
+    )
+
+    n=int(ev.get("样本",0) or 0)
+    mean_ev=ev.get("EV_R",np.nan)
+    lcb=ev.get("保守EV_R",np.nan)
+    stress=ev.get("压力EV_R",np.nan)
+    wf=ev.get("walk_forward") or {}
+    oos_ev=wf.get("OOS_EV_R",np.nan)
+
+    if base_pass and n>=8 and pd.notna(mean_ev) and mean_ev>0 and pd.notna(lcb) and lcb>0 and pd.notna(stress) and stress>0:
+        if wf.get("折数",0)>=1 and pd.notna(oos_ev) and oos_ev<=0:
+            return "候选观察","历史EV为正，但时间外验证尚未确认",p
+        return "优先机会","真实交易EV、保守EV和2倍成本压力EV均为正",p
+
+    if watch_pass:
+        if n>=5 and pd.notna(mean_ev) and mean_ev>0 and (pd.isna(stress) or stress>-0.05):
+            return "候选观察","历史真实交易EV为正，但样本/置信下界尚不足",p
+        if n<5 and technical>=p["技术"]+3 and buy_score>=p["买点"]+3 and pd.notna(rr) and rr>=p["盈亏比"]+0.2:
+            return "候选观察","当前结构强，但真实交易EV样本不足",p
+
+    if n>=5 and pd.notna(mean_ev) and mean_ev<=0:
+        return "不通过","历史真实交易EV≤0",p
+    return "不通过","结构或EV证据不足",p
+
+def save_forward_candidates(df):
+    if df is None or df.empty:
+        return
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
+    for _,r in df.iterrows():
+        try:
+            code=normalize_code(str(r.get("代码","")).strip())
+            signal_date=str(r.get("信号日") or pd.Timestamp.today().strftime("%Y-%m-%d"))
+            conn.execute("""
+                INSERT INTO forward_signals(
+                  code,name,market,signal_date,price,tier,technical_score,buy_score,weekly_score,
+                  rr,market_score,rs_score,ev_r,ev_lcb_r,stress_ev_r,ev_samples,risk_price,
+                  status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(code,signal_date) DO UPDATE SET
+                  tier=excluded.tier,technical_score=excluded.technical_score,
+                  buy_score=excluded.buy_score,weekly_score=excluded.weekly_score,
+                  rr=excluded.rr,market_score=excluded.market_score,rs_score=excluded.rs_score,
+                  ev_r=excluded.ev_r,ev_lcb_r=excluded.ev_lcb_r,
+                  stress_ev_r=excluded.stress_ev_r,ev_samples=excluded.ev_samples,
+                  risk_price=excluded.risk_price,updated_at=excluded.updated_at
+            """,(
+                code,str(r.get("名称","")),str(r.get("市场","")),signal_date,
+                float(r.get("收盘")) if pd.notna(r.get("收盘")) else None,
+                str(r.get("机会状态","")),
+                float(r.get("技术分/100")) if pd.notna(r.get("技术分/100")) else None,
+                float(r.get("买点分/100")) if pd.notna(r.get("买点分/100")) else None,
+                float(r.get("周线/100")) if pd.notna(r.get("周线/100")) else None,
+                float(r.get("盈亏比")) if pd.notna(r.get("盈亏比")) else None,
+                float(r.get("_market_score")) if pd.notna(r.get("_market_score")) else None,
+                float(r.get("相对强度/100")) if pd.notna(r.get("相对强度/100")) else None,
+                float(r.get("历史净EV(R)")) if pd.notna(r.get("历史净EV(R)")) else None,
+                float(r.get("保守EV(R)")) if pd.notna(r.get("保守EV(R)")) else None,
+                float(r.get("2倍成本EV(R)")) if pd.notna(r.get("2倍成本EV(R)")) else None,
+                int(r.get("EV样本",0) or 0),
+                float(r.get("风险位")) if pd.notna(r.get("风险位")) else None,
+                "tracking",now,now
+            ))
+        except Exception:
+            continue
+    conn.commit()
+    conn.close()
 
 def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     rows = []
