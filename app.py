@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,9 +15,28 @@ import streamlit as st
 import baostock as bs
 import akshare as ak
 from openai import OpenAI
+from shared_store import (
+    enabled as shared_db_enabled,
+    status as shared_db_status,
+    sync_light as shared_sync_light,
+    sync_research_run as shared_sync_research_run,
+    sync_experiment as shared_sync_experiment,
+)
 
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "analysis_history.db"
+RUNTIME_MODE = os.getenv(
+    "MACD_RUNTIME_MODE",
+    "windows" if os.name=="nt" else ("cloud" if os.getenv("RENDER") else "local")
+).strip().lower()
+
+if os.name=="nt":
+    _default_data_dir = Path(os.getenv("LOCALAPPDATA", str(APP_DIR))) / "MACD-BOLL"
+else:
+    _default_data_dir = APP_DIR
+DATA_DIR = Path(os.getenv("MACD_DATA_DIR", str(_default_data_dir))).expanduser()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = Path(os.getenv("MACD_LOCAL_DB_PATH", str(DATA_DIR / "analysis_history.db"))).expanduser()
+
 RULE_VERSION = "EV1.0-2026-09-30"
 
 st.set_page_config(
@@ -628,6 +648,10 @@ def init_db():
     conn.execute("""
     CREATE INDEX IF NOT EXISTS idx_research_trades_run_date
     ON research_trades(run_id,signal_date)
+    """)
+    conn.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_research_trades_unique
+    ON research_trades(run_id,code,signal_date)
     """)
     rtcols={r[1] for r in conn.execute("PRAGMA table_info(research_trades)").fetchall()}
     for cname,ctype in {
