@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import os
 import re
@@ -48,6 +49,34 @@ div[data-testid="stMetric"]{border:1px solid rgba(128,128,128,.22);border-radius
  .hero{padding:11px;margin:6px 0 9px}
 }
 .compactline{font-size:.92rem;line-height:1.45;margin:.3rem 0}
+.cockpit{border:1px solid rgba(128,128,128,.28);border-radius:18px;padding:14px;margin:4px 0 14px;background:rgba(128,128,128,.035)}
+.cockpit-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.cockpit-kicker{font-size:.76rem;opacity:.62;margin-bottom:3px}
+.cockpit-state{font-size:1.33rem;font-weight:780;line-height:1.18}
+.cockpit-stage{font-size:.92rem;opacity:.76;margin-top:5px}
+.cockpit-score{min-width:68px;text-align:center;border:1px solid rgba(128,128,128,.28);border-radius:14px;padding:8px 7px}
+.cockpit-score b{font-size:1.42rem}
+.cockpit-score span{display:block;font-size:.70rem;opacity:.60}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:11px}
+.kpi{border:1px solid rgba(128,128,128,.20);border-radius:11px;padding:8px;text-align:center}
+.kpi b{display:block;font-size:1.02rem}
+.kpi span{font-size:.70rem;opacity:.62}
+.cockpit-note{margin-top:10px;padding:9px 10px;border-radius:11px;background:rgba(128,128,128,.07);font-size:.90rem;line-height:1.45}
+.level-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
+.level{border:1px solid rgba(128,128,128,.20);border-radius:11px;padding:8px 10px;font-size:.84rem}
+.level span{display:block;font-size:.68rem;opacity:.60;margin-bottom:2px}
+.trigger-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
+.trigger{border-radius:11px;padding:8px 10px;font-size:.82rem;line-height:1.35;border:1px solid rgba(128,128,128,.20)}
+@media(max-width:700px){
+ .kpi-grid{grid-template-columns:repeat(4,1fr);gap:5px}
+ .kpi{padding:6px 3px}
+ .kpi b{font-size:.92rem}
+ .kpi span{font-size:.64rem}
+ .cockpit{padding:11px}
+ .cockpit-state{font-size:1.18rem}
+ .cockpit-score{min-width:60px;padding:7px 5px}
+ .level,.trigger{padding:7px 8px;font-size:.78rem}
+}
 
 </style>
 """, unsafe_allow_html=True)
@@ -403,6 +432,87 @@ def save_result(meta, x, metrics, raw):
     conn.commit()
     conn.close()
 
+def _safe(v):
+    return html.escape(str(v if v not in (None, "") else "—"))
+
+def render_cockpit(report):
+    if not report:
+        st.info("暂无分析结果。上传日线/周线后生成决策，结果会固定显示在这里。")
+        return
+
+    score = report.get("score", 0)
+    weekly = report.get("weekly_score")
+    weekly_txt = "—" if weekly is None else f"{weekly:.0f}"
+    symbol = report.get("symbol") or "当前标的"
+    updated = report.get("updated_at","")
+    essence = report.get("essence") or report.get("state_reason","")
+    delta = report.get("delta")
+    compare_text = ""
+    if delta is not None:
+        arrow = "↑" if delta > 3 else ("↓" if delta < -3 else "→")
+        compare_text = f" · 较上次 {arrow}{delta:+.1f}"
+
+    st.markdown(
+        f"""
+<div class="cockpit">
+  <div class="cockpit-head">
+    <div>
+      <div class="cockpit-kicker">最新决策 · {_safe(symbol)} · {_safe(updated)}</div>
+      <div class="cockpit-state">{signal_color(score)} {_safe(report.get("state"))} · {_safe(report.get("rating"))}</div>
+      <div class="cockpit-stage">{_safe(report.get("stage"))}{_safe(compare_text) if compare_text else ""}</div>
+    </div>
+    <div class="cockpit-score"><b>{score:.0f}</b><span>技术分</span></div>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi"><b>{report.get("trend",0):.0f}</b><span>趋势</span></div>
+    <div class="kpi"><b>{report.get("momentum",0):.0f}</b><span>动能</span></div>
+    <div class="kpi"><b>{weekly_txt}</b><span>周线</span></div>
+    <div class="kpi"><b>{report.get("confirm",0):.0f}</b><span>量能</span></div>
+  </div>
+  <div class="cockpit-note">{_safe(essence)}</div>
+  <div class="level-grid">
+    <div class="level"><span>关键支撑</span><b>{_safe(report.get("support"))}</b></div>
+    <div class="level"><span>关键压力</span><b>{_safe(report.get("resistance"))}</b></div>
+  </div>
+  <div class="trigger-grid">
+    <div class="trigger">⬆️ <b>升级</b><br>{_safe(report.get("upgrade"))}</div>
+    <div class="trigger">⬇️ <b>降级</b><br>{_safe(report.get("downgrade"))}</div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    if report.get("intraday"):
+        st.warning("盘中截图：信号尚未定型，已降低置信度。")
+    if report.get("confidence",0) < 65:
+        st.error("截图清晰度不足，本次只作观察，不据此执行。")
+
+    with st.expander("详细技术证据"):
+        d = report.get("daily",{}) or {}
+        rows = [
+            ["中轨", d.get("boll_mid_direction","未知")],
+            ["价格位置", d.get("price_vs_mid","未知")],
+            ["MACD零轴", d.get("macd_zero_zone","未知")],
+            ["DIF", d.get("dif_direction","未知")],
+            ["交叉", d.get("cross","未知")],
+            ["柱体", d.get("bar_momentum","未知")],
+            ["成交量", d.get("volume_state","未知")],
+            ["量能趋势", d.get("volume_trend","未知")],
+            ["背离", d.get("divergence","未知")],
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["证据","状态"]), use_container_width=True, hide_index=True)
+        if report.get("boll_analysis"):
+            st.caption("BOLL：" + report.get("boll_analysis",""))
+        if report.get("macd_analysis"):
+            st.caption("MACD：" + report.get("macd_analysis",""))
+        if report.get("weekly_analysis"):
+            st.caption("周线：" + report.get("weekly_analysis",""))
+        if report.get("resonance"):
+            st.caption("共振：" + report.get("resonance",""))
+
+    st.caption(f"置信度 {report.get('confidence',0)}% · 技术分不是上涨概率。")
+
 def history(limit=300):
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM analyses ORDER BY id DESC LIMIT ?", conn, params=(limit,))
@@ -452,6 +562,10 @@ with tab3:
     st.warning("评分是“技术证据质量分”，不是上涨概率，也不是收益率预测。真正的收益来自正期望：胜率 × 盈亏比 × 仓位纪律 × 足够样本。")
 
 with tab1:
+    st.subheader("决策驾驶舱")
+    render_cockpit(st.session_state.get("last_report"))
+    st.divider()
+
     st.subheader("① 上传图表")
     st.caption("模板：BOLL(20,2) + MACD(12,26,9) + VOL/MA5/MA10。")
     nonce = st.session_state.get("upload_nonce", 0)
@@ -616,39 +730,7 @@ with tab1:
         }
         save_result(meta, x, metrics, raw)
 
-        st.subheader("④ 结论")
         d = x.get("daily",{}) or {}
-
-        st.markdown(
-            f"<div class='hero'><b>{signal_color(score)} {state} · {rating}</b><br>"
-            f"<span style='font-size:1.18rem;font-weight:700'>{stage}</span><br>"
-            f"<span class='muted'>技术分 {score:.0f} · 置信度 {confidence}% · {state_reason}</span></div>",
-            unsafe_allow_html=True
-        )
-
-        weekly_txt = "—" if weekly_score is None else f"{weekly_score:.0f}"
-        st.markdown(
-            f"<div class='compactline'><b>趋势</b> {trend:.0f}　"
-            f"<b>动能</b> {momentum:.0f}　"
-            f"<b>周线</b> {weekly_txt}　"
-            f"<b>量能</b> {confirm:.0f}</div>",
-            unsafe_allow_html=True
-        )
-
-        if x.get("essence"):
-            st.info(x.get("essence",""))
-
-        if bool(x.get("is_intraday")):
-            st.warning("盘中截图：信号未定型，已降低置信度。")
-        if confidence < 65:
-            st.error("截图清晰度不足，本次只作观察，不据此执行。")
-
-        k1,k2 = st.columns(2)
-        k1.caption("关键支撑")
-        k1.write(x.get("key_support","未知"))
-        k2.caption("关键压力")
-        k2.write(x.get("key_resistance","未知"))
-
         daily_mid = d.get("boll_mid","未知")
         upgrade_parts = []
         downgrade_parts = []
@@ -671,59 +753,56 @@ with tab1:
 
         up_text = "；".join(upgrade_parts[:2]) if upgrade_parts else "维持强势并继续确认"
         down_text = "；".join(downgrade_parts[:2])
-        st.success("升级：" + up_text)
-        st.warning("降级：" + down_text)
 
+        delta = None
         if prev and prev.get("score") is not None:
             try:
                 delta = score - float(prev.get("score"))
-                arrow = "↑" if delta > 3 else ("↓" if delta < -3 else "→")
-                st.caption(f"较上次 {arrow} {delta:+.1f} 分")
             except Exception:
-                pass
+                delta = None
 
-        with st.expander("查看详细技术证据"):
-            rows = [
-                ["中轨", d.get("boll_mid_direction","未知")],
-                ["价格位置", d.get("price_vs_mid","未知")],
-                ["MACD零轴", d.get("macd_zero_zone","未知")],
-                ["DIF", d.get("dif_direction","未知")],
-                ["交叉", d.get("cross","未知")],
-                ["柱体", d.get("bar_momentum","未知")],
-                ["成交量", d.get("volume_state","未知")],
-                ["量能趋势", d.get("volume_trend","未知")],
-                ["背离", d.get("divergence","未知")],
-            ]
-            st.dataframe(
-                pd.DataFrame(rows, columns=["证据","状态"]),
-                use_container_width=True,
-                hide_index=True
-            )
-            if x.get("boll_analysis"):
-                st.caption("BOLL：" + x.get("boll_analysis",""))
-            if x.get("macd_analysis"):
-                st.caption("MACD：" + x.get("macd_analysis",""))
-            if weekly_ready and x.get("weekly_analysis"):
-                st.caption("周线：" + x.get("weekly_analysis",""))
-            if x.get("resonance"):
-                st.caption("共振：" + x.get("resonance",""))
+        st.session_state["last_report"] = {
+            "updated_at": datetime.now().strftime("%m-%d %H:%M"),
+            "symbol": symbol.strip() or "当前标的",
+            "state": state,
+            "rating": rating,
+            "stage": stage,
+            "state_reason": state_reason,
+            "score": score,
+            "trend": trend,
+            "momentum": momentum,
+            "weekly_score": weekly_score,
+            "confirm": confirm,
+            "confidence": confidence,
+            "essence": x.get("essence",""),
+            "support": x.get("key_support","未知"),
+            "resistance": x.get("key_resistance","未知"),
+            "upgrade": up_text,
+            "downgrade": down_text,
+            "delta": delta,
+            "intraday": bool(x.get("is_intraday")),
+            "daily": d,
+            "boll_analysis": x.get("boll_analysis",""),
+            "macd_analysis": x.get("macd_analysis",""),
+            "weekly_analysis": x.get("weekly_analysis","") if weekly_ready else "",
+            "resonance": x.get("resonance",""),
+        }
+        st.rerun()
 
-        with st.expander("仓位风险计算器"):
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                capital = st.number_input("账户资金", min_value=0.0, value=100000.0, step=10000.0)
-                risk_pct = st.number_input("单次最大风险 %", min_value=0.1, max_value=5.0, value=0.8, step=0.1)
-            with rc2:
-                entry = st.number_input("计划入场价", min_value=0.0, value=0.0, step=0.1)
-                stop = st.number_input("技术失效价", min_value=0.0, value=0.0, step=0.1)
-            if entry > 0 and stop > 0 and entry > stop:
-                risk_cash = capital * risk_pct / 100
-                shares = int(risk_cash / (entry-stop))
-                position_value = shares * entry
-                pct = (position_value/capital*100) if capital else 0
-                st.info(f"风险预算 {risk_cash:,.0f}；理论上限约 {shares:,} 股；约占资金 {pct:.1f}%")
-
-        st.caption("技术分不是上涨概率；中长线仍需结合基本面、估值与组合风险。")
+    with st.expander("仓位风险计算器"):
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            capital = st.number_input("账户资金", min_value=0.0, value=100000.0, step=10000.0, key="risk_capital")
+            risk_pct = st.number_input("单次最大风险 %", min_value=0.1, max_value=5.0, value=0.8, step=0.1, key="risk_pct")
+        with rc2:
+            entry = st.number_input("计划入场价", min_value=0.0, value=0.0, step=0.1, key="risk_entry")
+            stop = st.number_input("技术失效价", min_value=0.0, value=0.0, step=0.1, key="risk_stop")
+        if entry > 0 and stop > 0 and entry > stop:
+            risk_cash = capital * risk_pct / 100
+            shares = int(risk_cash / (entry-stop))
+            position_value = shares * entry
+            pct = (position_value/capital*100) if capital else 0
+            st.info(f"风险预算 {risk_cash:,.0f}；理论上限约 {shares:,} 股；约占资金 {pct:.1f}%")
 
 with tab2:
     st.subheader("历史记录与信号演化")
