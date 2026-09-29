@@ -2924,6 +2924,7 @@ def save_forward_candidates(df):
             continue
     conn.commit()
     conn.close()
+    sync_shared_light_safe(force=True)
 
 def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     rows=[]
@@ -3305,6 +3306,7 @@ def upsert_position(code, name, entry_date, entry_price, shares, initial_stop=No
     ))
     conn.commit()
     conn.close()
+    sync_shared_light_safe(force=True)
 
 def close_position(code):
     code = normalize_code(code)
@@ -3315,6 +3317,7 @@ def close_position(code):
     )
     conn.commit()
     conn.close()
+    sync_shared_light_safe(force=True)
 
 def load_positions(active_only=True):
     conn = sqlite3.connect(DB_PATH)
@@ -3681,6 +3684,7 @@ def create_research_run(universe,years):
             ) VALUES(?,?,?,?,?,?)""",mrows
         )
     conn.commit(); conn.close()
+    sync_shared_research_safe(run_id,mode="push")
     return run_id,len(pool)
 
 def load_research_runs(limit=30):
@@ -3863,6 +3867,7 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
                 except Exception:
                     pass
 
+    sync_shared_research_safe(run_id,mode="push")
     return {"processed":processed,"errors":errors,"done":end>=total}
 
 def _cached_close_series(code,start_date,end_date):
@@ -4392,6 +4397,7 @@ def create_strategy_experiment(research_run_id,module):
         )
     )
     conn.commit(); conn.close()
+    sync_shared_experiment_safe(exp_id,research_run_id=research_run_id,mode="push")
     return exp_id
 
 def load_strategy_experiments(research_run_id=None,limit=30):
@@ -4529,6 +4535,9 @@ def run_strategy_experiment_batch(experiment_id,batch_size=5,progress_callback=N
             )
             conn.commit(); conn.close()
 
+    sync_shared_experiment_safe(
+        experiment_id,research_run_id=exp["research_run_id"],mode="push"
+    )
     return {"processed":processed,"errors":errors,"done":end>=total}
 
 def _experiment_segment_metrics(df):
@@ -4662,6 +4671,12 @@ def reveal_strategy_test(experiment_id):
         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),experiment_id)
     )
     conn.commit(); conn.close()
+    exp=get_strategy_experiment(experiment_id)
+    sync_shared_experiment_safe(
+        experiment_id,
+        research_run_id=(exp.get("research_run_id") if exp else None),
+        mode="push"
+    )
 
 def save_strategy_candidate(experiment_id,config_id):
     exp=get_strategy_experiment(experiment_id)
@@ -4684,6 +4699,11 @@ def save_strategy_candidate(experiment_id,config_id):
         )
     )
     conn.commit(); conn.close()
+    sync_shared_experiment_safe(
+        experiment_id,
+        research_run_id=exp.get("research_run_id"),
+        mode="push"
+    )
     return cid
 
 def load_strategy_candidates(limit=30):
@@ -4801,6 +4821,7 @@ def refresh_forward_tests(max_items=25):
                 closed+=1
         except Exception as e:
             errors.append(f"{sig.get('name') or sig.get('code')}: {e}")
+    sync_shared_light_safe(force=True)
     return updated,closed,errors
 
 def forward_test_summary():
