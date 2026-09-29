@@ -117,7 +117,8 @@ AVOID=回避，趋势动能双弱。
  "risk_3":"",
  "decision_model":""
 }
-所有字符串用简洁中文；confidence 为 0-100 的整数。
+所有字符串必须简洁：普通字段尽量不超过80个汉字；essence不超过180字；comparison不超过120字；每个action/risk不超过80字。
+必须确保JSON完整闭合，宁可少写也不要截断。confidence 为 0-100 的整数。
 不要承诺收益，不使用“必涨/必跌/稳赚”。
 """
 
@@ -306,48 +307,63 @@ with tab1:
 
         if mode == "省钱模式":
             image_detail = "low"
-            max_tokens = 1200
+            max_tokens = 2600
         elif mode == "精细模式":
             image_detail = "original"
-            max_tokens = 2600
+            max_tokens = 5000
         else:
             image_detail = "original"
-            max_tokens = 1800
+            max_tokens = 3600
 
         full_prompt = "\n".join(prompt)
         model_used = f"DeepSeek Flash · {mode}"
 
+        def deepseek_call(token_budget, retry_note=""):
+            user_text = full_prompt
+            if retry_note:
+                user_text += "\n\n" + retry_note
+            return client.chat.completions.create(
+                model="deepseek-flash",
+                max_tokens=token_budget,
+                response_format={"type":"json_object"},
+                messages=[
+                    {"role":"system","content":SYSTEM_PROMPT},
+                    {
+                        "role":"user",
+                        "content":[
+                            {"type":"text","text":user_text},
+                            {
+                                "type":"image_url",
+                                "image_url":{
+                                    "url":image_url,
+                                    "detail":image_detail
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+
         with st.spinner("DeepSeek 正在读取截图并分析..."):
             try:
-                resp = client.chat.completions.create(
-                    model="deepseek-flash",
-                    max_tokens=max_tokens,
-                    response_format={"type":"json_object"},
-                    messages=[
-                        {"role":"system","content":SYSTEM_PROMPT},
-                        {
-                            "role":"user",
-                            "content":[
-                                {"type":"text","text":full_prompt},
-                                {
-                                    "type":"image_url",
-                                    "image_url":{
-                                        "url":image_url,
-                                        "detail":image_detail
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                )
+                resp = deepseek_call(max_tokens)
                 raw = resp.choices[0].message.content or ""
+                finish_reason = getattr(resp.choices[0], "finish_reason", None)
+                parsed, body = parse_result(raw)
+
+                # If output was truncated or malformed, retry once with a larger budget.
+                if finish_reason == "length" or not parsed:
+                    resp = deepseek_call(
+                        6000,
+                        "上一次输出可能被截断。请重新输出一个完整、简洁、合法的JSON对象；不要解释，不要Markdown，务必闭合所有引号和大括号。"
+                    )
+                    raw = resp.choices[0].message.content or ""
+                    parsed, body = parse_result(raw)
             except Exception as e:
                 st.error(f"分析失败：{e}")
                 st.stop()
-
-        parsed, body = parse_result(raw)
         if not parsed:
-            st.warning("DeepSeek 返回格式异常，已保留原始结果但本次不保存历史。请再点一次分析。")
+            st.warning("DeepSeek 连续两次返回了不完整JSON。本次不保存历史；请切到“省钱模式”或重新分析。")
             st.markdown(body)
         else:
             save(symbol.strip(), market, parsed, raw)
