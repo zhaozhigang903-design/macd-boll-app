@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import baostock as bs
+import akshare as ak
 from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
@@ -208,13 +209,13 @@ div[data-testid="stExpander"]{
 """, unsafe_allow_html=True)
 
 HOLDINGS_SCREENSHOT_PROMPT = """
-你是一个严谨的A股持仓列表读取器。请从用户上传的券商/行情App持仓截图中提取持仓，不要猜测看不清的数据。
+你是一个严谨的A股/港股持仓列表读取器。请从用户上传的券商/行情App持仓截图中提取持仓，不要猜测看不清的数据。
 
 只输出合法JSON：
 {
   "positions":[
     {
-      "symbol":"股票代码，若可见则6位；否则空字符串",
+      "symbol":"股票代码；A股6位，港股5位；若可见则填写，否则空字符串",
       "name":"股票名称，若可见则填写；否则空字符串",
       "entry_price": null,
       "shares": null,
@@ -232,7 +233,7 @@ HOLDINGS_SCREENSHOT_PROMPT = """
 - 截图通常不显示买入日期和技术失效价，没显示就留空/null，禁止猜测。
 - 若一张图有多只股票，逐只输出。
 - 同一股票若在多张图重复出现，只保留一条，优先采用信息更完整的一条。
-- 不要输出现金、基金、债券、港股、美股；这里只处理沪深A股。
+- 不要输出现金、基金、债券、美股；这里处理沪深A股和港股。
 - 看不清就留空/null，不要编造。
 """
 
@@ -893,14 +894,32 @@ def normalize_code(code):
     s = str(code or "").strip().lower()
     if not s:
         return ""
-    if s.startswith(("sh.","sz.")):
+    if s.startswith(("sh.","sz.","hk.")):
+        if s.startswith("hk."):
+            raw = re.sub(r"\D","",s.split(".",1)[1])
+            return "hk." + raw.zfill(5)[-5:]
         return s
+
+    hk_hint = s.endswith(".hk") or s.startswith("hk") or "港股" in s
     digits = re.sub(r"\D","",s)
-    if len(digits) != 6:
+    if not digits:
         return s
-    if digits.startswith(("5","6","9")):
-        return "sh." + digits
-    return "sz." + digits
+    if hk_hint or len(digits) == 5:
+        return "hk." + digits.zfill(5)[-5:]
+    if len(digits) == 6:
+        if digits.startswith(("5","6","9")):
+            return "sh." + digits
+        return "sz." + digits
+    return s
+
+def market_of_code(code):
+    return "港股" if normalize_code(code).startswith("hk.") else "A股"
+
+def benchmark_label_for_code(code):
+    return "恒生指数" if market_of_code(code) == "港股" else "沪深300"
+
+def data_source_for_code(code):
+    return "AKShare" if market_of_code(code) == "港股" else "BaoStock"
 
 def extract_a_share_code(*values):
     for value in values:
@@ -922,52 +941,118 @@ def bs_login():
         raise RuntimeError("BaoStock登录失败：" + lg.error_msg)
     return lg
 
-def resolve_symbol_input(value):
-    s = str(value or "").strip()
-    if not s:
-        raise ValueError("请输入股票代码或名称。")
+@st.cache_data(ttl=21600, show_spinner=False)
+def hk_universe_snapshot():
+    try:
+        df = ak.stock_hk_main_board_spot_em()
+    except Exception:
+        df = ak.stock_hk_spot_em()
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["code","code_name","latest","amount"])
+    code_col = "代码" if "代码" in df.columns else df.columns[0]
+    name_col = "名称" if "名称" in df.columns else ("中文名称" if "中文名称" in df.columns else None)
+    out = pd.DataFrame()
+    raw_code = df[code_col].astype(str).str.extract(r"(\d+)")[0].fillna("")
+    out["code"] = "hk." + raw_code.str.zfill(5).str[-5:]
+    out["code_name"] = df[name_col].astype(str).str.strip() if name_col else out["code"]
+    out["latest"] = pd.to_numeric(df["最新价"],errors="coerce") if "最新价" in df.columns else np.nan
+    out["amount"] = pd.to_numeric(df["成交额"],errors="coerce") if "成交额" in df.columns else np.nan
+    out = out[out["code"].str.match(r"^hk\.\d{5}$")]
+    return out.drop_duplicates("code").reset_index(drop=True)
 
-    digits = re.sub(r"\D","",s)
-    if len(digits) == 6:
-        code = normalize_code(digits)
-        return code, stock_basic_name(code)
-
-    # 先走BaoStock基础资料精确名称查询
+def _a_name_matches(s):
+    rows = []
     try:
         rs = bs.query_stock_basic(code_name=s)
         df = _rs_to_df(rs)
         if not df.empty and "code" in df.columns:
             name_col = "code_name" if "code_name" in df.columns else ("name" if "name" in df.columns else None)
-            if name_col:
-                exact = df[df[name_col].astype(str).str.strip() == s]
-                if len(exact) == 1:
-                    row = exact.iloc[0]
-                    return str(row["code"]), str(row[name_col])
-            if len(df) == 1:
-                row = df.iloc[0]
-                return str(row["code"]), str(row[name_col]) if name_col else s
+            for _,row in df.iterrows():
+                name = str(row[name_col]).strip() if name_col else ""
+                if name:
+                    rows.append((str(row["code"]),name))
+    except Exception:
+        pass
+    return rows
+
+def resolve_symbol_input(value):
+    s = str(value or "").strip()
+    if not s:
+        raise ValueError("请输入股票代码或名称。")
+
+    # 明确代码：5位按港股，6位按A股；00700.HK / HK00700 也支持。
+    norm = normalize_code(s)
+    if norm.startswith(("sh.","sz.")) and re.fullmatch(r"(sh|sz)\.\d{6}",norm):
+        return norm, stock_basic_name(norm)
+    if norm.startswith("hk.") and re.fullmatch(r"hk\.\d{5}",norm):
+        return norm, stock_basic_name(norm)
+
+    hk_hint = s.upper().endswith(".HK") or s.upper().startswith("HK") or "港股" in s
+    clean_name = re.sub(r"(?i)\.HK$","",s).replace("港股","").strip()
+
+    matches = []
+    if not hk_hint:
+        for code,name in _a_name_matches(clean_name):
+            if name == clean_name:
+                matches.append((code,name,"A股"))
+
+    try:
+        hk = hk_universe_snapshot()
+        exact = hk[hk["code_name"].astype(str).str.strip() == clean_name]
+        for _,row in exact.iterrows():
+            matches.append((str(row["code"]),str(row["code_name"]),"港股"))
+    except Exception:
+        hk = pd.DataFrame()
+
+    if len(matches) == 1:
+        return matches[0][0],matches[0][1]
+    if len(matches) > 1:
+        choices = "、".join([f"{x[1]}({display_code(x[0])},{x[2]})" for x in matches[:6]])
+        raise ValueError(f"名称对应多个市场，请输入代码或加.HK。匹配到：{choices}")
+
+    # 唯一模糊匹配
+    candidates = []
+    if not hk_hint:
+        try:
+            apool = fetch_universe("全A股（沪深）")
+            aa = apool[apool["code_name"].astype(str).str.contains(re.escape(clean_name),na=False)]
+            for _,row in aa.head(8).iterrows():
+                candidates.append((str(row["code"]),str(row["code_name"]),"A股"))
+        except Exception:
+            pass
+    try:
+        if "hk" not in locals() or hk.empty:
+            hk = hk_universe_snapshot()
+        hh = hk[hk["code_name"].astype(str).str.contains(re.escape(clean_name),na=False)]
+        for _,row in hh.head(8).iterrows():
+            candidates.append((str(row["code"]),str(row["code_name"]),"港股"))
     except Exception:
         pass
 
-    # 再从当前全A股股票池匹配名称；唯一包含匹配也可用
-    pool = fetch_universe("全A股（沪深）")
-    if pool.empty:
-        raise ValueError(f"未找到股票：{s}")
-    exact = pool[pool["code_name"].astype(str).str.strip() == s]
-    if len(exact) == 1:
-        row = exact.iloc[0]
-        return str(row["code"]), str(row["code_name"])
-
-    contains = pool[pool["code_name"].astype(str).str.contains(re.escape(s), na=False)]
-    if len(contains) == 1:
-        row = contains.iloc[0]
-        return str(row["code"]), str(row["code_name"])
-    if len(contains) > 1:
-        names = "、".join(contains["code_name"].astype(str).head(5).tolist())
-        raise ValueError(f"名称不唯一，请输入更完整名称或6位代码。匹配到：{names}")
+    # 去重
+    uniq = {}
+    for x in candidates:
+        uniq[x[0]] = x
+    candidates = list(uniq.values())
+    if len(candidates) == 1:
+        return candidates[0][0],candidates[0][1]
+    if len(candidates) > 1:
+        choices = "、".join([f"{x[1]}({display_code(x[0])},{x[2]})" for x in candidates[:6]])
+        raise ValueError(f"名称不唯一，请输入更完整名称或代码。匹配到：{choices}")
     raise ValueError(f"未找到股票：{s}")
 
 def stock_basic_name(code):
+    code = normalize_code(code)
+    if code.startswith("hk."):
+        try:
+            hk = hk_universe_snapshot()
+            hit = hk[hk["code"] == code]
+            if not hit.empty:
+                return str(hit.iloc[0]["code_name"]).strip()
+        except Exception:
+            pass
+        return display_code(code)
+
     rs = bs.query_stock_basic(code=code)
     df = _rs_to_df(rs)
     if df.empty:
@@ -1057,12 +1142,12 @@ def _mark_cache_checked(code):
     conn.commit()
     conn.close()
 
-def _download_daily(code, start, end):
+def _download_a_daily(code,start,end):
     if start > end:
         return pd.DataFrame()
     fields = "date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus,isST"
     rs = bs.query_history_k_data_plus(
-        code, fields, start_date=start, end_date=end, frequency="d", adjustflag="2"
+        code,fields,start_date=start,end_date=end,frequency="d",adjustflag="2"
     )
     df = _rs_to_df(rs)
     if df.empty:
@@ -1070,46 +1155,105 @@ def _download_daily(code, start, end):
     df = df.rename(columns={"date":"trade_date","volume":"vol"})
     for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col],errors="coerce")
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     if "tradestatus" in df.columns:
-        df = df[df["tradestatus"].astype(str) == "1"]
+        df = df[df["tradestatus"].astype(str)=="1"]
     return df.sort_values("trade_date").reset_index(drop=True)
 
-def fetch_stock_daily(code, years=3):
+def _normalize_hk_history(raw,code):
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    rename = {
+        "日期":"trade_date","date":"trade_date",
+        "开盘":"open","open":"open",
+        "最高":"high","high":"high",
+        "最低":"low","low":"low",
+        "收盘":"close","close":"close",
+        "成交量":"vol","volume":"vol",
+        "成交额":"amount","amount":"amount",
+        "涨跌幅":"pctChg","换手率":"turn"
+    }
+    df = df.rename(columns={k:v for k,v in rename.items() if k in df.columns})
+    needed = ["trade_date","open","high","low","close","vol"]
+    if any(x not in df.columns for x in needed):
+        return pd.DataFrame()
+    for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col],errors="coerce")
+    df["trade_date"] = pd.to_datetime(df["trade_date"],errors="coerce")
+    df["code"] = code
+    df["tradestatus"] = "1"
+    df["isST"] = ""
+    df = df.dropna(subset=["trade_date","close"])
+    return df[["trade_date","code","open","high","low","close","vol","amount","pctChg","turn","tradestatus","isST"]].sort_values("trade_date").reset_index(drop=True)
+
+def _download_hk_daily(code,start,end):
+    if start > end:
+        return pd.DataFrame()
+    symbol = display_code(code).zfill(5)
+    s = start.replace("-","")
+    e = end.replace("-","")
+    last_error = None
+    try:
+        raw = ak.stock_hk_hist(
+            symbol=symbol,period="daily",start_date=s,end_date=e,adjust="qfq"
+        )
+        df = _normalize_hk_history(raw,code)
+        if not df.empty:
+            return df
+    except Exception as ex:
+        last_error = ex
+    try:
+        raw = ak.stock_hk_daily(symbol=symbol,adjust="qfq")
+        df = _normalize_hk_history(raw,code)
+        if not df.empty:
+            mask = (
+                (df["trade_date"] >= pd.Timestamp(start)) &
+                (df["trade_date"] <= pd.Timestamp(end))
+            )
+            return df.loc[mask].reset_index(drop=True)
+    except Exception as ex:
+        last_error = ex
+    raise RuntimeError(f"港股历史行情获取失败：{last_error}")
+
+def _download_daily(code,start,end):
+    code = normalize_code(code)
+    return _download_hk_daily(code,start,end) if code.startswith("hk.") else _download_a_daily(code,start,end)
+
+def fetch_stock_daily(code,years=3):
     code = normalize_code(code)
     end = datetime.now().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
-    cache_min, cache_max, last_checked = _cache_bounds(code, "2")
+    start = (pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    cache_flag = "hk_qfq" if code.startswith("hk.") else "2"
+    cache_min,cache_max,last_checked = _cache_bounds(code,cache_flag)
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # 首次读取：下载完整所需区间。
     if not cache_min or not cache_max:
-        fresh = _download_daily(code, start, end)
-        _save_daily_cache(fresh, code, "2")
+        fresh = _download_daily(code,start,end)
+        _save_daily_cache(fresh,code,cache_flag)
         _mark_cache_checked(code)
     else:
-        # 如果请求区间比缓存更早，只补前段。
         if start < cache_min:
-            pre_end = (pd.Timestamp(cache_min) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            older = _download_daily(code, start, pre_end)
-            _save_daily_cache(older, code, "2")
-
-        # 每只股票每天最多检查一次最新行情，避免重复请求BaoStock。
+            pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            older = _download_daily(code,start,pre_end)
+            _save_daily_cache(older,code,cache_flag)
         if last_checked != today:
-            next_start = (pd.Timestamp(cache_max) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            newer = _download_daily(code, next_start, end)
-            _save_daily_cache(newer, code, "2")
+            next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            newer = _download_daily(code,next_start,end)
+            _save_daily_cache(newer,code,cache_flag)
             _mark_cache_checked(code)
 
-    return _read_daily_cache(code, start, end, "2")
+    return _read_daily_cache(code,start,end,cache_flag)
 
-def _download_index_daily(code, start, end):
+def _download_index_daily(code,start,end):
     if start > end:
         return pd.DataFrame()
     fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
     rs = bs.query_history_k_data_plus(
-        code, fields, start_date=start, end_date=end, frequency="d", adjustflag="3"
+        code,fields,start_date=start,end_date=end,frequency="d",adjustflag="3"
     )
     df = _rs_to_df(rs)
     if df.empty:
@@ -1117,32 +1261,110 @@ def _download_index_daily(code, start, end):
     df = df.rename(columns={"date":"trade_date","volume":"vol"})
     for col in ["open","high","low","close","vol","amount","pctChg"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col],errors="coerce")
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     return df.sort_values("trade_date").reset_index(drop=True)
 
-def fetch_benchmark_daily(years=5, code="sh.000300"):
+def fetch_benchmark_daily(years=5,code="sh.000300"):
     end = datetime.now().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
-    cache_min, cache_max, last_checked = _cache_bounds(code, "3")
+    start = (pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    cache_min,cache_max,last_checked = _cache_bounds(code,"3")
     today = datetime.now().strftime("%Y-%m-%d")
-
     if not cache_min or not cache_max:
-        fresh = _download_index_daily(code, start, end)
-        _save_daily_cache(fresh, code, "3")
+        fresh = _download_index_daily(code,start,end)
+        _save_daily_cache(fresh,code,"3")
         _mark_cache_checked(code)
     else:
         if start < cache_min:
-            pre_end = (pd.Timestamp(cache_min) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            older = _download_index_daily(code, start, pre_end)
-            _save_daily_cache(older, code, "3")
+            pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            older = _download_index_daily(code,start,pre_end)
+            _save_daily_cache(older,code,"3")
         if last_checked != today:
-            next_start = (pd.Timestamp(cache_max) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            newer = _download_index_daily(code, next_start, end)
-            _save_daily_cache(newer, code, "3")
+            next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            newer = _download_index_daily(code,next_start,end)
+            _save_daily_cache(newer,code,"3")
             _mark_cache_checked(code)
+    return _read_daily_cache(code,start,end,"3")
 
-    return _read_daily_cache(code, start, end, "3")
+def _download_hk_benchmark(start,end):
+    last_error = None
+    try:
+        raw = ak.stock_hk_index_daily_sina(symbol="HSI")
+        if raw is not None and not raw.empty:
+            df = raw.copy().rename(columns={"date":"trade_date","volume":"vol"})
+            for col in ["open","high","low","close","vol"]:
+                df[col] = pd.to_numeric(df[col],errors="coerce")
+            df["trade_date"] = pd.to_datetime(df["trade_date"],errors="coerce")
+            df["code"] = "hkidx.HSI"
+            df["amount"] = np.nan
+            df["pctChg"] = df["close"].pct_change()*100
+            df["turn"] = np.nan
+            df["tradestatus"] = "1"
+            df["isST"] = ""
+            mask = (
+                (df["trade_date"]>=pd.Timestamp(start)) &
+                (df["trade_date"]<=pd.Timestamp(end))
+            )
+            out = df.loc[mask,["trade_date","code","open","high","low","close","vol","amount","pctChg","turn","tradestatus","isST"]]
+            if not out.empty:
+                return out.reset_index(drop=True)
+    except Exception as ex:
+        last_error = ex
+
+    # 备用：港股通历史接口中带恒生指数收盘值。仅用于市场环境，不参与个股ATR。
+    try:
+        raw = ak.stock_hsgt_hist_em(symbol="港股通沪")
+        if raw is not None and not raw.empty and "恒生指数" in raw.columns:
+            df = pd.DataFrame()
+            df["trade_date"] = pd.to_datetime(raw["日期"],errors="coerce")
+            close = pd.to_numeric(raw["恒生指数"],errors="coerce")
+            df["open"] = close
+            df["high"] = close
+            df["low"] = close
+            df["close"] = close
+            df["vol"] = 0.0
+            df["amount"] = np.nan
+            df["pctChg"] = close.pct_change()*100
+            df["turn"] = np.nan
+            df["tradestatus"] = "1"
+            df["isST"] = ""
+            df["code"] = "hkidx.HSI"
+            mask = (
+                (df["trade_date"]>=pd.Timestamp(start)) &
+                (df["trade_date"]<=pd.Timestamp(end))
+            )
+            out = df.loc[mask,["trade_date","code","open","high","low","close","vol","amount","pctChg","turn","tradestatus","isST"]].dropna(subset=["trade_date","close"])
+            if not out.empty:
+                return out.reset_index(drop=True)
+    except Exception as ex:
+        last_error = ex
+    raise RuntimeError(f"恒生指数历史行情获取失败：{last_error}")
+
+def fetch_hk_benchmark_daily(years=5):
+    key = "hkidx.HSI"
+    flag = "index"
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    cache_min,cache_max,last_checked = _cache_bounds(key,flag)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not cache_min or not cache_max:
+        fresh = _download_hk_benchmark(start,end)
+        _save_daily_cache(fresh,key,flag)
+        _mark_cache_checked(key)
+    else:
+        if start < cache_min:
+            pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            older = _download_hk_benchmark(start,pre_end)
+            _save_daily_cache(older,key,flag)
+        if last_checked != today:
+            next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            newer = _download_hk_benchmark(next_start,end)
+            _save_daily_cache(newer,key,flag)
+            _mark_cache_checked(key)
+    return _read_daily_cache(key,start,end,flag)
+
+def fetch_benchmark_for_code(code,years=5):
+    return fetch_hk_benchmark_daily(years) if market_of_code(code)=="港股" else fetch_benchmark_daily(years)
 
 def market_cache_stats():
     conn = sqlite3.connect(DB_PATH)
@@ -1386,26 +1608,31 @@ def deterministic_report(code, name, df, position_state, fundamentals_ok, benchm
         "boll_analysis":f"中轨{boll_dir}，收盘{drow.get('close',np.nan):.2f}，中轨{mid:.2f}。" if pd.notna(mid) else "",
         "macd_analysis":f"DIF {drow.get('dif',np.nan):.3f}，DEA {drow.get('dea',np.nan):.3f}，{cross}。",
         "weekly_analysis":f"周线技术分 {weekly:.0f}/100。" if weekly is not None else "",
-        "resonance":f"个股相对强度{rs_score}/100；市场环境{mkt_regime}{mkt_score}/100。",
-        "data_source":"BaoStock", "adjustment":"前复权",
+        "resonance":f"个股相对强度{rs_score}/100；{benchmark_label_for_code(code)}环境{mkt_regime}{mkt_score}/100。",
+        "data_source":data_source_for_code(code), "market":market_of_code(code),
+        "benchmark":benchmark_label_for_code(code), "adjustment":"前复权",
         "latest_date":di.iloc[-1]["trade_date"].strftime("%Y-%m-%d"),
         "latest_close":float(di.iloc[-1]["close"]), "_df":di
     }
 
 def latest_trade_date():
     end = pd.Timestamp.today().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    rs = bs.query_trade_dates(start_date=start, end_date=end)
+    start = (pd.Timestamp.today()-pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    rs = bs.query_trade_dates(start_date=start,end_date=end)
     df = _rs_to_df(rs)
     if df.empty:
         return end
     if "is_trading_day" in df.columns:
-        df = df[df["is_trading_day"].astype(str) == "1"]
+        df = df[df["is_trading_day"].astype(str)=="1"]
     if df.empty:
         return end
     return str(df["calendar_date"].max())
 
 def fetch_universe(kind):
+    if kind == "港股主板":
+        hk = hk_universe_snapshot()
+        return hk[["code","code_name"]].drop_duplicates("code").reset_index(drop=True)
+
     if kind == "沪深300":
         rs = bs.query_hs300_stocks()
         df = _rs_to_df(rs)
@@ -1423,7 +1650,7 @@ def fetch_universe(kind):
             code_col = "code" if "code" in df.columns else df.columns[0]
             df = df[df[code_col].astype(str).str.match(r"^(sh\.6|sz\.[03])")]
             if "tradeStatus" in df.columns:
-                df = df[df["tradeStatus"].astype(str) == "1"]
+                df = df[df["tradeStatus"].astype(str)=="1"]
 
     if df.empty:
         return pd.DataFrame(columns=["code","code_name"])
@@ -1891,7 +2118,7 @@ def screen_codes(codes, name_map=None, benchmark_df=None):
             )
 
             rows.append({
-                "代码":display_code(code),"名称":name,"机会状态":"系统通过",
+                "市场":market_of_code(code),"代码":display_code(code),"名称":name,"机会状态":"系统通过",
                 "机会分/100":opp,"技术分/100":technical,"买点分/100":buy_score,
                 "周线/100":weekly,"盈亏比":rr,
                 "历史综合胜率":pct(hist_win),
@@ -2340,14 +2567,18 @@ def refresh_positions():
     if pos.empty:
         return pd.DataFrame()
 
-    benchmark_df = fetch_benchmark_daily(years=3)
-    mkt_score,mkt_regime = market_environment(benchmark_df)
+    benchmarks = {}
     rows = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for _,p in pos.iterrows():
         code = p["code"]
         try:
+            market = market_of_code(code)
+            if market not in benchmarks:
+                benchmarks[market] = fetch_benchmark_for_code(code,years=3)
+            benchmark_df = benchmarks[market]
+            mkt_score,mkt_regime = market_environment(benchmark_df)
             df = fetch_stock_daily(code,years=3)
             if df.empty:
                 continue
@@ -2410,6 +2641,7 @@ def refresh_positions():
             conn.close()
 
             rows.append({
+                "市场":market_of_code(code),
                 "代码":display_code(code),
                 "名称":name,
                 "管理状态":action,
@@ -2418,7 +2650,7 @@ def refresh_positions():
                 "峰值技术分":round(float(peak_score),1),
                 "较峰值":round(current-float(peak_score),1),
                 "周线/100":report.get("weekly_score"),
-                "大盘":f"{mkt_regime} {mkt_score}/100",
+                "大盘":f"{benchmark_label_for_code(code)} {mkt_regime} {mkt_score}/100",
                 "成本":round(float(p["entry_price"]),2),
                 "现价":round(current_price,2),
                 "收益率":pnl_pct,
@@ -2456,23 +2688,23 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 分析", "🔎 选股"
 
 with tab7:
     st.subheader("数据设置")
-    st.success("A股行情使用 BaoStock，无需 Token 或会员。")
-    st.info("统一使用前复权日线数据；周线由同一套日线聚合，分析、选股、回测使用相同数据口径和相同公式。")
-    st.caption("BaoStock采用自身复权算法，因此历史价格可能与同花顺/通达信存在细微差异；App内部始终保持同一数据源和同一复权口径。")
+    st.success("A股：BaoStock；港股：AKShare。两者均无需在本App配置行情Token。")
+    st.info("A股与港股统一使用前复权日线，并由日线聚合周线；分析、选股、持仓和回测使用同一指标逻辑。")
+    st.caption("港股市场环境以恒生指数为基准；A股以沪深300为基准。AKShare接口来自公开数据源，接口稳定性可能受上游网站变化影响。")
 
     st.subheader("本地行情缓存")
     cs = market_cache_stats()
     c1,c2,c3 = st.columns(3)
-    c1.metric("已缓存股票", f"{cs['stocks']:,}")
-    c2.metric("日线记录", f"{cs['rows']:,}")
-    c3.metric("数据库大小", f"{cs['db_mb']:.1f} MB")
-    st.caption(f"缓存区间：{cs['min_date']} ～ {cs['max_date']}。首次下载完整历史，以后同一股票每天只补最新数据。")
-    if st.button("🗑️ 清空行情缓存", use_container_width=True):
+    c1.metric("已缓存标的",f"{cs['stocks']:,}")
+    c2.metric("日线记录",f"{cs['rows']:,}")
+    c3.metric("数据库大小",f"{cs['db_mb']:.1f} MB")
+    st.caption(f"缓存区间：{cs['min_date']} ～ {cs['max_date']}。首次下载历史，以后主要补最新交易日。")
+    if st.button("🗑️ 清空行情缓存",use_container_width=True):
         clear_market_cache()
         st.success("行情缓存已清空。")
         st.rerun()
-    st.warning("当前缓存位于Render本机SQLite：日常重复扫描会明显加速，但服务重新部署/重建实例时可能被清空。")
-    st.caption("持仓截图识别使用已配置的DeepSeek视觉接口；截图只用于提取持仓字段，不参与技术评分。")
+    st.warning("当前缓存位于Render本机SQLite：重新部署/重建实例时可能被清空。持仓数据后续应迁移到持久数据库。")
+    st.caption("持仓截图识别使用已配置的DeepSeek视觉接口；截图只提取持仓字段，不参与技术评分。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
 
 with tab6:
@@ -2497,8 +2729,8 @@ with tab6:
 - **历史胜率**：该股票过去出现相似技术分和买点分时，未来20日获得正收益的比例。
 - **机会分**：技术25% + 买点25% + 盈亏比15% + 历史相似信号20% + 大盘10% + 相对强度5%。
 - **自动门槛**：用户不再设置技术分/买点分/盈亏比。系统根据大盘强弱动态设定基础门槛，再用当前盈亏比计算盈亏平衡胜率，并要求历史相似信号胜率留出安全边际、综合期望收益为正。
-- **大盘环境**：以沪深300的BOLL、MACD、MA60及20/60日收益评估“顺风/中性/偏弱/逆风”。
-- **相对强度**：比较个股与沪深300的20/60日表现，避免只买“随大盘被动上涨”的股票。
+- **市场环境**：A股以沪深300、港股以恒生指数的BOLL、MACD、MA60及20/60日收益评估“顺风/中性/偏弱/逆风”。
+- **相对强度**：A股相对沪深300、港股相对恒生指数比较20/60日表现，避免只买“随市场被动上涨”的股票。
 - **历史统计**：同时看20/40/60日胜率、平均收益和样本量；样本不足时自动降低权重。
 - **回测**：采用下一交易日开盘执行，并且不把“未来才知道的历史胜率”用于过去信号，避免明显未来函数。
 - **持仓管理**：买入后“买点分”的意义下降，核心转为技术分及其变化。≥78强势持有、65–77持有、55–64谨慎持有、45–54减仓候选、<45退出候选；技术分较峰值快速回落、周线转弱或大盘逆风会降档。
@@ -2517,10 +2749,10 @@ with tab1:
     st.divider()
 
     st.subheader("① 自动数据分析")
-    st.caption("输入A股6位代码或股票名称均可。系统自动获取日K并生成周K，周线始终参与中长线评分。")
+    st.caption("支持A股和港股。可输入6位A股代码、5位港股代码或股票名称；系统自动识别市场并使用对应基准。")
     a1,a2 = st.columns([1.2,1])
     with a1:
-        auto_code = st.text_input("股票代码或名称", placeholder="例如 600519 / 贵州茅台 / 宁德时代", key="auto_code")
+        auto_code = st.text_input("股票代码或名称", placeholder="例如 600519 / 贵州茅台 / 00700 / 腾讯控股", key="auto_code")
     with a2:
         auto_horizon = st.selectbox("持有周期", ["2–8周","2–6个月","6–18个月"], index=1, key="auto_horizon")
     a3,a4 = st.columns(2)
@@ -2531,14 +2763,14 @@ with tab1:
 
     if st.button("⚡ 自动生成决策", type="primary", use_container_width=True):
         if not auto_code.strip():
-            st.error("请输入A股代码。")
+            st.error("请输入A股或港股代码/名称。")
         else:
             with st.spinner("正在获取行情并计算日线/周线指标..."):
                 try:
                     bs_login()
                     code,name = resolve_symbol_input(auto_code)
                     df_auto = fetch_stock_daily(code, years=3)
-                    benchmark_df = fetch_benchmark_daily(years=3)
+                    benchmark_df = fetch_benchmark_for_code(code,years=3)
                     report = deterministic_report(code, name, df_auto, auto_position, auto_fund, benchmark_df)
                     prev = previous(report["symbol"])
                     if prev and prev.get("score") is not None:
@@ -2555,13 +2787,13 @@ with tab1:
                         "key_resistance":report["resistance"],
                     }
                     meta = {
-                        "symbol":report["symbol"],"market":"A股","horizon":auto_horizon,
+                        "symbol":report["symbol"],"market":market_of_code(code),"horizon":auto_horizon,
                         "position_state":auto_position,"rating":report["rating"],"state":report["state"],
-                        "stage":report["stage"],"confidence":100,"mode":"BaoStock自动数据",
+                        "stage":report["stage"],"confidence":100,"mode":f"{data_source_for_code(code)}自动数据",
                         "weekly_used":True
                     }
                     metrics = (report["score"],report["trend"],report["momentum"],report["weekly_score"],report["confirm"],False,False)
-                    save_result(meta,xsave,metrics,json.dumps({"source":"BaoStock"},ensure_ascii=False))
+                    save_result(meta,xsave,metrics,json.dumps({"source":data_source_for_code(code),"market":market_of_code(code)},ensure_ascii=False))
                     report.pop("_df",None)
                     st.rerun()
                 except Exception as e:
@@ -2594,7 +2826,7 @@ with tab2:
 
     sopt1,sopt2,sopt3 = st.columns(3)
     with sopt1:
-        universe = st.selectbox("选股范围",["全A股（沪深）","沪深300","中证500","上证50"],index=0)
+        universe = st.selectbox("选股范围",["全A股（沪深）","沪深300","中证500","上证50","港股主板"],index=0)
     with sopt2:
         batch_size = st.selectbox("每批扫描",[100,200,300,500],index=2)
     with sopt3:
@@ -2603,8 +2835,9 @@ with tab2:
     scan_market = st.session_state.get("scan_market")
     if scan_market:
         p = automatic_entry_policy(scan_market[0])
+        bench_label = scan_market[2] if len(scan_market)>2 else "沪深300"
         st.info(
-            f"当前大盘：{scan_market[1]} {scan_market[0]}/100。系统基础门槛自动调整为："
+            f"当前{bench_label}：{scan_market[1]} {scan_market[0]}/100。系统基础门槛自动调整为："
             f"技术≥{p['技术']}、买点≥{p['买点']}、周线≥{p['周线']}、"
             f"盈亏比≥{p['盈亏比']:.2f}、相对强度≥{p['相对强度']}、机会≥{p['机会']}。"
             "历史样本足够时，还必须满足“历史综合胜率 > 盈亏平衡胜率 + 安全边际”且综合期望收益>0。"
@@ -2624,12 +2857,17 @@ with tab2:
         with st.spinner("正在按系统自动门槛扫描交易机会..."):
             try:
                 bs_login()
-                benchmark_df = fetch_benchmark_daily(years=3)
+                if universe == "港股主板":
+                    benchmark_df = fetch_hk_benchmark_daily(years=3)
+                    benchmark_name = "恒生指数"
+                else:
+                    benchmark_df = fetch_benchmark_daily(years=3)
+                    benchmark_name = "沪深300"
                 current_market_score,current_market_regime = market_environment(benchmark_df)
-                st.session_state["scan_market"] = (current_market_score,current_market_regime)
+                st.session_state["scan_market"] = (current_market_score,current_market_regime,benchmark_name)
 
                 pool = fetch_universe(universe)
-                if exclude_st and not pool.empty:
+                if exclude_st and universe != "港股主板" and not pool.empty:
                     pool = pool[~pool["code_name"].str.upper().str.contains(r"(^ST|\*ST)",regex=True,na=False)]
                 pool = pool.reset_index(drop=True)
 
@@ -2671,8 +2909,9 @@ with tab2:
     scan_market = st.session_state.get("scan_market")
     if scan_market:
         p = automatic_entry_policy(scan_market[0])
+        bench_label = scan_market[2] if len(scan_market)>2 else "沪深300"
         st.info(
-            f"大盘环境（沪深300）：{scan_market[1]} · {scan_market[0]}/100；"
+            f"大盘环境（{bench_label}）：{scan_market[1]} · {scan_market[0]}/100；"
             f"本轮自动门槛：技≥{p['技术']} / 买≥{p['买点']} / 周≥{p['周线']} / "
             f"RR≥{p['盈亏比']:.2f} / RS≥{p['相对强度']} / 机会≥{p['机会']}。"
         )
@@ -2877,9 +3116,9 @@ with tab3:
 with tab4:
     st.subheader("自动策略回测")
     st.caption("这里不再让用户手调技术分、买点分、盈亏比或退出分。回测直接验证选股和持仓管理所使用的同一套自动规则，避免“为了回测好看而调参数”。")
-    bt_code = st.text_input("股票代码或名称",placeholder="例如 600519 / 贵州茅台",key="bt_code")
+    bt_code = st.text_input("股票代码或名称",placeholder="例如 600519 / 贵州茅台 / 00700 / 腾讯控股",key="bt_code")
 
-    st.info("固定口径：5年历史、单边交易成本万分之8；入场门槛每天根据当时的大盘环境自动变化；退出使用持仓管理规则。")
+    st.info("固定口径：5年历史；A股单边成本按万分之8，港股按万分之15保守估算；入场门槛根据当时市场环境自动变化，退出使用同一持仓管理规则。")
 
     if st.button("🧪 一键自动回测",type="primary",use_container_width=True):
         if not bt_code.strip():
@@ -2890,8 +3129,9 @@ with tab4:
                     bs_login()
                     code,name = resolve_symbol_input(bt_code)
                     df_bt = fetch_stock_daily(code,years=5)
-                    benchmark_bt = fetch_benchmark_daily(years=5)
-                    curve,m = run_backtest(df_bt,benchmark_bt,fee_bps=8)
+                    benchmark_bt = fetch_benchmark_for_code(code,years=5)
+                    fee_bps = 15 if market_of_code(code)=="港股" else 8
+                    curve,m = run_backtest(df_bt,benchmark_bt,fee_bps=fee_bps)
                     st.session_state["bt_curve"] = curve
                     st.session_state["bt_metrics"] = m
                     st.session_state["bt_symbol"] = f"{name} / {display_code(code)}"
