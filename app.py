@@ -552,6 +552,20 @@ def init_db():
     )
     """)
     conn.execute("""
+    CREATE TABLE IF NOT EXISTS research_members(
+      run_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      code TEXT NOT NULL,
+      name TEXT,
+      market TEXT,
+      PRIMARY KEY(run_id,seq)
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_research_members_run_code
+    ON research_members(run_id,code)
+    """)
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS research_stock_results(
       run_id TEXT NOT NULL,
       code TEXT NOT NULL,
