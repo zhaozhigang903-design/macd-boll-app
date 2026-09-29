@@ -205,6 +205,12 @@ with tab3:
         st.session_state["api_key"] = temp
         st.success("本次会话已启用临时 Key。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
+    st.markdown("""
+**省钱策略**
+- Luna：日常截图初筛，默认使用
+- 智能双模型：只有 A/S 级机会或低置信度才自动调用 Sol
+- Sol：重要标的、复杂冲突图形时手动使用
+""")
 
 with tab1:
     source = st.radio("图片来源", ["相册 / 文件", "相机"], horizontal=True, label_visibility="collapsed")
@@ -224,6 +230,14 @@ with tab1:
         cost = st.text_input("持仓成本", placeholder="例如：435")
         notes = st.text_area("补充说明", placeholder="例如：中线持有；这是盘中截图……", height=90)
 
+    st.markdown("### 💰 模型模式")
+    mode = st.radio(
+        "选择分析模式",
+        ["省钱模式（Luna）", "智能双模型（Luna→必要时Sol）", "深度模式（Sol）"],
+        index=0,
+        help="省钱模式默认只调用 Luna；智能双模型先用 Luna，A/S 级或低置信度时自动用 Sol 复核；深度模式直接用 Sol。"
+    )
+    st.caption("默认推荐“省钱模式”。只有关键机会或疑难图形，再用 Sol 深度复核。")
     compare = st.checkbox("自动和同标的上一次分析比较", value=True)
 
     if st.button("🚀 开始分析", type="primary", use_container_width=True):
@@ -256,21 +270,60 @@ with tab1:
                 f"上次MACD区域：{prev.get('macd_zero_zone','')}",
             ]
 
+        client = OpenAI(api_key=key)
+        image_url = to_data_url(uploaded)
+
+        def call_model(model_name, extra_text=""):
+            full_prompt = "\n".join(prompt)
+            if extra_text:
+                full_prompt += "\n\n" + extra_text
+            resp = client.responses.create(
+                model=model_name,
+                reasoning={"effort":"low"},
+                max_output_tokens=1800 if model_name == "gpt-5.6-luna" else 2400,
+                instructions=SYSTEM_PROMPT,
+                input=[{
+                    "role":"user",
+                    "content":[
+                        {"type":"input_text","text":full_prompt},
+                        {"type":"input_image","image_url":image_url}
+                    ]
+                }]
+            )
+            return resp.output_text
+
+        model_used = ""
         with st.spinner("正在读取截图并分析..."):
             try:
-                client = OpenAI(api_key=key)
-                resp = client.responses.create(
-                    model="gpt-5.6-sol",
-                    instructions=SYSTEM_PROMPT,
-                    input=[{
-                        "role":"user",
-                        "content":[
-                            {"type":"input_text","text":"\n".join(prompt)},
-                            {"type":"input_image","image_url":to_data_url(uploaded)}
-                        ]
-                    }]
-                )
-                raw = resp.output_text
+                if mode == "深度模式（Sol）":
+                    raw = call_model("gpt-5.6-sol")
+                    model_used = "GPT-5.6 Sol"
+                else:
+                    luna_raw = call_model("gpt-5.6-luna")
+                    luna_parsed, _ = parse_result(luna_raw)
+
+                    need_sol = False
+                    reason = ""
+                    if mode == "智能双模型（Luna→必要时Sol）" and luna_parsed:
+                        rating = str(luna_parsed.get("rating","")).upper()
+                        confidence = int(luna_parsed.get("confidence",0) or 0)
+                        if rating.startswith(("S","A")):
+                            need_sol = True
+                            reason = "Luna 初筛达到 A/S 级，触发 Sol 深度复核。"
+                        elif confidence < 70:
+                            need_sol = True
+                            reason = "Luna 置信度低于 70%，触发 Sol 深度复核。"
+
+                    if need_sol:
+                        raw = call_model(
+                            "gpt-5.6-sol",
+                            "以下是 Luna 初筛结果，请独立复核截图，若不同意必须以截图为准修正：\n" + luna_raw[:5000]
+                        )
+                        model_used = "GPT-5.6 Luna → Sol"
+                        st.info("🔎 " + reason)
+                    else:
+                        raw = luna_raw
+                        model_used = "GPT-5.6 Luna"
             except Exception as e:
                 st.error(f"分析失败：{e}")
                 st.stop()
@@ -281,6 +334,7 @@ with tab1:
             st.markdown(body)
         else:
             save(symbol.strip(), market, parsed, raw)
+            st.caption(f"本次使用：{model_used}")
             c1,c2 = st.columns(2)
             c1.metric("评级", parsed.get("rating","未知"))
             c2.metric("状态", parsed.get("state","未知"))
