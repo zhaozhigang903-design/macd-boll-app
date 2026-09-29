@@ -418,8 +418,14 @@ def backtest(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9, use_weekly_f
 
     win = sum(t>0 for t in trades)/len(trades) if trades else float("nan")
     avg_trade = sum(trades)/len(trades) if trades else float("nan")
-    gains = sum(t for t in trades if t>0)
-    losses = abs(sum(t for t in trades if t<0))
+    winners = [t for t in trades if t>0]
+    losers = [t for t in trades if t<0]
+    avg_win = sum(winners)/len(winners) if winners else float("nan")
+    avg_loss = sum(losers)/len(losers) if losers else float("nan")
+    payoff = avg_win/abs(avg_loss) if winners and losers and avg_loss != 0 else float("nan")
+    expectancy = avg_trade
+    gains = sum(winners)
+    losses = abs(sum(losers))
     profit_factor = gains/losses if losses>0 else float("nan")
     mar = cagr/abs(mdd) if (not pd.isna(cagr) and mdd < 0) else float("nan")
 
@@ -445,6 +451,10 @@ def backtest(df, fee_bps=10, boll_n=20, fast=12, slow=26, signal=9, use_weekly_f
         "trades":len(trades),
         "win_rate":win,
         "avg_trade":avg_trade,
+        "avg_win":avg_win,
+        "avg_loss":avg_loss,
+        "payoff":payoff,
+        "expectancy":expectancy,
         "profit_factor":profit_factor,
         "mar":mar,
         "exposure":exposure,
