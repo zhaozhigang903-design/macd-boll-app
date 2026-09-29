@@ -2050,14 +2050,15 @@ def historical_edge_summary(hist):
     }
 
 def automatic_entry_policy(market_score):
-    # 市场越弱，对技术质量、买点、盈亏比和相对强度要求越高。
+    # 自动门槛不是“越严越好”：目标是过滤明显低质量机会，同时保留可观察候选。
+    # 市场越弱，技术/买点/盈亏比/相对强度要求逐级提高。
     if market_score >= 70:
-        return {"技术":58,"买点":58,"周线":50,"盈亏比":1.15,"相对强度":45,"机会":66}
+        return {"技术":56,"买点":56,"周线":48,"盈亏比":1.00,"相对强度":43,"机会":63}
     if market_score >= 50:
-        return {"技术":62,"买点":60,"周线":52,"盈亏比":1.25,"相对强度":48,"机会":68}
+        return {"技术":58,"买点":58,"周线":50,"盈亏比":1.10,"相对强度":45,"机会":65}
     if market_score >= 35:
-        return {"技术":67,"买点":64,"周线":55,"盈亏比":1.45,"相对强度":52,"机会":72}
-    return {"技术":73,"买点":68,"周线":60,"盈亏比":1.80,"相对强度":58,"机会":76}
+        return {"技术":62,"买点":60,"周线":52,"盈亏比":1.25,"相对强度":48,"机会":68}
+    return {"技术":66,"买点":63,"周线":55,"盈亏比":1.40,"相对强度":52,"机会":71}
 
 def automatic_opportunity_decision(
     technical,buy_score,weekly,rr,market_score,rs_score,hist,opp
@@ -2065,65 +2066,108 @@ def automatic_opportunity_decision(
     policy = automatic_entry_policy(market_score)
     summary = historical_edge_summary(hist)
     if pd.isna(rr):
-        return False,"盈亏比不可计算",policy,summary,np.nan
+        return "不通过","盈亏比不可计算",policy,summary,np.nan
 
+    # 盈亏比越高，盈亏平衡胜率越低；系统额外要求安全边际。
     breakeven = 1.0/(1.0+max(float(rr),0.01))
-    margin = 0.06 if market_score >= 50 else (0.08 if market_score >= 35 else 0.10)
-    required_win = max(0.48,breakeven+margin)
+    margin = 0.04 if market_score >= 50 else (0.05 if market_score >= 35 else 0.07)
+    required_win = max(0.46,breakeven+margin)
 
-    checks = [
-        (technical >= policy["技术"], f"技术分<{policy['技术']}"),
-        (buy_score >= policy["买点"], f"买点分<{policy['买点']}"),
-        (weekly is not None and pd.notna(weekly) and weekly >= policy["周线"], f"周线分<{policy['周线']}"),
-        (rr >= policy["盈亏比"], f"盈亏比<{policy['盈亏比']:.2f}"),
-        (rs_score >= policy["相对强度"], f"相对强度<{policy['相对强度']}"),
-        (opp >= policy["机会"], f"机会分<{policy['机会']}")
+    base_checks = [
+        technical >= policy["技术"],
+        buy_score >= policy["买点"],
+        weekly is not None and pd.notna(weekly) and weekly >= policy["周线"],
+        rr >= policy["盈亏比"],
+        rs_score >= policy["相对强度"],
+        opp >= policy["机会"]
     ]
-    for ok,reason in checks:
-        if not ok:
-            return False,reason,policy,summary,required_win
+    base_pass = all(base_checks)
 
     n = int(summary.get("样本",0) or 0)
     hist_win = summary.get("综合胜率")
     hist_avg = summary.get("综合均收益")
 
-    # 样本足够时，让历史胜率/收益直接决定是否通过。
-    if n >= 5:
-        if pd.isna(hist_win) or hist_win < required_win:
-            return False,f"历史综合胜率未超过系统门槛{required_win:.0%}",policy,summary,required_win
-        if pd.isna(hist_avg) or hist_avg <= 0:
-            return False,"历史相似信号综合期望收益≤0",policy,summary,required_win
-    else:
-        # 样本不足时，不假装“胜率可靠”，改用更严格的当前结构门槛。
-        if not (
-            technical >= policy["技术"]+4 and
-            buy_score >= policy["买点"]+4 and
-            rr >= policy["盈亏比"]+0.25 and
-            rs_score >= policy["相对强度"]+4 and
-            opp >= policy["机会"]+3
-        ):
-            return False,"历史样本不足，当前结构未达到加严门槛",policy,summary,required_win
+    # 一级：优先机会。结构达标，并且历史证据足够时必须体现正期望。
+    if base_pass:
+        if n >= 5:
+            if (
+                hist_win is not None and pd.notna(hist_win) and hist_win >= required_win and
+                hist_avg is not None and pd.notna(hist_avg) and hist_avg > 0
+            ):
+                return "优先机会","结构与历史正期望同时通过",policy,summary,required_win
+        else:
+            # 历史样本不足时不假装胜率可靠，只在当前结构明显更强时升为优先。
+            if (
+                technical >= policy["技术"]+3 and
+                buy_score >= policy["买点"]+3 and
+                rr >= policy["盈亏比"]+0.20 and
+                rs_score >= policy["相对强度"]+3 and
+                opp >= policy["机会"]+3
+            ):
+                return "优先机会","历史样本少，但当前结构显著高于自动门槛",policy,summary,required_win
 
-    return True,"系统自动门槛全部通过",policy,summary,required_win
+    # 二级：候选观察。允许轻微低于基础门槛，避免自动阈值把市场完全筛空。
+    watch_pass = (
+        technical >= policy["技术"]-4 and
+        buy_score >= policy["买点"]-4 and
+        weekly is not None and pd.notna(weekly) and weekly >= policy["周线"]-4 and
+        rr >= max(0.80,policy["盈亏比"]-0.20) and
+        rs_score >= policy["相对强度"]-5 and
+        opp >= policy["机会"]-4
+    )
+    if watch_pass:
+        # 样本充足且历史显著负期望时仍然剔除。
+        if n >= 5 and hist_avg is not None and pd.notna(hist_avg) and hist_avg < -0.03:
+            return "不通过","历史相似信号明显负期望",policy,summary,required_win
+        if base_pass and n >= 5:
+            return "候选观察","当前结构达标，但历史胜率/期望尚未达到优先门槛",policy,summary,required_win
+        return "候选观察","接近自动门槛，保留观察而不直接判定买入",policy,summary,required_win
 
-def screen_codes(codes, name_map=None, benchmark_df=None):
+    reasons = []
+    if technical < policy["技术"]-4: reasons.append("技术")
+    if buy_score < policy["买点"]-4: reasons.append("买点")
+    if weekly is None or pd.isna(weekly) or weekly < policy["周线"]-4: reasons.append("周线")
+    if rr < max(0.80,policy["盈亏比"]-0.20): reasons.append("盈亏比")
+    if rs_score < policy["相对强度"]-5: reasons.append("相对强度")
+    if opp < policy["机会"]-4: reasons.append("机会分")
+    return "不通过"," / ".join(reasons[:3])+"不足",policy,summary,required_win
+
+def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     rows = []
     name_map = name_map or {}
     benchmark_df = benchmark_df if benchmark_df is not None else pd.DataFrame()
     mkt_score,mkt_regime = market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
     policy = automatic_entry_policy(mkt_score)
+    stats = {
+        "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
+        "历史阶段":0,"数据异常":0
+    }
+    total_codes = len(codes)
 
-    for code in codes:
+    def tick(i,code,name,stage):
+        if progress_callback is not None:
+            try:
+                progress_callback(i,total_codes,code,name,stage,len(rows),stats.copy())
+            except Exception:
+                pass
+
+    for i,code in enumerate(codes, start=1):
+        name = name_map.get(code) or display_code(code)
         try:
-            # 第一步：当前结构快速初筛
+            tick(i-1,code,name,"读取行情")
             d = fetch_stock_daily(code,years=1)
+            stats["扫描"] += 1
             if len(d) < 150:
+                tick(i,code,name,"历史不足，跳过")
                 continue
+
             name = name_map.get(code) or stock_basic_name(code)
             di = add_indicators(d)
             wi = weekly_from_daily(d)
             if wi.empty:
+                tick(i,code,name,"周线不足，跳过")
                 continue
+
             lr = di.iloc[-1].to_dict()
             lr["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
             wr = wi.iloc[-1].to_dict()
@@ -2131,16 +2175,24 @@ def screen_codes(codes, name_map=None, benchmark_df=None):
             buy_score,rr,stop,target = entry_quality(lr)
 
             if weekly is None or pd.isna(rr):
-                continue
-            if (
-                technical < policy["技术"]-4 or
-                buy_score < policy["买点"]-4 or
-                weekly < policy["周线"]-5 or
-                rr < max(0.9,policy["盈亏比"]-0.25)
-            ):
+                tick(i,code,name,"指标不足，跳过")
                 continue
 
-            # 第二步：补3年历史，计算相对强度与历史相似信号
+            # 只做宽松快速门槛，真正自动判定在3年历史阶段完成。
+            quick_pass = (
+                technical >= policy["技术"]-6 and
+                buy_score >= policy["买点"]-6 and
+                weekly >= policy["周线"]-6 and
+                rr >= max(0.75,policy["盈亏比"]-0.30)
+            )
+            if not quick_pass:
+                tick(i,code,name,"快速初筛未通过")
+                continue
+
+            stats["快速初筛通过"] += 1
+            stats["历史阶段"] += 1
+            tick(i-1,code,name,"计算3年历史与胜率")
+
             hist_df = fetch_stock_daily(code,years=3)
             rs_score,ex20,ex60 = relative_strength(hist_df,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
             hist = historical_edge(
@@ -2149,11 +2201,14 @@ def screen_codes(codes, name_map=None, benchmark_df=None):
                 current_market_score=mkt_score
             )
             opp = opportunity_score(technical,buy_score,rr,hist,mkt_score,rs_score)
-            passed,reason,policy_used,summary,required_win = automatic_opportunity_decision(
+            tier,reason,policy_used,summary,required_win = automatic_opportunity_decision(
                 technical,buy_score,weekly,rr,mkt_score,rs_score,hist,opp
             )
-            if not passed:
+            if tier == "不通过":
+                tick(i,code,name,f"未通过：{reason}")
                 continue
+
+            stats[tier] += 1
 
             def pct(v):
                 return f"{v:.0%}" if v is not None and pd.notna(v) else "—"
@@ -2169,7 +2224,8 @@ def screen_codes(codes, name_map=None, benchmark_df=None):
             )
 
             rows.append({
-                "市场":market_of_code(code),"代码":display_code(code),"名称":name,"机会状态":"系统通过",
+                "市场":market_of_code(code),"代码":display_code(code),"名称":name,
+                "机会状态":tier,"判定说明":reason,
                 "机会分/100":opp,"技术分/100":technical,"买点分/100":buy_score,
                 "周线/100":weekly,"盈亏比":rr,
                 "历史综合胜率":pct(hist_win),
@@ -2191,14 +2247,23 @@ def screen_codes(codes, name_map=None, benchmark_df=None):
                     f"RS≥{policy_used['相对强度']} / 机会≥{policy_used['机会']}"
                 )
             })
+            tick(i,code,name,f"发现{tier}")
         except Exception:
+            stats["数据异常"] += 1
+            tick(i,code,name,"数据异常，跳过")
             continue
 
     if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(
-        ["机会分/100","买点分/100","技术分/100"],ascending=False
-    ).reset_index(drop=True)
+        return pd.DataFrame(),stats
+
+    out = pd.DataFrame(rows)
+    tier_order = {"优先机会":0,"候选观察":1}
+    out["_tier"] = out["机会状态"].map(tier_order).fillna(9)
+    out = out.sort_values(
+        ["_tier","机会分/100","买点分/100","技术分/100"],
+        ascending=[True,False,False,False]
+    ).drop(columns="_tier").reset_index(drop=True)
+    return out,stats
 
 def run_backtest(df,benchmark_df,fee_bps=8):
     m = build_score_series(df)
@@ -2793,7 +2858,7 @@ with tab6:
 - **盈亏比**：以中轨/20日低点作为风险参考，以20日高点/BOLL上轨作为压力参考。
 - **历史胜率**：该股票过去出现相似技术分和买点分时，未来20日获得正收益的比例。
 - **机会分**：技术25% + 买点25% + 盈亏比15% + 历史相似信号20% + 大盘10% + 相对强度5%。
-- **自动门槛**：用户不再设置技术分/买点分/盈亏比。系统根据大盘强弱动态设定基础门槛，再用当前盈亏比计算盈亏平衡胜率，并要求历史相似信号胜率留出安全边际、综合期望收益为正。
+- **自动门槛**：用户不再手调技术分/买点分/盈亏比。系统根据大盘强弱动态设门槛，并分成“优先机会/候选观察”两层；优先机会还要结合盈亏平衡胜率、安全边际和历史期望，避免阈值过严导致全市场零候选。
 - **市场环境**：A股以沪深300、港股以恒生指数的BOLL、MACD、MA60及20/60日收益评估“顺风/中性/偏弱/逆风”。
 - **相对强度**：A股相对沪深300、港股相对恒生指数比较20/60日表现，避免只买“随市场被动上涨”的股票。
 - **历史统计**：同时看20/40/60日胜率、平均收益和样本量；样本不足时自动降低权重。
@@ -2926,7 +2991,7 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("策略门槛由系统自动决定，不需要手动调技术分、机会分或盈亏比。系统会根据大盘环境、当前盈亏比和历史相似信号胜率自动提高或降低门槛。")
+    st.caption("系统自动调节门槛，但不再把“接近优质”的股票全部筛掉：结果分为“优先机会”和“候选观察”。扫描过程中会实时显示当前股票、整体进度和发现数量。")
 
     sopt1,sopt2,sopt3 = st.columns(3)
     with sopt1:
@@ -2986,7 +3051,43 @@ with tab2:
                 batch = pool.iloc[cursor:end_i]
                 codes = batch["code"].tolist()
                 names = dict(zip(batch["code"],batch["code_name"]))
-                batch_result = screen_codes(codes,names,benchmark_df=benchmark_df)
+                live_progress = st.progress(
+                    min(cursor/total,1.0) if total else 0.0,
+                    text=f"准备扫描：已完成 {cursor:,}/{total:,}"
+                )
+                live_status = st.empty()
+                live_diag = st.empty()
+
+                def _scan_progress(done,batch_total,code_now,name_now,stage,found,stats_now):
+                    overall_done = min(cursor+done,total)
+                    overall_pct = (overall_done/total) if total else 0.0
+                    live_progress.progress(
+                        min(overall_pct,1.0),
+                        text=(
+                            f"实时进度 {overall_done:,}/{total:,}（{overall_pct:.1%}） · "
+                            f"本批 {done:,}/{batch_total:,} · 已发现 {found} 只"
+                        )
+                    )
+                    live_status.caption(
+                        f"当前：{display_code(code_now)} {name_now} · {stage}"
+                    )
+                    live_diag.caption(
+                        f"快速初筛 {stats_now.get('快速初筛通过',0)} · "
+                        f"优先机会 {stats_now.get('优先机会',0)} · "
+                        f"候选观察 {stats_now.get('候选观察',0)} · "
+                        f"数据异常 {stats_now.get('数据异常',0)}"
+                    )
+
+                batch_result,batch_stats = screen_codes(
+                    codes,names,benchmark_df=benchmark_df,
+                    progress_callback=_scan_progress
+                )
+                st.session_state["scan_last_stats"] = batch_stats
+                live_progress.progress(
+                    (end_i/total) if total else 1.0,
+                    text=f"本批完成：已扫描 {end_i:,}/{total:,}"
+                )
+                live_status.caption("本批扫描完成。")
 
                 old_result = st.session_state.get("scan_results")
                 if not isinstance(old_result,pd.DataFrame) or old_result.empty:
@@ -3035,9 +3136,11 @@ with tab2:
     if isinstance(result,pd.DataFrame):
         if result.empty:
             if cursor>0:
-                st.warning("已扫描部分暂未出现通过系统自动门槛的交易机会。")
+                st.warning("已扫描部分暂未发现“优先机会/候选观察”。这代表当前结构普遍较弱，不会为了凑数量强行选股。")
         else:
-            st.success(f"当前累计筛出 {len(result)} 只系统通过候选")
+            n_priority = int((result["机会状态"]=="优先机会").sum()) if "机会状态" in result.columns else 0
+            n_watch = int((result["机会状态"]=="候选观察").sum()) if "机会状态" in result.columns else 0
+            st.success(f"当前累计 {len(result)} 只：优先机会 {n_priority} · 候选观察 {n_watch}")
             pick = result.head(100).copy()
             pick.insert(0,"加入持仓",False)
             edited_pick = st.data_editor(
@@ -3080,7 +3183,15 @@ with tab2:
                 result.to_csv(index=False).encode("utf-8-sig"),
                 "screen_candidates.csv","text/csv",use_container_width=True
             )
-            st.caption("系统通过 ≠ 保证盈利。自动门槛的作用是减少低胜率、低盈亏比和逆风环境中的交易。")
+            stats_last = st.session_state.get("scan_last_stats") or {}
+            if stats_last:
+                st.caption(
+                    f"本批诊断：扫描 {stats_last.get('扫描',0)} · "
+                    f"快速初筛通过 {stats_last.get('快速初筛通过',0)} · "
+                    f"进入历史阶段 {stats_last.get('历史阶段',0)} · "
+                    f"数据异常 {stats_last.get('数据异常',0)}"
+                )
+            st.caption("“优先机会”要求结构和历史统计同时更强；“候选观察”表示已接近自动门槛，适合继续跟踪，不等同于买入信号。")
 
 with tab3:
     st.subheader("持仓管理")
