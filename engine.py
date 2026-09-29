@@ -206,6 +206,66 @@ def parse_num(v):
     try: return float(m.group())
     except: return None
 
+def extraction_consensus(first, second):
+    first = first if isinstance(first, dict) else {}
+    second = second if isinstance(second, dict) else {}
+    disagreements = []
+    comparable = 0
+    matches = 0
+
+    categorical = [
+        "mid_direction","price_vs_mid","price_vs_band","dif_direction",
+        "zero_zone","cross","bar_momentum","volume_state","divergence"
+    ]
+    numeric = ["price","boll_mid","boll_upper","boll_lower","dif","dea","macd_bar"]
+
+    merged = {"daily":{}, "weekly":{}, "global":{}}
+    for tf in ("daily","weekly"):
+        a = normalize_tf(first.get(tf), tf=="daily")
+        b = normalize_tf(second.get(tf), tf=="daily")
+        out = a.copy()
+        out["visible"] = bool(a.get("visible") or b.get("visible"))
+        out["image_quality"] = min(int(a.get("image_quality",0) or 0), int(b.get("image_quality",0) or 0))
+
+        for k in categorical:
+            va, vb = a.get(k), b.get(k)
+            if va not in ("unknown","",None) and vb not in ("unknown","",None):
+                comparable += 1
+                if va == vb:
+                    matches += 1
+                    out[k] = va
+                else:
+                    out[k] = "unknown"
+                    disagreements.append(f"{tf}.{k}: {va} vs {vb}")
+            elif va in ("unknown","",None) and vb not in ("unknown","",None):
+                out[k] = vb
+
+        for k in numeric:
+            na, nb = parse_num(a.get(k)), parse_num(b.get(k))
+            if na is not None and nb is not None:
+                comparable += 1
+                denom = max(abs(na),abs(nb),1e-9)
+                if abs(na-nb)/denom <= 0.03:
+                    matches += 1
+                    out[k] = str(round((na+nb)/2, 4))
+                else:
+                    out[k] = ""
+                    disagreements.append(f"{tf}.{k}: {a.get(k)} vs {b.get(k)}")
+            elif (a.get(k) in ("",None)) and b.get(k) not in ("",None):
+                out[k] = b.get(k)
+
+        merged[tf] = out
+
+    ga = first.get("global",{}) if isinstance(first.get("global",{}),dict) else {}
+    gb = second.get("global",{}) if isinstance(second.get("global",{}),dict) else {}
+    merged["global"] = {
+        "is_intraday_unclosed": bool(ga.get("is_intraday_unclosed") or gb.get("is_intraday_unclosed")),
+        "uncertainties": list(dict.fromkeys((ga.get("uncertainties") or []) + (gb.get("uncertainties") or []))),
+        "data_quality_comment": ga.get("data_quality_comment") or gb.get("data_quality_comment") or "",
+    }
+    ratio = matches/comparable if comparable else 0.0
+    return merged, ratio, disagreements
+
 def validate_extraction(daily, weekly):
     issues = []
     penalty = 0
