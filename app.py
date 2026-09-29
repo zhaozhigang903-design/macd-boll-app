@@ -17,6 +17,7 @@ from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "analysis_history.db"
+RULE_VERSION = "EV1.0-2026-09-30"
 
 st.set_page_config(
     page_title="中长线技术决策引擎",
@@ -511,6 +512,7 @@ def init_db():
       stress_ev_r REAL,
       ev_samples INTEGER,
       risk_price REAL,
+      rule_version TEXT,
       status TEXT NOT NULL DEFAULT 'tracking',
       realized_r REAL,
       exit_date TEXT,
@@ -523,6 +525,9 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_forward_signals_status_date
     ON forward_signals(status, signal_date)
     """)
+    fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
+    if "rule_version" not in fcols:
+        conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
     conn.commit()
     conn.close()
 
@@ -1158,6 +1163,31 @@ def stock_basic_name(code):
             return str(df.iloc[0][col]).strip()
     return display_code(code)
 
+def sanitize_daily(df):
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    d=df.copy()
+    if "trade_date" in d.columns:
+        d["trade_date"]=pd.to_datetime(d["trade_date"],errors="coerce")
+    for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+        if col in d.columns:
+            d[col]=pd.to_numeric(d[col],errors="coerce")
+    required=[x for x in ["trade_date","open","high","low","close","vol"] if x in d.columns]
+    if required:
+        d=d.dropna(subset=required)
+    if all(x in d.columns for x in ["open","high","low","close","vol"]):
+        valid=(
+            (d["open"]>0)&(d["close"]>0)&
+            (d["high"]>=d["low"])&
+            (d["high"]>=d[["open","close"]].max(axis=1))&
+            (d["low"]<=d[["open","close"]].min(axis=1))&
+            (d["vol"]>=0)
+        )
+        d=d[valid]
+    if "trade_date" in d.columns:
+        d=d.sort_values("trade_date").drop_duplicates("trade_date",keep="last")
+    return d.reset_index(drop=True)
+
 def _read_daily_cache(code, start_date, end_date, adjustflag="2"):
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
@@ -1175,7 +1205,7 @@ def _read_daily_cache(code, start_date, end_date, adjustflag="2"):
     for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    return sanitize_daily(df)
 
 def _cache_bounds(code, adjustflag="2"):
     conn = sqlite3.connect(DB_PATH)
@@ -2426,8 +2456,8 @@ def save_forward_candidates(df):
                 INSERT INTO forward_signals(
                   code,name,market,signal_date,price,tier,technical_score,buy_score,weekly_score,
                   rr,market_score,rs_score,ev_r,ev_lcb_r,stress_ev_r,ev_samples,risk_price,
-                  status,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  rule_version,status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(code,signal_date) DO UPDATE SET
                   tier=excluded.tier,technical_score=excluded.technical_score,
                   buy_score=excluded.buy_score,weekly_score=excluded.weekly_score,
@@ -2450,7 +2480,7 @@ def save_forward_candidates(df):
                 float(r.get("2倍成本EV(R)")) if pd.notna(r.get("2倍成本EV(R)")) else None,
                 int(r.get("EV样本",0) or 0),
                 float(r.get("风险位")) if pd.notna(r.get("风险位")) else None,
-                "tracking",now,now
+                RULE_VERSION,"tracking",now,now
             ))
         except Exception:
             continue
@@ -3191,6 +3221,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 分析", "🔎 选股"
 
 with tab7:
     st.subheader("数据设置")
+    st.info(f"当前策略规则版本：{RULE_VERSION}。为避免过拟合，EV核心规则进入观察期后不因短期盈亏或候选数量随意调整。")
     st.success("A股：BaoStock；港股：AKShare。两者均无需在本App配置行情Token。")
     st.info("A股与港股统一使用前复权日线，并由日线聚合周线；分析、选股、持仓和回测使用同一指标逻辑。")
     st.caption("港股市场环境以恒生指数为基准；A股以沪深300为基准。AKShare接口来自公开数据源，接口稳定性可能受上游网站变化影响。")
@@ -3256,6 +3287,10 @@ with tab6:
 - **流动性**：A股默认20日中位成交额≥5000万元，港股≥2000万元。
 - **回测**：收盘形成信号，下一交易日执行；止损考虑跳空，不假设一定能按风险位成交。
 - **持仓管理**：买入后“买点分”的意义下降，核心转为技术分及其变化。≥78强势持有、65–77持有、55–64谨慎持有、45–54减仓候选、<45退出候选；技术分较峰值快速回落、周线转弱或大盘逆风会降档。
+
+**规则版本与冻结原则**
+- 当前版本：**EV1.0**。Forward Test会记录规则版本；后续若改变核心入场/退出逻辑，应升级版本而不是覆盖历史结果。
+- 不因为某天“没有候选”就降低阈值，也不因为连续几笔亏损就临时改规则。
 
 **关键原则**
 - 零轴下金叉 = 先看修复，不把反弹当反转。
@@ -3609,7 +3644,7 @@ with tab3:
                 try:
                     parsed = extract_holdings_from_images(hold_imgs)
                     if parsed.empty:
-                        st.warning("没有识别到有效A股持仓。")
+                        st.warning("没有识别到有效A股/港股持仓。")
                     else:
                         st.session_state["holding_import_preview"] = parsed
                 except Exception as e:
@@ -3707,6 +3742,36 @@ with tab3:
                 except Exception: pass
 
         active_now = load_positions(True)
+
+        if not active_now.empty:
+            pv=active_now.copy()
+            pv["shares_n"]=pd.to_numeric(pv["shares"],errors="coerce").fillna(0)
+            pv["last_price_n"]=pd.to_numeric(pv["last_price"],errors="coerce")
+            pv["market_value"]=pv["shares_n"]*pv["last_price_n"]
+            total_mv=float(pv["market_value"].fillna(0).sum())
+            top_weight=(float(pv["market_value"].max())/total_mv) if total_mv>0 else np.nan
+            a_mv=float(pv.loc[~pv["code"].astype(str).str.startswith("hk."),"market_value"].fillna(0).sum())
+            hk_mv=float(pv.loc[pv["code"].astype(str).str.startswith("hk."),"market_value"].fillna(0).sum())
+
+            stop_n=pd.to_numeric(pv["initial_stop"],errors="coerce")
+            known=(stop_n.notna() & pv["last_price_n"].notna() & (pv["last_price_n"]>stop_n) & (pv["shares_n"]>0))
+            risk_cash=((pv.loc[known,"last_price_n"]-stop_n[known])*pv.loc[known,"shares_n"]).sum()
+            unknown_stop=int((~stop_n.notna() & (pv["shares_n"]>0)).sum())
+            defense=int(pv["last_action"].isin(["退出候选","减仓候选"]).sum())
+
+            st.markdown("### 组合风险概览")
+            p1,p2,p3,p4=st.columns(4)
+            p1.metric("持仓市值",f"{total_mv:,.0f}" if total_mv>0 else "—")
+            p2.metric("最大单票占比",f"{top_weight:.0%}" if pd.notna(top_weight) else "—")
+            p3.metric("已知技术风险",f"{float(risk_cash):,.0f}" if risk_cash>0 else "—")
+            p4.metric("减仓/退出候选",str(defense))
+            if total_mv>0:
+                st.caption(
+                    f"A股市值占比 {a_mv/total_mv:.0%} · 港股市值占比 {hk_mv/total_mv:.0%} · "
+                    f"{unknown_stop} 只持仓尚未设置技术失效价。"
+                )
+            st.caption("“已知技术风险”=现价到技术失效价的距离×持股数量，仅用于组合风险预算，不代表最大实际亏损；跳空可能扩大损失。")
+
         codes_available = [
             (r["code"],f"{display_code(r['code'])} · {r['name']}")
             for _,r in active_now.iterrows()
