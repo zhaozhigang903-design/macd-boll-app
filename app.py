@@ -525,7 +525,18 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_forward_signals_status_date
     ON forward_signals(status, signal_date)
     """)
-    fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS ev_cache(
+      code TEXT NOT NULL,
+      stock_date TEXT NOT NULL,
+      benchmark_date TEXT NOT NULL,
+      rule_version TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(code,stock_date,benchmark_date,rule_version)
+    )
+    """)
+    fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()
     if "rule_version" not in fcols:
         conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
     conn.commit()
@@ -1705,7 +1716,7 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
     tier="候选观察"
     ev_reason="持仓管理模式不重复计算历史EV"
     if compute_ev:
-        ev,_=realized_trade_ev(df,benchmark_df,code)
+        ev,_,_=realized_trade_ev(df,benchmark_df,code,use_cache=True)
         tier,ev_reason,_=ev_opportunity_decision(
             score,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
         )
@@ -2289,6 +2300,7 @@ def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0):
             "entry_date":pd.Timestamp(entry_row["trade_date"]),
             "exit_date":pd.Timestamp(m.iloc[exit_i]["trade_date"]),
             "signal_index":i,"entry_index":entry_i,"exit_index":exit_i,
+            "raw_entry":raw_entry,"raw_exit":raw_exit,"path_min_low":min_low,
             "entry":entry_fill,"exit":exit_fill,"stop":float(stop),
             "risk":initial_risk,"return":ret,"R":r_mult,"MAE_R":mae_r,
             "holding_days":int(exit_i-entry_i+1),"exit_reason":exit_reason,
@@ -2394,14 +2406,98 @@ def walk_forward_validation(trades):
         "OOS_EV_R":oe["EV_R"],"OOS胜率":oe["胜率"],"稳定性":stability
     }
 
-def realized_trade_ev(df,benchmark_df,code):
+def reprice_trades_for_cost(trades,code,cost_mult=2.0):
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    fee_bps,slip_bps=trade_cost_profile(code)
+    friction=(fee_bps+slip_bps)*cost_mult/10000.0
+    out=trades.copy()
+    raw_entry=pd.to_numeric(out["raw_entry"],errors="coerce")
+    raw_exit=pd.to_numeric(out["raw_exit"],errors="coerce")
+    stop=pd.to_numeric(out["stop"],errors="coerce")
+    min_low=pd.to_numeric(out["path_min_low"],errors="coerce")
+    entry=raw_entry*(1+friction)
+    exitp=raw_exit*(1-friction)
+    risk=entry-stop
+    valid=risk>0
+    out["entry"]=entry
+    out["exit"]=exitp
+    out["risk"]=risk
+    out["return"]=exitp/entry-1
+    out["R"]=np.where(valid,(exitp-entry)/risk,np.nan)
+    out["MAE_R"]=np.where(valid,(min_low-entry)/risk,np.nan)
+    return out
+
+def _ev_json_safe(v):
+    if isinstance(v,dict):
+        return {k:_ev_json_safe(x) for k,x in v.items()}
+    if isinstance(v,(list,tuple)):
+        return [_ev_json_safe(x) for x in v]
+    if isinstance(v,np.generic):
+        v=v.item()
+    if isinstance(v,float) and (np.isnan(v) or np.isinf(v)):
+        return None
+    return v
+
+def _ev_cache_key(df,benchmark_df,code):
+    if df is None or df.empty:
+        return None
+    stock_date=pd.Timestamp(df["trade_date"].max()).strftime("%Y-%m-%d")
+    benchmark_date=(
+        pd.Timestamp(benchmark_df["trade_date"].max()).strftime("%Y-%m-%d")
+        if benchmark_df is not None and not benchmark_df.empty else "none"
+    )
+    return normalize_code(code),stock_date,benchmark_date,RULE_VERSION
+
+def get_cached_ev(df,benchmark_df,code):
+    key=_ev_cache_key(df,benchmark_df,code)
+    if key is None:
+        return None
+    conn=sqlite3.connect(DB_PATH)
+    row=conn.execute(
+        """SELECT payload FROM ev_cache
+           WHERE code=? AND stock_date=? AND benchmark_date=? AND rule_version=?""",
+        key
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+def save_cached_ev(df,benchmark_df,code,ev):
+    key=_ev_cache_key(df,benchmark_df,code)
+    if key is None:
+        return
+    payload=json.dumps(_ev_json_safe(ev),ensure_ascii=False,separators=(",",":"))
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT OR REPLACE INTO ev_cache(
+           code,stock_date,benchmark_date,rule_version,payload,updated_at
+        ) VALUES(?,?,?,?,?,?)""",
+        (*key,payload,datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+def realized_trade_ev(df,benchmark_df,code,use_cache=True):
+    if use_cache:
+        cached=get_cached_ev(df,benchmark_df,code)
+        if cached is not None:
+            return cached,pd.DataFrame(),True
+
     trades,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0)
-    stress,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=2.0)
+    stress=reprice_trades_for_cost(trades,code,cost_mult=2.0)
     base=summarize_ev(trades)
     stress_s=summarize_ev(stress)
     base["压力EV_R"]=stress_s.get("EV_R",np.nan)
     base["walk_forward"]=walk_forward_validation(trades)
-    return base,trades
+
+    if use_cache:
+        save_cached_ev(df,benchmark_df,code,base)
+    return base,trades,False
 
 def ev_opportunity_decision(technical,buy_score,weekly,rr,market_score,rs_score,opp,ev,liq_ok):
     p=automatic_entry_policy(market_score)
@@ -2495,7 +2591,7 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     policy=automatic_entry_policy(mkt_score)
     stats={
         "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
-        "EV阶段":0,"流动性不足":0,"数据异常":0
+        "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"数据异常":0
     }
     total_codes=len(codes)
 
@@ -2537,13 +2633,16 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             rs_score,ex20,ex60=relative_strength(d,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
             opp=opportunity_score(technical,buy_score,rr,None,mkt_score,rs_score)
 
+            # 与最终“候选观察”的结构门槛对齐，不会漏掉最终可能入选的股票；
+            # 但可避免为结构上注定无法通过的股票计算5年EV。
             quick_pass=(
                 weekly is not None and pd.notna(rr) and
-                technical>=policy["技术"]-6 and
-                buy_score>=policy["买点"]-6 and
-                weekly>=policy["周线"]-6 and
-                rr>=max(0.75,policy["盈亏比"]-0.30) and
-                rs_score>=policy["相对强度"]-8
+                technical>=policy["技术"]-4 and
+                buy_score>=policy["买点"]-4 and
+                weekly>=policy["周线"]-4 and
+                rr>=max(0.80,policy["盈亏比"]-0.20) and
+                rs_score>=policy["相对强度"]-5 and
+                opp>=policy["机会"]-4
             )
             if not quick_pass:
                 tick(i,code,name,"快速结构初筛未通过")
@@ -2554,7 +2653,9 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             tick(i-1,code,name,"计算5年真实交易EV")
 
             hist_df=fetch_stock_daily(code,years=5)
-            ev,trades=realized_trade_ev(hist_df,benchmark_df,code)
+            ev,trades,cache_hit=realized_trade_ev(hist_df,benchmark_df,code,use_cache=True)
+            if cache_hit:
+                stats["EV缓存命中"]+=1
             tier,reason,policy_used=ev_opportunity_decision(
                 technical,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
             )
@@ -2622,7 +2723,7 @@ def run_backtest(df,benchmark_df,code=None,fee_bps=None):
         code="sh.000001"
 
     trades,m=simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0)
-    stress,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=2.0)
+    stress=reprice_trades_for_cost(trades,code,cost_mult=2.0)
     if m.empty:
         return pd.DataFrame(),{}
 
@@ -3418,7 +3519,7 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("系统自动调节门槛，但不再把“接近优质”的股票全部筛掉：结果分为“优先机会”和“候选观察”。扫描过程中会实时显示当前股票、整体进度和发现数量。")
+    st.caption("已启用两阶段快速扫描：先做1年当前结构过滤，只有最终可能进入“优先/观察”的股票才计算5年EV；同一交易日EV自动缓存。提速不放宽正期望标准。")
 
     sopt1,sopt2,sopt3 = st.columns(3)
     with sopt1:
@@ -3500,7 +3601,7 @@ with tab2:
                     )
                     live_diag.caption(
                         f"结构初筛 {stats_now.get('快速初筛通过',0)} · "
-                        f"EV计算 {stats_now.get('EV阶段',0)} · "
+                        f"EV计算 {stats_now.get('EV阶段',0)} · 缓存 {stats_now.get('EV缓存命中',0)} · "
                         f"优先 {stats_now.get('优先机会',0)} · 观察 {stats_now.get('候选观察',0)} · "
                         f"流动性不足 {stats_now.get('流动性不足',0)}"
                     )
@@ -3620,6 +3721,7 @@ with tab2:
                     f"本批诊断：扫描 {stats_last.get('扫描',0)} · "
                     f"快速初筛通过 {stats_last.get('快速初筛通过',0)} · "
                     f"进入EV阶段 {stats_last.get('EV阶段',0)} · "
+                    f"EV缓存命中 {stats_last.get('EV缓存命中',0)} · "
                     f"流动性不足 {stats_last.get('流动性不足',0)} · "
                     f"数据异常 {stats_last.get('数据异常',0)}"
                 )
