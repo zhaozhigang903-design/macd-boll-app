@@ -4,3 +4,4 @@ numpy>=1.26
 baostock>=0.8.9
 openai>=1.55
 akshare>=1.17.0
+psycopg[binary]>=3.2
