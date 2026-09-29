@@ -270,6 +270,8 @@ def extract_holdings_from_images(files):
     for x in obj["positions"]:
         symbol = str(x.get("symbol") or "").strip()
         name = str(x.get("name") or "").strip()
+        if symbol.isdigit() and 1 <= len(symbol) <= 5:
+            symbol = symbol.zfill(5)
         key = symbol or name
         if not key or key in seen:
             continue
@@ -765,7 +767,7 @@ def _safe(v):
 
 def render_cockpit(report):
     if not report:
-        st.info("暂无分析结果。输入A股代码后生成决策，结果会固定显示在这里。")
+        st.info("暂无分析结果。输入A股或港股代码/名称后生成决策，结果会固定显示在这里。")
         return
 
     score = report.get("score", 0)
@@ -2381,11 +2383,12 @@ def editable_positions_frame():
     df = load_positions(True)
     if df.empty:
         return pd.DataFrame(columns=[
-            "删除","代码","名称","买入均价","持股数量","买入日期","技术失效价","备注",
+            "删除","市场","代码","名称","买入均价","持股数量","买入日期","技术失效价","备注",
             "技术分/100","峰值技术分","现价","管理状态"
         ])
     out = pd.DataFrame({
         "删除":False,
+        "市场":df["code"].map(market_of_code),
         "代码":df["code"].map(display_code),
         "名称":df["name"],
         "买入均价":df["entry_price"],
@@ -2833,7 +2836,7 @@ with tab2:
         exclude_st = st.checkbox("排除ST/*ST",value=True)
 
     scan_market = st.session_state.get("scan_market")
-    if scan_market:
+    if scan_market and st.session_state.get("scan_universe") == universe:
         p = automatic_entry_policy(scan_market[0])
         bench_label = scan_market[2] if len(scan_market)>2 else "沪深300"
         st.info(
@@ -3074,7 +3077,7 @@ with tab3:
                 "峰值技术分":st.column_config.NumberColumn("峰值技术分",format="%.1f"),
                 "现价":st.column_config.NumberColumn("现价",format="%.3f")
             },
-            disabled=["代码","名称","技术分/100","峰值技术分","现价","管理状态"],
+            disabled=["市场","代码","名称","技术分/100","峰值技术分","现价","管理状态"],
             key="positions_editor"
         )
         if st.button("💾 保存修改 / 删除勾选",type="primary",use_container_width=True):
