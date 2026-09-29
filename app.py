@@ -3259,6 +3259,296 @@ def recent_analyses(limit=12):
     conn.close()
     return df
 
+def create_research_run(universe,years):
+    pool=fetch_universe(universe).copy()
+    if universe!="港股主板" and not pool.empty:
+        pool=pool[~pool["code_name"].astype(str).str.upper().str.contains(r"(^ST|\\*ST)",regex=True,na=False)]
+    pool=pool.drop_duplicates("code").reset_index(drop=True)
+    if pool.empty:
+        raise RuntimeError("研究股票池为空，无法创建任务。")
+
+    run_id=datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((universe,int(years),RULE_VERSION)))%10000).zfill(4)
+    market="港股" if universe=="港股主板" else "A股"
+    benchmark_name="恒生指数" if market=="港股" else "沪深300"
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO research_runs(
+           run_id,created_at,updated_at,universe,years,status,cursor,total,rule_version,benchmark_name,note
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            run_id,now,now,universe,int(years),"running",0,len(pool),
+            RULE_VERSION,benchmark_name,
+            "股票池在任务创建时冻结；指数/全市场股票池为当前可取得成分，存在幸存者偏差。"
+        )
+    )
+    members=[
+        (run_id,int(i),str(r["code"]),str(r["code_name"]),market)
+        for i,r in pool.iterrows()
+    ]
+    conn.executemany(
+        """INSERT INTO research_members(run_id,seq,code,name,market)
+           VALUES(?,?,?,?,?)""",members
+    )
+    conn.commit(); conn.close()
+    return run_id,len(pool)
+
+def load_research_runs(limit=30):
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        """SELECT * FROM research_runs
+           ORDER BY created_at DESC LIMIT ?""",
+        conn,params=(int(limit),)
+    )
+    conn.close()
+    return df
+
+def get_research_run(run_id):
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query(
+        "SELECT * FROM research_runs WHERE run_id=?",
+        conn,params=(run_id,)
+    )
+    conn.close()
+    return df.iloc[0].to_dict() if not df.empty else None
+
+def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pf=ev.get("盈亏因子")
+    pf_db=float(pf) if pd.notna(pf) and np.isfinite(pf) else None
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM research_trades WHERE run_id=? AND code=?",(run_id,code))
+    conn.execute(
+        """INSERT OR REPLACE INTO research_stock_results(
+           run_id,code,name,market,trade_count,ev_r,conservative_ev_r,win_rate,
+           avg_win_r,avg_loss_r,profit_factor,oos_ev_r,oos_stability,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            run_id,code,name,market,int(ev.get("样本",0) or 0),
+            float(ev["EV_R"]) if pd.notna(ev.get("EV_R")) else None,
+            float(ev["保守EV_R"]) if pd.notna(ev.get("保守EV_R")) else None,
+            float(ev["胜率"]) if pd.notna(ev.get("胜率")) else None,
+            float(ev["平均盈利R"]) if pd.notna(ev.get("平均盈利R")) else None,
+            float(ev["平均亏损R"]) if pd.notna(ev.get("平均亏损R")) else None,
+            pf_db,
+            float(wf["OOS_EV_R"]) if pd.notna(wf.get("OOS_EV_R")) else None,
+            str(wf.get("稳定性","样本不足")),now
+        )
+    )
+    if trades is not None and not trades.empty:
+        rows=[]
+        for _,t in trades.iterrows():
+            rows.append((
+                run_id,code,name,market,
+                pd.Timestamp(t["signal_date"]).strftime("%Y-%m-%d"),
+                pd.Timestamp(t["entry_date"]).strftime("%Y-%m-%d"),
+                pd.Timestamp(t["exit_date"]).strftime("%Y-%m-%d"),
+                float(t["return"]) if pd.notna(t.get("return")) else None,
+                float(t["R"]) if pd.notna(t.get("R")) else None,
+                int(t.get("holding_days",0) or 0),
+                float(t["technical"]) if pd.notna(t.get("technical")) else None,
+                float(t["buy_score"]) if pd.notna(t.get("buy_score")) else None,
+                float(t["weekly"]) if pd.notna(t.get("weekly")) else None,
+                float(t["rr"]) if pd.notna(t.get("rr")) else None,
+                float(t["market_score"]) if pd.notna(t.get("market_score")) else None,
+                float(t["rs_score"]) if pd.notna(t.get("rs_score")) else None,
+                float(t["opportunity"]) if pd.notna(t.get("opportunity")) else None,
+                str(t.get("exit_reason",""))
+            ))
+        conn.executemany(
+            """INSERT INTO research_trades(
+               run_id,code,name,market,signal_date,entry_date,exit_date,return_pct,r_multiple,
+               holding_days,technical_score,buy_score,weekly_score,rr,market_score,rs_score,
+               opportunity_score,exit_reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",rows
+        )
+    conn.commit(); conn.close()
+
+def run_research_batch(run_id,batch_size=20,progress_callback=None):
+    run=get_research_run(run_id)
+    if not run:
+        raise RuntimeError("研究任务不存在。")
+    if run.get("status")=="completed":
+        return {"processed":0,"errors":[],"done":True}
+
+    cursor=int(run.get("cursor",0) or 0)
+    total=int(run.get("total",0) or 0)
+    end=min(cursor+int(batch_size),total)
+    conn=sqlite3.connect(DB_PATH)
+    members=pd.read_sql_query(
+        """SELECT * FROM research_members
+           WHERE run_id=? AND seq>=? AND seq<?
+           ORDER BY seq""",
+        conn,params=(run_id,cursor,end)
+    )
+    conn.close()
+    if members.empty:
+        return {"processed":0,"errors":[],"done":cursor>=total}
+
+    years=int(run.get("years",5) or 5)
+    universe=str(run.get("universe"))
+    benchmark=fetch_hk_benchmark_daily(years=years) if universe=="港股主板" else fetch_benchmark_daily(years=years)
+    errors=[]
+    processed=0
+
+    for _,member in members.iterrows():
+        seq=int(member["seq"])
+        code=str(member["code"])
+        name=str(member["name"])
+        market=str(member["market"])
+        if progress_callback:
+            try:
+                progress_callback(seq-cursor,len(members),seq,total,code,name,"读取历史行情")
+            except Exception:
+                pass
+        try:
+            df=fetch_stock_daily(code,years=years)
+            if len(df)<180:
+                raise RuntimeError("有效历史少于180个交易日")
+            if progress_callback:
+                try:
+                    progress_callback(seq-cursor,len(members),seq,total,code,name,"执行固定规则交易回放")
+                except Exception:
+                    pass
+            trades,_=simulate_structural_trades(df,benchmark,code,cost_mult=1.0)
+            ev=summarize_ev(trades)
+            wf=walk_forward_validation(trades)
+            save_research_stock_result(run_id,code,name,market,trades,ev,wf)
+        except Exception as e:
+            errors.append(f"{display_code(code)} {name}: {e}")
+        finally:
+            processed+=1
+            new_cursor=seq+1
+            status="completed" if new_cursor>=total else "running"
+            conn=sqlite3.connect(DB_PATH)
+            conn.execute(
+                """UPDATE research_runs
+                   SET cursor=?,status=?,updated_at=?
+                   WHERE run_id=?""",
+                (
+                    new_cursor,status,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),run_id
+                )
+            )
+            conn.commit(); conn.close()
+            if progress_callback:
+                try:
+                    progress_callback(seq-cursor+1,len(members),new_cursor,total,code,name,"完成")
+                except Exception:
+                    pass
+
+    return {"processed":processed,"errors":errors,"done":end>=total}
+
+def research_portfolio_approx(trades,max_slots=10):
+    if trades is None or trades.empty:
+        return {"交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,"采用率":np.nan},pd.DataFrame()
+
+    t=trades.copy()
+    for col in ["entry_date","exit_date","signal_date"]:
+        t[col]=pd.to_datetime(t[col],errors="coerce")
+    t["opportunity_score"]=pd.to_numeric(t["opportunity_score"],errors="coerce").fillna(0)
+    t=t.dropna(subset=["entry_date","exit_date","return_pct"]).sort_values(
+        ["entry_date","opportunity_score"],ascending=[True,False]
+    )
+
+    active=[]
+    accepted=[]
+    for _,row in t.iterrows():
+        entry=row["entry_date"]
+        active=[x for x in active if x>entry]
+        if len(active)>=max_slots:
+            continue
+        active.append(row["exit_date"])
+        accepted.append(row.to_dict())
+
+    if not accepted:
+        return {"交易数":0,"累计收益":np.nan,"年化收益":np.nan,"最大回撤":np.nan,"采用率":0.0},pd.DataFrame()
+
+    a=pd.DataFrame(accepted).sort_values("exit_date").reset_index(drop=True)
+    capital=1.0
+    points=[]
+    peak=1.0
+    max_dd=0.0
+    for _,row in a.iterrows():
+        contribution=float(row["return_pct"])/float(max_slots)
+        capital*=max(0.0001,1.0+contribution)
+        peak=max(peak,capital)
+        max_dd=min(max_dd,capital/peak-1.0)
+        points.append({"date":row["exit_date"],"equity":capital})
+    curve=pd.DataFrame(points)
+    start=pd.to_datetime(a["entry_date"]).min()
+    end=pd.to_datetime(a["exit_date"]).max()
+    years=max((end-start).days/365.25,0.01)
+    annual=capital**(1/years)-1 if capital>0 else -1.0
+    return {
+        "交易数":int(len(a)),
+        "累计收益":float(capital-1),
+        "年化收益":float(annual),
+        "最大回撤":float(max_dd),
+        "采用率":float(len(a)/len(t)) if len(t) else np.nan
+    },curve
+
+def research_summary(run_id):
+    run=get_research_run(run_id)
+    if not run:
+        return None,pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+    conn=sqlite3.connect(DB_PATH)
+    stocks=pd.read_sql_query(
+        "SELECT * FROM research_stock_results WHERE run_id=? ORDER BY ev_r DESC",
+        conn,params=(run_id,)
+    )
+    trades=pd.read_sql_query(
+        "SELECT * FROM research_trades WHERE run_id=? ORDER BY signal_date,code",
+        conn,params=(run_id,)
+    )
+    conn.close()
+
+    if trades.empty:
+        summary={
+            "股票数":int(len(stocks)),"交易数":0,"EV_R":np.nan,"保守EV_R":np.nan,
+            "胜率":np.nan,"平均盈利R":np.nan,"平均亏损R":np.nan,"真实盈亏比":np.nan,
+            "盈亏因子":np.nan,"OOS_EV_R":np.nan,"OOS稳定性":"样本不足"
+        }
+        return summary,stocks,trades,pd.DataFrame()
+
+    temp=pd.DataFrame({
+        "R":pd.to_numeric(trades["r_multiple"],errors="coerce"),
+        "holding_days":pd.to_numeric(trades["holding_days"],errors="coerce"),
+        "signal_date":pd.to_datetime(trades["signal_date"],errors="coerce")
+    }).dropna(subset=["R","signal_date"])
+    ev=summarize_ev(temp)
+    wf=walk_forward_validation(temp)
+    avg_win=ev.get("平均盈利R")
+    avg_loss=ev.get("平均亏损R")
+    wl=(
+        float(avg_win/abs(avg_loss))
+        if pd.notna(avg_win) and pd.notna(avg_loss) and abs(avg_loss)>1e-12
+        else np.nan
+    )
+    pf=ev.get("盈亏因子")
+    summary={
+        "股票数":int(len(stocks)),"交易数":int(ev.get("样本",0) or 0),
+        "EV_R":ev.get("EV_R"),"保守EV_R":ev.get("保守EV_R"),
+        "胜率":ev.get("胜率"),"平均盈利R":avg_win,"平均亏损R":avg_loss,
+        "真实盈亏比":wl,"盈亏因子":pf,
+        "OOS_EV_R":wf.get("OOS_EV_R"),"OOS稳定性":wf.get("稳定性")
+    }
+    port,curve=research_portfolio_approx(trades,max_slots=10)
+    summary.update({
+        "组合累计收益":port.get("累计收益"),"组合年化收益":port.get("年化收益"),
+        "组合最大回撤":port.get("最大回撤"),"组合交易数":port.get("交易数"),
+        "组合采用率":port.get("采用率")
+    })
+    return summary,stocks,trades,curve
+
+def delete_research_run(run_id):
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM research_trades WHERE run_id=?",(run_id,))
+    conn.execute("DELETE FROM research_stock_results WHERE run_id=?",(run_id,))
+    conn.execute("DELETE FROM research_members WHERE run_id=?",(run_id,))
+    conn.execute("DELETE FROM research_runs WHERE run_id=?",(run_id,))
+    conn.commit(); conn.close()
+
 def load_forward_signals(limit=300):
     conn=sqlite3.connect(DB_PATH)
     df=pd.read_sql_query(
