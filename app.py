@@ -199,28 +199,29 @@ def history(limit=100):
 init_db()
 
 st.markdown("<div style='height:.2rem'></div>", unsafe_allow_html=True)
-st.title("📈 MACD + BOLL 日线决策")
-st.caption("iPhone版 · 上传截图 → 评级 → 五状态 → 关键位 → 升级/降级条件")
+st.title("📈 MACD + BOLL 日线决策 · DeepSeek版")
+st.caption("DeepSeek国内版 · 上传截图 → 评级 → 五状态 → 关键位 → 升级/降级条件")
 
 tab1, tab2, tab3 = st.tabs(["📷 分析", "📚 历史", "⚙️ 设置"])
 
 with tab3:
     st.subheader("API 设置")
-    env_key = os.getenv("OPENAI_API_KEY", "")
+    env_key = os.getenv("DEEPSEEK_API_KEY", "")
     if env_key:
-        st.success("服务器已配置 OpenAI API Key。")
+        st.success("服务器已配置 DeepSeek API Key。")
     else:
         st.info("服务器尚未配置 Key。可在这里临时输入；仅保存在当前浏览器会话。")
-    temp = st.text_input("OpenAI API Key", type="password", key="temp_key")
+    temp = st.text_input("DeepSeek API Key", type="password", key="temp_key")
     if temp:
         st.session_state["api_key"] = temp
         st.success("本次会话已启用临时 Key。")
     st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
     st.markdown("""
-**省钱策略**
-- Luna：日常截图初筛，默认使用
-- 智能双模型：只有 A/S 级机会或低置信度才自动调用 Sol
-- Sol：重要标的、复杂冲突图形时手动使用
+**DeepSeek 国内版**
+- 省钱：低分辨率读取截图，适合日常复盘
+- 标准：原图读取，适合大多数K线分析
+- 精细：原图 + 更长输出，适合复杂图形
+
 """)
 
 with tab1:
@@ -241,23 +242,23 @@ with tab1:
         cost = st.text_input("持仓成本", placeholder="例如：435")
         notes = st.text_area("补充说明", placeholder="例如：中线持有；这是盘中截图……", height=90)
 
-    st.markdown("### 💰 模型模式")
+    st.markdown("### 💰 DeepSeek 分析模式")
     mode = st.radio(
         "选择分析模式",
-        ["省钱模式（Luna）", "智能双模型（Luna→必要时Sol）", "深度模式（Sol）"],
-        index=0,
-        help="省钱模式默认只调用 Luna；智能双模型先用 Luna，A/S 级或低置信度时自动用 Sol 复核；深度模式直接用 Sol。"
+        ["省钱模式", "标准模式", "精细模式"],
+        index=1,
+        help="三种模式都使用 DeepSeek Flash。省钱模式降低图片细节；标准模式使用原图；精细模式使用原图并允许更长输出。"
     )
-    st.caption("默认推荐“省钱模式”。只有关键机会或疑难图形，再用 Sol 深度复核。")
+    st.caption("默认推荐“标准模式”。日常大量复盘可用省钱模式，复杂图形再切精细模式。")
     compare = st.checkbox("自动和同标的上一次分析比较", value=True)
 
     if st.button("🚀 开始分析", type="primary", use_container_width=True):
-        key = os.getenv("OPENAI_API_KEY","") or st.session_state.get("api_key","")
+        key = os.getenv("DEEPSEEK_API_KEY","") or st.session_state.get("api_key","")
         if not uploaded:
             st.error("请先上传截图。")
             st.stop()
         if not key:
-            st.error("请到“设置”输入 OpenAI API Key。")
+            st.error("请到“设置”输入 DeepSeek API Key。")
             st.stop()
 
         prev = previous(symbol.strip()) if compare else None
@@ -281,60 +282,45 @@ with tab1:
                 f"上次MACD区域：{prev.get('macd_zero_zone','')}",
             ]
 
-        client = OpenAI(api_key=key)
+        client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
         image_url = to_data_url(uploaded)
 
-        def call_model(model_name, extra_text=""):
-            full_prompt = "\n".join(prompt)
-            if extra_text:
-                full_prompt += "\n\n" + extra_text
-            resp = client.responses.create(
-                model=model_name,
-                reasoning={"effort":"low"},
-                max_output_tokens=1800 if model_name == "gpt-5.6-luna" else 2400,
-                instructions=SYSTEM_PROMPT,
-                input=[{
-                    "role":"user",
-                    "content":[
-                        {"type":"input_text","text":full_prompt},
-                        {"type":"input_image","image_url":image_url}
-                    ]
-                }]
-            )
-            return resp.output_text
+        if mode == "省钱模式":
+            image_detail = "low"
+            max_tokens = 1200
+        elif mode == "精细模式":
+            image_detail = "original"
+            max_tokens = 2600
+        else:
+            image_detail = "original"
+            max_tokens = 1800
 
-        model_used = ""
-        with st.spinner("正在读取截图并分析..."):
+        full_prompt = "\n".join(prompt)
+        model_used = f"DeepSeek Flash · {mode}"
+
+        with st.spinner("DeepSeek 正在读取截图并分析..."):
             try:
-                if mode == "深度模式（Sol）":
-                    raw = call_model("gpt-5.6-sol")
-                    model_used = "GPT-5.6 Sol"
-                else:
-                    luna_raw = call_model("gpt-5.6-luna")
-                    luna_parsed, _ = parse_result(luna_raw)
-
-                    need_sol = False
-                    reason = ""
-                    if mode == "智能双模型（Luna→必要时Sol）" and luna_parsed:
-                        rating = str(luna_parsed.get("rating","")).upper()
-                        confidence = int(luna_parsed.get("confidence",0) or 0)
-                        if rating.startswith(("S","A")):
-                            need_sol = True
-                            reason = "Luna 初筛达到 A/S 级，触发 Sol 深度复核。"
-                        elif confidence < 70:
-                            need_sol = True
-                            reason = "Luna 置信度低于 70%，触发 Sol 深度复核。"
-
-                    if need_sol:
-                        raw = call_model(
-                            "gpt-5.6-sol",
-                            "以下是 Luna 初筛结果，请独立复核截图，若不同意必须以截图为准修正：\n" + luna_raw[:5000]
-                        )
-                        model_used = "GPT-5.6 Luna → Sol"
-                        st.info("🔎 " + reason)
-                    else:
-                        raw = luna_raw
-                        model_used = "GPT-5.6 Luna"
+                resp = client.chat.completions.create(
+                    model="deepseek-flash",
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role":"system","content":SYSTEM_PROMPT},
+                        {
+                            "role":"user",
+                            "content":[
+                                {"type":"text","text":full_prompt},
+                                {
+                                    "type":"image_url",
+                                    "image_url":{
+                                        "url":image_url,
+                                        "detail":image_detail
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                )
+                raw = resp.choices[0].message.content or ""
             except Exception as e:
                 st.error(f"分析失败：{e}")
                 st.stop()
