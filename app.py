@@ -2414,16 +2414,16 @@ def save_forward_candidates(df):
     conn.close()
 
 def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
-    rows = []
-    name_map = name_map or {}
-    benchmark_df = benchmark_df if benchmark_df is not None else pd.DataFrame()
-    mkt_score,mkt_regime = market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
-    policy = automatic_entry_policy(mkt_score)
-    stats = {
+    rows=[]
+    name_map=name_map or {}
+    benchmark_df=benchmark_df if benchmark_df is not None else pd.DataFrame()
+    mkt_score,mkt_regime=market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
+    policy=automatic_entry_policy(mkt_score)
+    stats={
         "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
-        "历史阶段":0,"数据异常":0
+        "EV阶段":0,"流动性不足":0,"数据异常":0
     }
-    total_codes = len(codes)
+    total_codes=len(codes)
 
     def tick(i,code,name,stage):
         if progress_callback is not None:
@@ -2432,96 +2432,90 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             except Exception:
                 pass
 
-    for i,code in enumerate(codes, start=1):
-        name = name_map.get(code) or display_code(code)
+    for i,code in enumerate(codes,start=1):
+        name=name_map.get(code) or display_code(code)
         try:
             tick(i-1,code,name,"读取行情")
-            d = fetch_stock_daily(code,years=1)
-            stats["扫描"] += 1
-            if len(d) < 150:
+            d=fetch_stock_daily(code,years=1)
+            stats["扫描"]+=1
+            if len(d)<150:
                 tick(i,code,name,"历史不足，跳过")
                 continue
 
-            name = name_map.get(code) or stock_basic_name(code)
-            di = add_indicators(d)
-            wi = weekly_from_daily(d)
+            name=name_map.get(code) or stock_basic_name(code)
+            di=add_indicators(d)
+            wi=weekly_from_daily(d,completed_only=True)
             if wi.empty:
-                tick(i,code,name,"周线不足，跳过")
+                tick(i,code,name,"确认周线不足，跳过")
                 continue
 
-            lr = di.iloc[-1].to_dict()
-            lr["macd_prev"] = di.iloc[-2]["macd"] if len(di)>1 else np.nan
-            wr = wi.iloc[-1].to_dict()
-            technical,trend,momentum,weekly,confirm = numeric_score(lr,wr)
-            buy_score,rr,stop,target = entry_quality(lr)
-
-            if weekly is None or pd.isna(rr):
-                tick(i,code,name,"指标不足，跳过")
+            lr=di.iloc[-1].to_dict()
+            lr["macd_prev"]=di.iloc[-2]["macd"] if len(di)>1 else np.nan
+            wr=wi.iloc[-1].to_dict()
+            technical,trend,momentum,weekly,confirm=numeric_score(lr,wr)
+            buy_score,rr,stop,target=entry_quality(lr)
+            liq_ok,amount20,liq_threshold=liquidity_rule(code,lr)
+            if not liq_ok:
+                stats["流动性不足"]+=1
+                tick(i,code,name,"流动性不足")
                 continue
 
-            # 只做宽松快速门槛，真正自动判定在3年历史阶段完成。
-            quick_pass = (
-                technical >= policy["技术"]-6 and
-                buy_score >= policy["买点"]-6 and
-                weekly >= policy["周线"]-6 and
-                rr >= max(0.75,policy["盈亏比"]-0.30)
+            rs_score,ex20,ex60=relative_strength(d,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
+            opp=opportunity_score(technical,buy_score,rr,None,mkt_score,rs_score)
+
+            quick_pass=(
+                weekly is not None and pd.notna(rr) and
+                technical>=policy["技术"]-6 and
+                buy_score>=policy["买点"]-6 and
+                weekly>=policy["周线"]-6 and
+                rr>=max(0.75,policy["盈亏比"]-0.30) and
+                rs_score>=policy["相对强度"]-8
             )
             if not quick_pass:
-                tick(i,code,name,"快速初筛未通过")
+                tick(i,code,name,"快速结构初筛未通过")
                 continue
 
-            stats["快速初筛通过"] += 1
-            stats["历史阶段"] += 1
-            tick(i-1,code,name,"计算3年历史与胜率")
+            stats["快速初筛通过"]+=1
+            stats["EV阶段"]+=1
+            tick(i-1,code,name,"计算5年真实交易EV")
 
-            hist_df = fetch_stock_daily(code,years=3)
-            rs_score,ex20,ex60 = relative_strength(hist_df,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
-            hist = historical_edge(
-                hist_df,technical,buy_score,
-                benchmark_df=benchmark_df,
-                current_market_score=mkt_score
+            hist_df=fetch_stock_daily(code,years=5)
+            ev,trades=realized_trade_ev(hist_df,benchmark_df,code)
+            tier,reason,policy_used=ev_opportunity_decision(
+                technical,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
             )
-            opp = opportunity_score(technical,buy_score,rr,hist,mkt_score,rs_score)
-            tier,reason,policy_used,summary,required_win = automatic_opportunity_decision(
-                technical,buy_score,weekly,rr,mkt_score,rs_score,hist,opp
-            )
-            if tier == "不通过":
+            if tier=="不通过":
                 tick(i,code,name,f"未通过：{reason}")
                 continue
 
-            stats[tier] += 1
-
-            def pct(v):
-                return f"{v:.0%}" if v is not None and pd.notna(v) else "—"
-            def pct1(v):
-                return f"{v:.1%}" if v is not None and pd.notna(v) else "—"
-
-            hist_win = summary.get("综合胜率")
-            hist_avg = summary.get("综合均收益")
-            safety = (
-                float(hist_win)-float(required_win)
-                if hist_win is not None and pd.notna(hist_win) and required_win is not None and pd.notna(required_win)
-                else np.nan
-            )
-
+            stats[tier]+=1
+            wf=ev.get("walk_forward") or {}
+            pf=ev.get("盈亏因子")
             rows.append({
                 "市场":market_of_code(code),"代码":display_code(code),"名称":name,
                 "机会状态":tier,"判定说明":reason,
+                "历史净EV(R)":round(float(ev["EV_R"]),2) if pd.notna(ev.get("EV_R")) else np.nan,
+                "保守EV(R)":round(float(ev["保守EV_R"]),2) if pd.notna(ev.get("保守EV_R")) else np.nan,
+                "2倍成本EV(R)":round(float(ev["压力EV_R"]),2) if pd.notna(ev.get("压力EV_R")) else np.nan,
+                "EV可信度":ev.get("可信度","不足"),"EV样本":ev.get("样本",0),
+                "交易胜率":f"{ev.get('胜率'):.0%}" if pd.notna(ev.get("胜率")) else "—",
+                "平均盈利R":round(float(ev["平均盈利R"]),2) if pd.notna(ev.get("平均盈利R")) else np.nan,
+                "平均亏损R":round(float(ev["平均亏损R"]),2) if pd.notna(ev.get("平均亏损R")) else np.nan,
+                "盈亏因子":round(float(pf),2) if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else np.nan),
+                "OOS EV(R)":round(float(wf.get("OOS_EV_R")),2) if pd.notna(wf.get("OOS_EV_R")) else np.nan,
+                "OOS稳定性":wf.get("稳定性","样本不足"),
                 "机会分/100":opp,"技术分/100":technical,"买点分/100":buy_score,
                 "周线/100":weekly,"盈亏比":rr,
-                "历史综合胜率":pct(hist_win),
-                "盈亏平衡+安全门槛":pct(required_win),
-                "胜率安全边际":pct(safety),
-                "历史综合均收益":pct1(hist_avg),
-                "历史样本":summary.get("样本",0),
-                "大盘":f"{mkt_regime} {mkt_score}/100",
+                "大盘":f"{mkt_regime} {mkt_score}/100","_market_score":mkt_score,
                 "相对强度/100":rs_score,
-                "20日超额":pct1(ex20),"60日超额":pct1(ex60),
-                "20日胜率":pct(hist[20]["胜率"]),"40日胜率":pct(hist[40]["胜率"]),"60日胜率":pct(hist[60]["胜率"]),
+                "20日超额":f"{ex20:.1%}" if pd.notna(ex20) else "—",
+                "60日超额":f"{ex60:.1%}" if pd.notna(ex60) else "—",
+                "20日中位成交额":round(float(amount20)/1e6,1) if pd.notna(amount20) else np.nan,
                 "趋势/100":trend,"动能/100":momentum,"量能/100":confirm,
                 "收盘":round(float(lr["close"]),2),
                 "风险位":round(float(stop),2) if pd.notna(stop) else np.nan,
                 "参考压力":round(float(target),2) if pd.notna(target) else np.nan,
+                "信号日":pd.Timestamp(di.iloc[-1]["trade_date"]).strftime("%Y-%m-%d"),
                 "系统规则":(
                     f"技≥{policy_used['技术']} / 买≥{policy_used['买点']} / "
                     f"周≥{policy_used['周线']} / RR≥{policy_used['盈亏比']:.2f} / "
@@ -2530,145 +2524,78 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             })
             tick(i,code,name,f"发现{tier}")
         except Exception:
-            stats["数据异常"] += 1
+            stats["数据异常"]+=1
             tick(i,code,name,"数据异常，跳过")
             continue
 
     if not rows:
         return pd.DataFrame(),stats
 
-    out = pd.DataFrame(rows)
-    tier_order = {"优先机会":0,"候选观察":1}
-    out["_tier"] = out["机会状态"].map(tier_order).fillna(9)
-    out = out.sort_values(
-        ["_tier","机会分/100","买点分/100","技术分/100"],
+    out=pd.DataFrame(rows)
+    tier_order={"优先机会":0,"候选观察":1}
+    out["_tier"]=out["机会状态"].map(tier_order).fillna(9)
+    out["_evsort"]=pd.to_numeric(out["保守EV(R)"],errors="coerce").fillna(-999)
+    out=out.sort_values(
+        ["_tier","_evsort","历史净EV(R)","技术分/100"],
         ascending=[True,False,False,False]
-    ).drop(columns="_tier").reset_index(drop=True)
+    ).drop(columns=["_tier","_evsort"]).reset_index(drop=True)
+    save_forward_candidates(out)
     return out,stats
 
-def run_backtest(df,benchmark_df,fee_bps=8):
-    m = build_score_series(df)
-    if m.empty or len(m) < 120:
-        return pd.DataFrame(), {}
+def run_backtest(df,benchmark_df,code=None,fee_bps=None):
+    code=normalize_code(code or (str(df.iloc[-1].get("code","")) if df is not None and not df.empty else ""))
+    if not code:
+        code="sh.000001"
 
-    bm = market_score_series(benchmark_df)
-    if not bm.empty:
-        bm2 = bm[["trade_date","close","ret20","ret60","market_score"]].copy()
-        bm2.columns = ["trade_date","bm_close","bm_ret20","bm_ret60","market_score"]
-        m = pd.merge_asof(
-            m.sort_values("trade_date"),bm2.sort_values("trade_date"),
-            on="trade_date",direction="backward"
-        )
-    else:
-        m["market_score"] = 50
-        m["bm_ret20"] = np.nan
-        m["bm_ret60"] = np.nan
+    trades,m=simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0)
+    stress,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=2.0)
+    if m.empty:
+        return pd.DataFrame(),{}
 
-    rs_scores,tech_req,buy_req,week_req,rr_req,rs_req = [],[],[],[],[],[]
-    for _,r in m.iterrows():
-        ex20 = r.get("ret20")-r.get("bm_ret20") if pd.notna(r.get("ret20")) and pd.notna(r.get("bm_ret20")) else np.nan
-        ex60 = r.get("ret60")-r.get("bm_ret60") if pd.notna(r.get("ret60")) and pd.notna(r.get("bm_ret60")) else np.nan
-        rs = 50
-        if pd.notna(ex20): rs += 120*ex20
-        if pd.notna(ex60): rs += 60*ex60
-        rs_scores.append(clamp(rs))
-        p = automatic_entry_policy(float(r.get("market_score",50) or 50))
-        tech_req.append(p["技术"]); buy_req.append(p["买点"]); week_req.append(p["周线"])
-        rr_req.append(p["盈亏比"]); rs_req.append(p["相对强度"])
+    equity=np.ones(len(m),dtype=float)
+    capital=1.0
+    cursor=0
 
-    m["rs_score"] = rs_scores
-    m["tech_req"] = tech_req
-    m["buy_req"] = buy_req
-    m["week_req"] = week_req
-    m["rr_req"] = rr_req
-    m["rs_req"] = rs_req
+    if trades is not None and not trades.empty:
+        for _,t in trades.iterrows():
+            ei=int(t["entry_index"])
+            xi=int(t["exit_index"])
+            if ei>=len(m) or xi>=len(m):
+                continue
+            equity[cursor:ei]=capital
+            entry=float(t["entry"])
+            for k in range(ei,xi+1):
+                px=float(m.iloc[k]["close"])
+                equity[k]=capital*(px/entry)
+            capital*=1+float(t["return"])
+            equity[xi]=capital
+            cursor=xi+1
 
-    m["entry_cond"] = (
-        (m["score"] >= m["tech_req"]) &
-        (m["buy_score"] >= m["buy_req"]) &
-        m["weekly_score"].notna() & (m["weekly_score"] >= m["week_req"]) &
-        m["rr"].notna() & (m["rr"] >= m["rr_req"]) &
-        (m["rs_score"] >= m["rs_req"])
-    )
+    equity[cursor:]=capital
+    m=m.copy()
+    m["净值"]=equity
+    first_open=float(m.iloc[0]["open"]) if pd.notna(m.iloc[0]["open"]) and m.iloc[0]["open"]>0 else float(m.iloc[0]["close"])
+    m["买入持有"]=m["close"]/first_open
 
-    fee = fee_bps/10000.0
-    cash,shares = 1.0,0.0
-    pending = None
-    eq,pos = [],[]
-    trade_returns,holding_days = [],[]
-    trade_start_equity,trade_start_i = None,None
-    trade_peak_score = None
-    actions = []
+    eq=pd.Series(equity)
+    total=float(eq.iloc[-1]-1)
+    n_years=max((m["trade_date"].iloc[-1]-m["trade_date"].iloc[0]).days/365.25,0.01)
+    annual=float(eq.iloc[-1]**(1/n_years)-1) if eq.iloc[-1]>0 else -1.0
+    dd=float((eq/eq.cummax()-1).min())
 
-    for i,row in m.iterrows():
-        openp = float(row["open"]) if pd.notna(row.get("open")) and row.get("open")>0 else float(row["close"])
-        closep = float(row["close"])
-
-        if pending == "buy" and shares == 0:
-            trade_start_equity = cash
-            shares = cash*(1-fee)/openp
-            cash = 0.0
-            trade_start_i = i
-            trade_peak_score = float(row["score"])
-        elif pending == "sell" and shares > 0:
-            cash = shares*openp*(1-fee)
-            shares = 0.0
-            if trade_start_equity and trade_start_equity>0:
-                trade_returns.append(cash/trade_start_equity-1)
-                holding_days.append(int(i-trade_start_i) if trade_start_i is not None else 0)
-            trade_start_equity,trade_start_i,trade_peak_score = None,None,None
-
-        if shares > 0:
-            trade_peak_score = max(float(trade_peak_score or row["score"]),float(row["score"]))
-
-        equity = cash if shares==0 else shares*closep
-        eq.append(equity)
-        pos.append(1 if shares>0 else 0)
-
-        pending = None
-        action = "空仓"
-        if shares == 0:
-            if bool(row["entry_cond"]) and i < len(m)-1:
-                pending = "buy"
-                action = "次日买入"
-        else:
-            exit_now = (
-                float(row["score"]) < 45 or
-                (trade_peak_score is not None and trade_peak_score-float(row["score"]) >= 15 and float(row["score"]) < 65) or
-                (pd.notna(row.get("weekly_score")) and float(row["weekly_score"]) < 45) or
-                (float(row.get("market_score",50)) < 25 and float(row["score"]) < 60)
-            )
-            if exit_now and i < len(m)-1:
-                pending = "sell"
-                action = "次日退出"
-            else:
-                action = "持有"
-        actions.append(action)
-
-    m["净值"] = eq
-    m["position"] = pos
-    m["action"] = actions
-    first_open = float(m.iloc[0]["open"]) if pd.notna(m.iloc[0]["open"]) and m.iloc[0]["open"]>0 else float(m.iloc[0]["close"])
-    m["买入持有"] = m["close"]/first_open
-
-    equity = pd.Series(eq,index=m.index)
-    total = equity.iloc[-1]-1
-    n_years = max((m["trade_date"].iloc[-1]-m["trade_date"].iloc[0]).days/365.25,0.01)
-    annual = equity.iloc[-1]**(1/n_years)-1
-    dd = (equity/equity.cummax()-1).min()
-
-    tr = np.array(trade_returns,dtype=float)
-    wins = tr[tr>0]; losses = tr[tr<0]
-    win_rate = float((tr>0).mean()) if len(tr) else np.nan
-    avg_trade = float(tr.mean()) if len(tr) else np.nan
-    profit_factor = float(wins.sum()/abs(losses.sum())) if len(losses) and abs(losses.sum())>1e-12 else (np.inf if len(wins) else np.nan)
-
-    metrics = {
+    ev=summarize_ev(trades)
+    stress_ev=summarize_ev(stress)
+    wf=walk_forward_validation(trades)
+    metrics={
         "累计收益":total,"年化收益":annual,"最大回撤":dd,
-        "交易次数":int(len(tr)),"买入持有":m["买入持有"].iloc[-1]-1,
-        "交易胜率":win_rate,"单笔均收益":avg_trade,"盈亏因子":profit_factor,
-        "平均持有天数":float(np.mean(holding_days)) if holding_days else np.nan,
-        "持仓暴露":float(np.mean(pos)) if pos else 0.0
+        "交易次数":ev["样本"],"买入持有":float(m["买入持有"].iloc[-1]-1),
+        "交易胜率":ev["胜率"],
+        "单笔均收益":float(trades["return"].mean()) if trades is not None and not trades.empty else np.nan,
+        "盈亏因子":ev["盈亏因子"],"平均持有天数":ev["平均持有"],
+        "持仓暴露":float(pd.to_numeric(trades["holding_days"],errors="coerce").sum()/max(len(m),1)) if trades is not None and not trades.empty else 0.0,
+        "EV_R":ev["EV_R"],"保守EV_R":ev["保守EV_R"],"压力EV_R":stress_ev["EV_R"],
+        "EV可信度":ev["可信度"],"OOS_EV_R":wf["OOS_EV_R"],"OOS胜率":wf["OOS胜率"],
+        "OOS稳定性":wf["稳定性"],"OOS折数":wf["折数"],"OOS正EV折数":wf["正EV折数"]
     }
     return m,metrics
 
