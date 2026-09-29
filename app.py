@@ -4275,6 +4275,14 @@ with tab6:
 - **回测**：收盘形成信号，下一交易日执行；止损考虑跳空，不假设一定能按风险位成交。
 - **持仓管理**：买入后“买点分”的意义下降，核心转为技术分及其变化。≥78强势持有、65–77持有、55–64谨慎持有、45–54减仓候选、<45退出候选；技术分较峰值快速回落、周线转弱或大盘逆风会降档。
 
+**量化研究层**
+- **历史股票池**：A股研究按月读取当时的沪深300/中证500成分或当时在市股票，信号必须处于历史成员区间，降低幸存者偏差；港股当前仍受免费历史股票池数据限制。
+- **Purged Walk-Forward**：训练与测试之间设置净化期和Embargo，降低重叠持仓造成的信息泄漏。
+- **Bootstrap EV**：采用月度块重采样估计EV分布与 P(EV>0)，不只看一个均值。
+- **EV校准**：每笔交易的预测EV只使用当时已经结束的历史交易，检查预测EV的排序能力。
+- **日级组合回测**：每日按真实收盘盯市，计算CAGR、最大回撤、Sharpe、Sortino、Calmar和换手。
+- **风险预算仓位**：默认每笔承担0.5% NAV风险，按技术失效距离反推仓位，单票上限10%、最多10仓。
+
 **规则版本与冻结原则**
 - 当前版本：**EV1.0**。Forward Test会记录规则版本；后续若改变核心入场/退出逻辑，应升级版本而不是覆盖历史结果。
 - 不因为某天“没有候选”就降低阈值，也不因为连续几笔亏损就临时改规则。
@@ -4881,8 +4889,8 @@ with tab4:
         st.dataframe(fs[cols],use_container_width=True,hide_index=True)
 
 with tab8:
-    st.subheader("组合级研究回测")
-    st.caption("用于回答EV1.0在多股票、多年份下是否真的具有正期望。任务按批次运行并保存进度，不需要一次把几千只股票全部算完。")
+    st.subheader("组合级量化研究")
+    st.caption("EV1.0研究层：历史股票池、Purged OOS、Bootstrap EV、EV校准、日级组合净值和风险预算仓位。任务分批运行并可断点继续。")
 
     r1,r2,r3=st.columns(3)
     with r1:
@@ -4897,26 +4905,22 @@ with tab8:
         research_batch=st.selectbox("每批计算",[10,20,30],index=1,key="research_batch")
 
     st.info(
-        "研究口径固定：EV1.0规则、次日执行、确认周线、流动性过滤、真实风险位与技术退出。"
-        "股票池在创建任务时冻结。"
-    )
-    st.warning(
-        "当前阶段使用“任务创建时可取得的当前成分/当前上市股票池”，因此仍可能存在幸存者偏差。"
-        "先用于判断Edge是否值得继续验证；后续历史成分股数据库接入后再做最终无偏验证。"
+        "A股研究任务会按月调用BaoStock历史成分/历史在市股票，历史信号只有在当时属于股票池时才保留。"
+        "港股免费数据源暂没有同等级历史主板成分，因此港股仍使用当前股票池回溯并单独标注偏差。"
     )
 
     runs=load_research_runs(30)
     rb1,rb2=st.columns([1.25,1])
     create_research=rb1.button("🧬 新建研究任务",type="primary",use_container_width=True)
-    rb2.caption("建议顺序：沪深300 5年 → 中证500 5年 → 港股主板5年 → 全A股5年。")
+    rb2.caption("建议：先跑沪深300 5年，再跑中证500 5年；规则不因结果好坏临时修改。")
 
     if create_research:
-        with st.spinner("正在冻结股票池并创建研究任务..."):
+        with st.spinner("正在构建历史股票池并创建研究任务..."):
             try:
                 bs_login()
                 rid,total_count=create_research_run(research_universe,research_years)
                 st.session_state["research_run_id"]=rid
-                st.success(f"研究任务已创建：{total_count}只股票。")
+                st.success(f"研究任务已创建：历史并集 {total_count} 只股票。")
                 st.rerun()
             except Exception as e:
                 st.error(f"创建研究任务失败：{e}")
@@ -4928,8 +4932,7 @@ with tab8:
     if runs.empty:
         st.info("暂无研究任务。建议先创建“沪深300 · 5年”。")
     else:
-        options=[]
-        labels={}
+        options=[]; labels={}
         for _,rr in runs.iterrows():
             rid=str(rr["run_id"])
             label=(
@@ -4947,6 +4950,12 @@ with tab8:
         st.session_state["research_run_id"]=selected_run
         run=get_research_run(selected_run)
 
+        if run.get("note"):
+            if str(run.get("universe"))=="港股主板":
+                st.warning(str(run["note"]))
+            else:
+                st.success(str(run["note"]))
+
         done=int(run.get("cursor",0) or 0)
         total=int(run.get("total",0) or 0)
         pct=done/total if total else 0
@@ -4958,7 +4967,7 @@ with tab8:
             type="primary",use_container_width=True,
             disabled=(run.get("status")=="completed")
         )
-        rc2.caption(f"每次处理 {research_batch} 只；完成后结果会保留，可随时继续。")
+        rc2.caption(f"每次处理 {research_batch} 只；每只股票会按历史成员区间过滤交易。")
 
         if run_batch_btn:
             prog=st.progress(0.0,text="准备研究批次...")
@@ -4992,9 +5001,9 @@ with tab8:
                     try: bs.logout()
                     except Exception: pass
 
-        summary,stock_results,research_trades,portfolio_curve=research_summary(selected_run)
+        summary,stock_results,research_trades,portfolio_curve,calibration=research_summary(selected_run)
         if summary is not None:
-            st.markdown("### 系统级核心结果")
+            st.markdown("### ① 系统级Edge")
             s1,s2,s3,s4=st.columns(4)
             s1.metric("已完成股票",str(summary.get("股票数",0)))
             s2.metric("历史交易数",str(summary.get("交易数",0)))
@@ -5006,40 +5015,76 @@ with tab8:
             s6.metric("真实盈亏比",f"{summary['真实盈亏比']:.2f}" if pd.notna(summary.get("真实盈亏比")) else "—")
             pf=summary.get("盈亏因子")
             s7.metric("Profit Factor",f"{pf:.2f}" if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else "—"))
-            s8.metric("OOS EV",f"{summary['OOS_EV_R']:+.2f}R" if pd.notna(summary.get("OOS_EV_R")) else "—")
+            s8.metric("Purged OOS EV",f"{summary['OOS_EV_R']:+.2f}R" if pd.notna(summary.get("OOS_EV_R")) else "—")
             st.caption(
-                f"平均盈利 {summary.get('平均盈利R'):+.2f}R" if pd.notna(summary.get("平均盈利R")) else "平均盈利 —"
+                f"Purged Walk-Forward：正EV折数 {summary.get('Purged正EV折数',0)}/{summary.get('Purged折数',0)} · "
+                f"稳定性 {summary.get('OOS稳定性','样本不足')} · 训练/测试之间设置30日净化+10日禁入间隔。"
             )
-            if pd.notna(summary.get("平均亏损R")):
-                st.caption(
-                    f"平均亏损 {summary['平均亏损R']:+.2f}R · "
-                    f"OOS稳定性：{summary.get('OOS稳定性','样本不足')}"
-                )
 
-            if summary.get("交易数",0)>=20:
-                if (
-                    pd.notna(summary.get("EV_R")) and summary["EV_R"]>0 and
-                    pd.notna(summary.get("保守EV_R")) and summary["保守EV_R"]>0 and
-                    pd.notna(summary.get("OOS_EV_R")) and summary["OOS_EV_R"]>0
-                ):
-                    st.success("当前已完成样本中：净EV、保守EV和OOS EV均为正。继续扩大股票数与年份验证稳定性。")
-                else:
-                    st.warning("当前已完成样本尚不能同时证明净EV、保守EV和OOS EV为正。不要根据少量局部结果调参数。")
+            st.markdown("### ② Bootstrap EV可信区间")
+            b1,b2,b3,b4=st.columns(4)
+            b1.metric("P(EV>0)",f"{summary['Bootstrap_P正EV']:.1%}" if pd.notna(summary.get("Bootstrap_P正EV")) else "—")
+            b2.metric("EV 5%分位",f"{summary['Bootstrap_P05']:+.2f}R" if pd.notna(summary.get("Bootstrap_P05")) else "—")
+            b3.metric("EV中位数",f"{summary['Bootstrap_P50']:+.2f}R" if pd.notna(summary.get("Bootstrap_P50")) else "—")
+            b4.metric("EV 95%分位",f"{summary['Bootstrap_P95']:+.2f}R" if pd.notna(summary.get("Bootstrap_P95")) else "—")
+            st.caption("采用月度块Bootstrap，尽量保留同一月份股票之间的相关性；比逐笔独立重采样更保守。")
 
-            st.markdown("### 10仓等权组合近似")
+            if isinstance(calibration,pd.DataFrame) and not calibration.empty:
+                st.markdown("### ③ EV校准")
+                cal=calibration.copy()
+                st.dataframe(cal,use_container_width=True,hide_index=True)
+                chart_df=cal[["平均预测EV(R)","实际EV(R)"]].copy()
+                chart_df.index=[f"组{i+1}" for i in range(len(chart_df))]
+                st.line_chart(chart_df,height=230)
+                st.caption("预测EV只使用当时已经结束的历史交易，并向大样本均值收缩。理想状态是预测EV越高，实际EV也随之上升。")
+            else:
+                st.caption("EV校准：至少需要约15笔具有历史预测EV的交易后才显示。")
+
+            st.markdown("### ④ 日级组合回测 · 风险预算仓位")
             p1,p2,p3,p4=st.columns(4)
             p1.metric("累计收益",f"{summary['组合累计收益']:.1%}" if pd.notna(summary.get("组合累计收益")) else "—")
             p2.metric("年化收益",f"{summary['组合年化收益']:.1%}" if pd.notna(summary.get("组合年化收益")) else "—")
-            p3.metric("近似最大回撤",f"{summary['组合最大回撤']:.1%}" if pd.notna(summary.get("组合最大回撤")) else "—")
-            p4.metric("组合采用交易",str(summary.get("组合交易数",0)))
-            st.caption("组合收益/回撤目前是10个并发仓位、等权占用的事件级近似；系统级EV、胜率、真实盈亏比和PF来自逐笔真实规则交易，优先参考这些指标。")
+            p3.metric("最大回撤",f"{summary['组合最大回撤']:.1%}" if pd.notna(summary.get("组合最大回撤")) else "—")
+            p4.metric("采用交易",str(summary.get("组合交易数",0)))
+
+            q1,q2,q3,q4=st.columns(4)
+            q1.metric("Sharpe",f"{summary['组合Sharpe']:.2f}" if pd.notna(summary.get("组合Sharpe")) else "—")
+            q2.metric("Sortino",f"{summary['组合Sortino']:.2f}" if pd.notna(summary.get("组合Sortino")) else "—")
+            q3.metric("Calmar",f"{summary['组合Calmar']:.2f}" if pd.notna(summary.get("组合Calmar")) else "—")
+            q4.metric("平均资金利用",f"{summary['组合平均仓位']:.1%}" if pd.notna(summary.get("组合平均仓位")) else "—")
+            st.caption(
+                "组合按日盯市；最多10仓。每笔默认风险预算=组合NAV的0.5%，"
+                "仓位由“风险预算 ÷ 入场到技术失效价的风险距离”决定，单票市值上限10%。"
+                "同日候选优先按仅使用过去已完成交易估计的预测EV排序。"
+            )
+            if pd.notna(summary.get("组合换手率")):
+                st.caption(
+                    f"累计换手约 {summary['组合换手率']:.1f}× · "
+                    f"候选采用率 {summary.get('组合采用率',np.nan):.1%}"
+                    if pd.notna(summary.get("组合采用率"))
+                    else f"累计换手约 {summary['组合换手率']:.1f}×"
+                )
             if isinstance(portfolio_curve,pd.DataFrame) and not portfolio_curve.empty:
-                st.line_chart(portfolio_curve.set_index("date")[["equity"]],height=240)
+                st.line_chart(
+                    portfolio_curve.set_index("date")[[x for x in ["equity","exposure"] if x in portfolio_curve.columns]],
+                    height=260
+                )
+
+            if summary.get("交易数",0)>=30:
+                strong=(
+                    pd.notna(summary.get("EV_R")) and summary["EV_R"]>0 and
+                    pd.notna(summary.get("保守EV_R")) and summary["保守EV_R"]>0 and
+                    pd.notna(summary.get("OOS_EV_R")) and summary["OOS_EV_R"]>0 and
+                    pd.notna(summary.get("Bootstrap_P正EV")) and summary["Bootstrap_P正EV"]>=0.90
+                )
+                if strong:
+                    st.success("当前样本同时通过：净EV>0、保守EV>0、Purged OOS EV>0、Bootstrap正EV概率≥90%。继续扩大年份和股票池验证。")
+                else:
+                    st.warning("当前样本尚未同时通过全部稳健性条件。不要根据局部结果重新调参。")
 
             if isinstance(stock_results,pd.DataFrame) and not stock_results.empty:
                 with st.expander("查看单股研究结果"):
-                    view=stock_results.copy()
-                    view=view.rename(columns={
+                    view=stock_results.copy().rename(columns={
                         "code":"代码","name":"名称","trade_count":"交易数",
                         "ev_r":"EV(R)","conservative_ev_r":"保守EV(R)",
                         "win_rate":"胜率","avg_win_r":"平均盈利R","avg_loss_r":"平均亏损R",
@@ -5049,7 +5094,7 @@ with tab8:
                         "代码","名称","交易数","EV(R)","保守EV(R)","胜率",
                         "平均盈利R","平均亏损R","PF","OOS EV(R)","OOS稳定性"
                     ] if x in view.columns]
-                    st.dataframe(view[cols].head(200),use_container_width=True,hide_index=True)
+                    st.dataframe(view[cols].head(300),use_container_width=True,hide_index=True)
 
             if isinstance(research_trades,pd.DataFrame) and not research_trades.empty:
                 dl1,dl2=st.columns(2)
