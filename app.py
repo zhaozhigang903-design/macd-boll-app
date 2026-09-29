@@ -71,6 +71,8 @@ EXTRACT_PROMPT = """
 - 绿柱缩短=空头动能减速，不等于立刻转多。
 - 背离是风险/机会提示，不单独构成交易确认。
 - 盘中截图必须标记 is_intraday=true。
+- 成交量只依据截图中的VOL柱与MA5/MA10判断；不要求MA20。
+- “异常放量”只表示明显偏离近期均量，不能自动判定利多或利空，必须结合价格位置与趋势解释。
 - 不要根据股票名称补充截图外行情。
 
 必须只输出合法 json，不要Markdown，不要额外文字。JSON格式：
@@ -90,7 +92,10 @@ EXTRACT_PROMPT = """
     "dif_direction": "向上/走平/向下/未知",
     "cross": "金叉/死叉/粘合/未知",
     "bar_momentum": "红柱放大/红柱缩短/绿柱缩短/绿柱放大/不明确/未知",
-    "volume_state": "放量/缩量/普通/不可见/未知",
+    "volume_state": "明显放量/温和放量/普通/缩量/异常放量/不可见/未知",
+    "vol_vs_ma5": "高于MA5/接近MA5/低于MA5/不可见/未知",
+    "vol_vs_ma10": "高于MA10/接近MA10/低于MA10/不可见/未知",
+    "volume_trend": "递增/递减/震荡/不明确/未知",
     "divergence": "顶背离/底背离/无明显背离/无法判断",
     "atr": "未知"
   },
@@ -101,7 +106,11 @@ EXTRACT_PROMPT = """
     "macd_zero_zone": "未知",
     "dif_direction": "未知",
     "cross": "未知",
-    "bar_momentum": "未知"
+    "bar_momentum": "未知",
+    "volume_state": "未知",
+    "vol_vs_ma5": "未知",
+    "vol_vs_ma10": "未知",
+    "volume_trend": "未知"
   },
   "key_support": "未知",
   "key_resistance": "未知",
@@ -221,17 +230,43 @@ def score_engine(x, weekly_uploaded):
         weekly += {"向上":10, "走平":5, "向下":1}.get(cat(w.get("dif_direction")), 4)
         weekly = clamp(weekly)
 
-    # 4) 确认因子 0-100
+    # 4) 确认因子 0-100：成交量用 MA5/MA10 + 柱体趋势，不依赖 MA20
     confirm = 45
     vol = cat(d.get("volume_state"))
-    if vol == "放量": confirm += 25
-    elif vol == "缩量": confirm -= 10
-    elif vol == "普通": confirm += 5
+    if vol == "明显放量":
+        confirm += 14
+    elif vol == "温和放量":
+        confirm += 9
+    elif vol == "普通":
+        confirm += 3
+    elif vol == "缩量":
+        confirm -= 6
+    elif vol == "异常放量":
+        # 异常量本身不是方向信号，留给价格位置/趋势解释
+        confirm += 0
+
+    v5 = cat(d.get("vol_vs_ma5"))
+    v10 = cat(d.get("vol_vs_ma10"))
+    if v5 == "高于MA5" and v10 == "高于MA10":
+        confirm += 12
+    elif v5 == "低于MA5" and v10 == "低于MA10":
+        confirm -= 8
+    elif "高于" in v5 or "高于" in v10:
+        confirm += 5
+
+    vtrend = cat(d.get("volume_trend"))
+    if vtrend == "递增":
+        confirm += 7
+    elif vtrend == "递减":
+        confirm -= 4
 
     div = cat(d.get("divergence"))
-    if div == "底背离": confirm += 18
-    elif div == "顶背离": confirm -= 25
-    elif div == "无明显背离": confirm += 5
+    if div == "底背离":
+        confirm += 15
+    elif div == "顶背离":
+        confirm -= 22
+    elif div == "无明显背离":
+        confirm += 4
     confirm = clamp(confirm)
 
     if weekly is None:
@@ -393,7 +428,7 @@ with tab3:
 1. **趋势层（40%左右）**：BOLL中轨方向、价格相对中轨、带宽状态。  
 2. **动能层（30%左右）**：MACD零轴、DIF方向、金叉/死叉、柱体加减速。  
 3. **周期层（约20%）**：周线确认日线。中长线若没有周线确认，强信号会被降级。  
-4. **确认层（约10%）**：成交量与背离，只做加减分，不抢主导权。  
+4. **确认层（约10%）**：成交量与背离，只做加减分，不抢主导权。成交量固定读取 **VOL柱 + MA5 + MA10**，不要求MA20。  
 
 **关键原则**
 - 零轴下金叉 = 先看修复，不把反弹当反转。
@@ -407,6 +442,7 @@ with tab3:
 
 with tab1:
     st.subheader("① 上传图表")
+    st.caption("固定模板建议：主图 BOLL(20,2)；副图1 MACD(12,26,9)；副图2 VOL + MA5 + MA10。日线和周线保持一致。")
     c1, c2 = st.columns(2)
     with c1:
         daily_img = st.file_uploader("日线截图（必填）", type=["png","jpg","jpeg","webp"], key="daily")
@@ -539,6 +575,8 @@ with tab1:
 
         if bool(x.get("is_intraday")):
             st.warning("这是盘中截图：日K与指标尚未定型，系统已自动降低置信度。")
+        if cat((x.get("daily") or {}).get("volume_state")) == "异常放量":
+            st.warning("检测到异常放量：它不是自动利多/利空信号，必须结合价格位于中轨上/下、是否突破/跌破关键位来解释。")
         if confidence < 65:
             st.error(f"截图质量不足（{confidence}%）。缺失/模糊：{x.get('missing_or_unclear','未说明')}。不建议依据本次结果采取中长线动作。")
 
@@ -561,6 +599,9 @@ with tab1:
             ["交叉", d.get("cross","未知"), "确认信号"],
             ["柱体", d.get("bar_momentum","未知"), "动能加减速"],
             ["成交量", d.get("volume_state","未知"), "参与度确认"],
+            ["VOL vs MA5", d.get("vol_vs_ma5","未知"), "短期量能强弱"],
+            ["VOL vs MA10", d.get("vol_vs_ma10","未知"), "中短期量能基准"],
+            ["量能趋势", d.get("volume_trend","未知"), "近期参与度变化"],
             ["背离", d.get("divergence","未知"), "仅作风险提示"],
         ]
         st.dataframe(pd.DataFrame(rows, columns=["证据","当前状态","作用"]), use_container_width=True, hide_index=True)
