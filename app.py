@@ -536,7 +536,7 @@ def init_db():
       PRIMARY KEY(code,stock_date,benchmark_date,rule_version)
     )
     """)
-    fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()
+    fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
     if "rule_version" not in fcols:
         conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
     conn.commit()
