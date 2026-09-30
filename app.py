@@ -4115,19 +4115,109 @@ def load_screener_job_results(job_id):
         out=out.sort_values(sort_cols,ascending=asc).drop(columns=["_tier","_evsort"],errors="ignore")
     return out.reset_index(drop=True)
 
-def create_screener_job(universe="中证500",exclude_st=True,batch_size=100,trade_date=None):
+def create_screener_job(
+    universe="中证500",exclude_st=True,batch_size=100,
+    trade_date=None,job_type="manual"
+):
     trade_date=trade_date or datetime.now().strftime("%Y-%m-%d")
-    job_id="SCAN_"+datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_type="scheduled" if str(job_type)=="scheduled" else "manual"
+    prefix="AUTO" if job_type=="scheduled" else "MAN"
+    job_id=f"{prefix}_SCAN_"+datetime.now().strftime("%Y%m%d_%H%M%S")
     now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn=sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO screener_jobs(
-           job_id,trade_date,universe,exclude_st,batch_size,status,cursor,total,
+           job_id,job_type,trade_date,universe,exclude_st,batch_size,status,cursor,total,
            created_at,updated_at
-        ) VALUES(?,?,?,?,?,'queued',0,0,?,?)""",
-        (job_id,trade_date,universe,1 if exclude_st else 0,int(batch_size),now,now)
+        ) VALUES(?,?,?,?,?,?,'queued',0,0,?,?)""",
+        (
+            job_id,job_type,trade_date,universe,1 if exclude_st else 0,
+            int(batch_size),now,now
+        )
     )
     conn.commit(); conn.close()
+    return job_id
+
+def latest_screener_job(job_type=None):
+    conn=sqlite3.connect(DB_PATH)
+    if job_type:
+        df=pd.read_sql_query(
+            """SELECT * FROM screener_jobs
+               WHERE job_type=?
+               ORDER BY created_at DESC LIMIT 1""",
+            conn,params=(job_type,)
+        )
+    else:
+        df=pd.read_sql_query(
+            """SELECT * FROM screener_jobs
+               ORDER BY created_at DESC LIMIT 1""",
+            conn
+        )
+    conn.close()
+    return df.iloc[0].to_dict() if not df.empty else None
+
+def active_screener_job(job_type=None):
+    conn=sqlite3.connect(DB_PATH)
+    if job_type:
+        row=conn.execute(
+            """SELECT job_id,status FROM screener_jobs
+               WHERE job_type=? AND status IN ('queued','running')
+               ORDER BY created_at DESC LIMIT 1""",
+            (job_type,)
+        ).fetchone()
+    else:
+        row=conn.execute(
+            """SELECT job_id,status,job_type FROM screener_jobs
+               WHERE status IN ('queued','running')
+               ORDER BY created_at DESC LIMIT 1"""
+        ).fetchone()
+    conn.close()
+    return row
+
+def repair_stale_screener_jobs():
+    # Streamlit/Render进程重启后，数据库可能仍写着running，但线程已经不存在。
+    # 这种任务改成paused，避免“明明完成/已中断却永远挡住下一次扫描”。
+    conn=sqlite3.connect(DB_PATH)
+    rows=conn.execute(
+        """SELECT job_id FROM screener_jobs
+           WHERE status='running'"""
+    ).fetchall()
+    conn.close()
+    for (job_id,) in rows:
+        with _SCREENER_THREADS_LOCK:
+            t=_SCREENER_THREADS.get(str(job_id))
+            alive=bool(t is not None and t.is_alive())
+        if not alive:
+            _update_screener_job(
+                str(job_id),status="paused",
+                error="服务重启或后台线程已结束，任务已保留断点。"
+            )
+
+def pause_scheduled_for_manual():
+    conn=sqlite3.connect(DB_PATH)
+    rows=conn.execute(
+        """SELECT job_id FROM screener_jobs
+           WHERE job_type='scheduled' AND status IN ('queued','running')"""
+    ).fetchall()
+    conn.close()
+    for (job_id,) in rows:
+        _update_screener_job(str(job_id),status="paused_manual",error=None)
+
+def resume_scheduled_after_manual():
+    if active_screener_job("manual"):
+        return None
+    conn=sqlite3.connect(DB_PATH)
+    row=conn.execute(
+        """SELECT job_id FROM screener_jobs
+           WHERE job_type='scheduled' AND status='paused_manual'
+           ORDER BY created_at DESC LIMIT 1"""
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    job_id=str(row[0])
+    _update_screener_job(job_id,status="queued",error=None)
+    start_screener_job_background(job_id)
     return job_id
 
 def _update_screener_job(job_id,**kwargs):
@@ -4145,6 +4235,7 @@ def _background_screener_worker(job_id):
     job=load_screener_job(job_id)
     if not job:
         return
+    job_type=str(job.get("job_type") or "manual")
     try:
         _update_screener_job(job_id,status="running",error=None)
         universe=str(job["universe"])
@@ -4196,10 +4287,16 @@ def _background_screener_worker(job_id):
                 pass
 
         while cursor<total:
+            current=load_screener_job(job_id)
+            if not current or str(current.get("status"))=="paused_manual":
+                return
             outer_end=min(cursor+outer_batch,total)
             bs_login()
             try:
                 while cursor<outer_end:
+                    current=load_screener_job(job_id)
+                    if not current or str(current.get("status"))=="paused_manual":
+                        return
                     end=min(cursor+micro_batch,outer_end)
                     batch=pool.iloc[cursor:end]
                     codes=batch["code"].tolist()
@@ -4247,6 +4344,8 @@ def _background_screener_worker(job_id):
         bs_logout_safe()
         with _SCREENER_THREADS_LOCK:
             _SCREENER_THREADS.pop(job_id,None)
+        if job_type=="manual":
+            resume_scheduled_after_manual()
 
 def start_screener_job_background(job_id):
     if not job_id:
@@ -4297,34 +4396,42 @@ def save_screener_settings(auto_daily,universe,exclude_st,batch_size,run_after_h
     conn.commit(); conn.close()
 
 def maybe_resume_or_start_daily_screener():
+    repair_stale_screener_jobs()
     settings=get_screener_settings()
-    # 先恢复被网页刷新/交互打断前已经持久化的任务。
+
+    # 手动任务优先。每日任务与手动任务逻辑完全分开，手动任务运行时每日任务暂停。
+    if active_screener_job("manual"):
+        return None
+
     conn=sqlite3.connect(DB_PATH)
-    running=pd.read_sql_query(
+    scheduled=pd.read_sql_query(
         """SELECT * FROM screener_jobs
-           WHERE status IN ('running','queued','paused')
+           WHERE job_type='scheduled'
+             AND status IN ('running','queued','paused','paused_manual')
            ORDER BY created_at DESC LIMIT 1""",
         conn
     )
     conn.close()
-    if not running.empty:
-        job=running.iloc[0].to_dict()
-        # paused通常是临时网络错误；下次页面活动时自动续跑。
-        if str(job.get("status")) in ("running","queued","paused"):
-            start_screener_job_background(str(job["job_id"]))
-            return str(job["job_id"])
+    if not scheduled.empty:
+        job=scheduled.iloc[0].to_dict()
+        job_id=str(job["job_id"])
+        if str(job.get("status")) in ("paused","paused_manual"):
+            _update_screener_job(job_id,status="queued",error=None)
+        start_screener_job_background(job_id)
+        return job_id
 
     if not int(settings.get("auto_daily",0)):
         return None
-    now=datetime.now()
-    if now.hour<int(settings.get("run_after_hour",18)):
+
+    now=pd.Timestamp.now(tz="Asia/Shanghai")
+    if int(now.hour)<int(settings.get("run_after_hour",18)):
         return None
 
     today=now.strftime("%Y-%m-%d")
     conn=sqlite3.connect(DB_PATH)
     row=conn.execute(
-        """SELECT job_id FROM screener_jobs
-           WHERE trade_date=? AND universe=?
+        """SELECT job_id,status FROM screener_jobs
+           WHERE job_type='scheduled' AND trade_date=? AND universe=?
            ORDER BY created_at DESC LIMIT 1""",
         (today,settings["universe"])
     ).fetchone()
@@ -4334,7 +4441,7 @@ def maybe_resume_or_start_daily_screener():
 
     job_id=create_screener_job(
         settings["universe"],bool(settings["exclude_st"]),
-        settings["batch_size"],trade_date=today
+        settings["batch_size"],trade_date=today,job_type="scheduled"
     )
     start_screener_job_background(job_id)
     return job_id
