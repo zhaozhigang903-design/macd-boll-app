@@ -3826,7 +3826,12 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     rows=[]
     name_map=name_map or {}
     benchmark_df=benchmark_df if benchmark_df is not None else pd.DataFrame()
-    mkt_score,mkt_regime=market_environment(benchmark_df) if not benchmark_df.empty else (50,"未知")
+    benchmark_features=market_score_series(benchmark_df) if not benchmark_df.empty else pd.DataFrame()
+    if benchmark_features is not None and not benchmark_features.empty:
+        mkt_score=int(benchmark_features.iloc[-1]["market_score"])
+        mkt_regime=market_regime(mkt_score)
+    else:
+        mkt_score,mkt_regime=(50,"未知")
     policy=automatic_entry_policy(mkt_score)
     stats={
         "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
@@ -3851,27 +3856,17 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 tick(i,code,name,"历史不足，跳过")
                 continue
 
-            name=name_map.get(code) or stock_basic_name(code)
+            name=name_map.get(code) or display_code(code)
             di=add_indicators(d)
             agg_w=weekly_from_daily(d,completed_only=True)
-            try:
-                native_w=fetch_stock_weekly(code,years=2)
-                native_w=confirmed_native_weekly(native_w,di["trade_date"].max()) if not native_w.empty else native_w
-            except Exception:
-                native_w=pd.DataFrame()
-            wi=native_w if native_w is not None and not native_w.empty else agg_w
-            weekly_source="原生周K" if native_w is not None and not native_w.empty else "日K聚合兜底"
-            weekly_check=weekly_consistency(native_w,agg_w)
-            if wi is None or wi.empty:
-                tick(i,code,name,"确认周线不足，跳过")
+            if agg_w is None or agg_w.empty:
+                tick(i,code,name,"聚合周线不足，跳过")
                 continue
-            if weekly_check.get("level")=="低":
-                stats["周线低一致性"]+=1
 
             lr=di.iloc[-1].to_dict()
             lr["macd_prev"]=di.iloc[-2]["macd"] if len(di)>1 else np.nan
-            wr=wi.iloc[-1].to_dict()
-            technical,trend,momentum,weekly,confirm=numeric_score(lr,wr)
+            agg_wr=agg_w.iloc[-1].to_dict()
+            agg_technical,agg_trend,agg_momentum,agg_weekly,agg_confirm=numeric_score(lr,agg_wr)
             buy_score,rr,stop,target=entry_quality(lr)
             liq_ok,amount20,liq_threshold=liquidity_rule(code,lr)
             if not liq_ok:
@@ -3880,10 +3875,40 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 continue
 
             rs_score,ex20,ex60=relative_strength(d,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
+            agg_opp=opportunity_score(agg_technical,buy_score,rr,None,mkt_score,rs_score)
+
+            # 第一层只用已在内存中的日K+聚合周K做“宽松预筛”。
+            # 原生周K仍是最终周线依据，但只为有可能入选的股票请求，避免全市场逐只额外网络请求。
+            coarse_pass=(
+                agg_weekly is not None and pd.notna(rr) and
+                agg_technical>=policy["技术"]-10 and
+                buy_score>=policy["买点"]-7 and
+                agg_weekly>=policy["周线"]-12 and
+                rr>=max(0.65,policy["盈亏比"]-0.35) and
+                rs_score>=policy["相对强度"]-9 and
+                agg_opp>=policy["机会"]-9
+            )
+            if not coarse_pass:
+                tick(i,code,name,"快速预筛未通过")
+                continue
+
+            try:
+                native_w=fetch_stock_weekly(code,years=2)
+                native_w=confirmed_native_weekly(native_w,di["trade_date"].max()) if not native_w.empty else native_w
+            except Exception:
+                native_w=pd.DataFrame()
+
+            wi=native_w if native_w is not None and not native_w.empty else agg_w
+            weekly_source="原生周K" if native_w is not None and not native_w.empty else "日K聚合兜底"
+            weekly_check=weekly_consistency(native_w,agg_w)
+            if weekly_check.get("level")=="低":
+                stats["周线低一致性"]+=1
+
+            wr=wi.iloc[-1].to_dict()
+            technical,trend,momentum,weekly,confirm=numeric_score(lr,wr)
             opp=opportunity_score(technical,buy_score,rr,None,mkt_score,rs_score)
 
-            # 与最终“候选观察”的结构门槛对齐，不会漏掉最终可能入选的股票；
-            # 但可避免为结构上注定无法通过的股票计算5年EV。
+            # 第二层使用“原生周K为主”的最终结构门槛。
             quick_pass=(
                 weekly is not None and pd.notna(rr) and
                 technical>=policy["技术"]-4 and
@@ -3894,7 +3919,7 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 opp>=policy["机会"]-4
             )
             if not quick_pass:
-                tick(i,code,name,"快速结构初筛未通过")
+                tick(i,code,name,"原生周K确认后未通过")
                 continue
 
             stats["快速初筛通过"]+=1
@@ -3902,7 +3927,10 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             tick(i-1,code,name,"计算5年真实交易EV")
 
             hist_df=fetch_stock_daily(code,years=5)
-            ev,trades,cache_hit=realized_trade_ev(hist_df,benchmark_df,code,use_cache=True)
+            ev,trades,cache_hit=realized_trade_ev(
+                hist_df,benchmark_df,code,use_cache=True,
+                benchmark_features=benchmark_features
+            )
             if cache_hit:
                 stats["EV缓存命中"]+=1
             tier,reason,policy_used=ev_opportunity_decision(
