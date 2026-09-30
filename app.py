@@ -2788,11 +2788,17 @@ def build_operation_strategy(
         )
     }
 
-def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_df=None,compute_ev=True):
+def deterministic_report(
+    code,name,df,position_state,fundamentals_ok,benchmark_df=None,
+    compute_ev=True,native_weekly_df=None,ev_override=None
+):
     di=add_indicators(df)
     agg_w=weekly_from_daily(df,completed_only=True)
     try:
-        native_w=fetch_stock_weekly(code,years=5)
+        if native_weekly_df is not None:
+            native_w=native_weekly_df.copy()
+        else:
+            native_w=fetch_stock_weekly(code,years=3 if not compute_ev else 5)
         native_w=confirmed_native_weekly(native_w,di["trade_date"].max()) if not native_w.empty else native_w
     except Exception:
         native_w=pd.DataFrame()
@@ -2828,11 +2834,37 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
     }
     tier="候选观察"
     ev_reason="持仓管理模式不重复计算历史EV"
-    if compute_ev:
-        ev,_,_=realized_trade_ev(df,benchmark_df,code,use_cache=True)
+    ev_pending=False
+    if ev_override is not None:
+        ev=ev_override
         tier,ev_reason,_=ev_opportunity_decision(
             score,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
         )
+    elif compute_ev:
+        ev,_,_=realized_trade_ev(
+            df,benchmark_df,code,use_cache=True,weekly_df=native_w
+        )
+        tier,ev_reason,_=ev_opportunity_decision(
+            score,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
+        )
+    else:
+        p=automatic_entry_policy(mkt_score)
+        watch_pass=(
+            technical if False else score
+        )
+        structure_watch=(
+            score>=p["技术"]-4 and buy_score>=p["买点"]-4 and
+            pd.notna(weekly) and weekly>=p["周线"]-4 and
+            pd.notna(rr) and rr>=max(0.8,p["盈亏比"]-0.2) and
+            rs_score>=p["相对强度"]-5 and opp>=p["机会"]-4 and liq_ok
+        )
+        if structure_watch:
+            tier="候选观察"
+            ev_reason="当前结构达到观察门槛；历史EV正在后台更新"
+            ev_pending=True
+        else:
+            tier="不通过"
+            ev_reason="当前结构未达到自动观察门槛；本次不阻塞等待5年EV"
 
     hard_bear=(
         pd.notna(drow.get("boll_slope")) and drow.get("boll_slope")<0 and
@@ -2868,12 +2900,17 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
     zero="零轴上" if drow.get("dif",0)>0 and drow.get("dea",0)>0 else "零轴下/附近"
     cross="金叉" if drow.get("dif",0)>drow.get("dea",0) else "死叉"
     rr_txt=f"{rr:.2f}" if pd.notna(rr) else "—"
-    ev_txt=f"{ev.get('EV_R'):+.2f}R" if pd.notna(ev.get("EV_R")) else "样本不足"
+    ev_txt=(
+        f"{ev.get('EV_R'):+.2f}R" if pd.notna(ev.get("EV_R"))
+        else ("后台更新中" if ev_pending else "未计算")
+    )
     essence=f"{tier} · 历史净EV {ev_txt} · 技术{score:.0f} · 买点{buy_score} · RR {rr_txt} · {mkt_regime}{mkt_score}/100"
 
     up=[]; down=[]
-    if compute_ev and tier!="优先机会":
+    if (compute_ev or ev_override is not None) and tier!="优先机会":
         up.append("等待保守EV与压力EV转正")
+    elif ev_pending:
+        up.append("等待后台EV完成后再确认是否升级")
     if buy_score<65:
         up.append("买点质量继续改善")
     if pd.notna(risk_price):
@@ -2903,7 +2940,7 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
         "buy_score":buy_score,"rr":rr,
         "market_score":mkt_score,"market_regime":mkt_regime,
         "rs_score":rs_score,"excess20":ex20,"excess60":ex60,
-        "ev":ev,"liquidity_ok":liq_ok,"amount20":amount20,
+        "ev":ev,"ev_pending":ev_pending,"liquidity_ok":liq_ok,"amount20":amount20,
         "risk_price":risk_price,"target_price":target_price,
         "weekly_source":weekly_source,
         "weekly_crosscheck":weekly_check,
