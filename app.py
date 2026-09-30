@@ -6116,29 +6116,98 @@ with tab7:
     st.subheader("数据设置")
     st.info(f"当前策略规则版本：{RULE_VERSION}。为避免过拟合，EV核心规则进入观察期后不因短期盈亏或候选数量随意调整。")
 
-    st.subheader("多终端架构")
+    st.subheader("数据架构")
     a1,a2,a3=st.columns(3)
     a1.metric("当前运行端","Windows计算端" if RUNTIME_MODE=="windows" else ("云端访问端" if RUNTIME_MODE=="cloud" else "本地运行"))
-    a2.metric("核心数据", "共享PostgreSQL" if shared_db_enabled() else "本地SQLite")
-    a3.metric("行情缓存","本机独立缓存")
-    if shared_db_enabled():
-        st.success("✅ 已启用共享数据库架构：持仓、Forward Test、研究任务、策略实验和候选版本可在Windows与云端之间同步。行情K线和EV计算缓存仍各自保留在本机。")
-        ss1,ss2=st.columns(2)
-        if ss1.button("☁️ 立即同步核心数据",use_container_width=True):
-            out=sync_shared_light_safe(force=True)
-            if out.get("errors"):
-                st.warning("同步完成，但存在异常："+"；".join(out["errors"][:5]))
-            else:
-                st.success(f"同步完成：上传 {out.get('pushed',0)} 行 · 下载 {out.get('pulled',0)} 行。")
-        if ss2.button("🔌 测试共享数据库",use_container_width=True):
-            chk=shared_db_status()
-            if chk.get("enabled"):
-                st.success(chk.get("reason","PostgreSQL 已连接"))
-            else:
-                st.error(chk.get("reason","共享数据库未连接"))
+    a2.metric("核心数据库","SQLite")
+    a3.metric("云端备份","腾讯云COS" if cos_backup_configured() else "待配置")
+
+    st.success("当前采用低成本方案：SQLite作为主数据库；行情/EV缓存留在本机；不可重建的核心业务数据每天备份到腾讯云COS。")
+    st.caption("PostgreSQL能力继续保留，但现在不是必需项。等以后需要多人/多节点实时双向写入时再启用。")
+
+    st.markdown("**☁️ 腾讯云 COS 核心数据备份**")
+    cos_state=cos_backup_status()
+    if cos_backup_configured() and cos_state.get("enabled"):
+        st.success("✅ "+cos_state.get("reason","腾讯云COS已连接"))
+        cb1,cb2=st.columns(2)
+        if cb1.button("☁️ 立即备份核心数据",use_container_width=True,key="cos_backup_now_btn"):
+            try:
+                out=cos_backup_now(DB_PATH,RUNTIME_MODE,keep=30)
+                st.success(
+                    f"备份完成：{out.get('key','')} · "
+                    f"{out.get('size',0)/1024/1024:.2f} MB · "
+                    f"自动清理旧备份 {out.get('pruned',0)} 个"
+                )
+            except Exception as e:
+                st.error(f"COS备份失败：{e}")
+
+        if cb2.button("🔄 刷新COS备份列表",use_container_width=True,key="cos_refresh_list_btn"):
+            st.session_state.pop("_cos_backup_list",None)
+
+        try:
+            if "_cos_backup_list" not in st.session_state:
+                st.session_state["_cos_backup_list"]=cos_list_backups(max_keys=60)
+            cos_rows=st.session_state.get("_cos_backup_list") or []
+        except Exception as e:
+            cos_rows=[]
+            st.warning(f"读取COS备份列表失败：{e}")
+
+        if cos_rows:
+            backup_labels={
+                r["key"]:f"{r.get('last_modified','')} · {r.get('device','')} · {r.get('size',0)/1024/1024:.2f} MB"
+                for r in cos_rows
+            }
+            restore_key=st.selectbox(
+                "选择一个云端备份",
+                [r["key"] for r in cos_rows],
+                format_func=lambda x:backup_labels.get(x,x),
+                key="cos_restore_key"
+            )
+            confirm_restore=st.checkbox(
+                "我确认用所选备份覆盖当前核心业务数据",
+                value=False,key="cos_restore_confirm"
+            )
+            if st.button(
+                "♻️ 恢复所选核心数据",
+                use_container_width=True,
+                disabled=not confirm_restore,
+                key="cos_restore_btn"
+            ):
+                try:
+                    restored=cos_restore_core(DB_PATH,restore_key)
+                    st.success(
+                        "恢复完成："+
+                        " · ".join([f"{k}:{v}" for k,v in restored.items()])
+                    )
+                    st.session_state.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"COS恢复失败：{e}")
+        else:
+            st.caption("COS中暂未发现备份。点击“立即备份核心数据”生成第一份。")
     else:
-        st.warning("当前代码已经支持Windows/云端共用同一个PostgreSQL，但还没有配置 SHARED_DATABASE_URL。未配置前，两端会各自使用本地SQLite。")
-        st.caption("配置完成后无需改代码：云端和Windows分别设置指向同一个PostgreSQL实例的连接地址即可。连接密码不会写入GitHub。")
+        st.warning("COS备份代码已经启用，但还没有配置腾讯云COS密钥/桶信息，所以目前不会上传云端。")
+        st.caption(
+            "Render环境变量需要配置：TENCENT_COS_SECRET_ID、TENCENT_COS_SECRET_KEY、"
+            "TENCENT_COS_REGION、TENCENT_COS_BUCKET。配置后系统每天自动备份1次，并保留最近30份。"
+        )
+
+    if shared_db_enabled():
+        with st.expander("高级：PostgreSQL共享数据库（当前不建议启用）"):
+            st.caption("只有将来需要Windows与云端同时实时写入同一数据库时才需要。")
+            ss1,ss2=st.columns(2)
+            if ss1.button("☁️ 立即同步PostgreSQL",use_container_width=True):
+                out=sync_shared_light_safe(force=True)
+                if out.get("errors"):
+                    st.warning("同步完成，但存在异常："+"；".join(out["errors"][:5]))
+                else:
+                    st.success(f"同步完成：上传 {out.get('pushed',0)} 行 · 下载 {out.get('pulled',0)} 行。")
+            if ss2.button("🔌 测试PostgreSQL",use_container_width=True):
+                chk=shared_db_status()
+                if chk.get("enabled"):
+                    st.success(chk.get("reason","PostgreSQL 已连接"))
+                else:
+                    st.error(chk.get("reason","共享数据库未连接"))
 
     st.success("A股：BaoStock主源 + AKShare自动容灾；港股：AKShare。均无需在本App配置行情Token。")
     st.info("如果BaoStock出现黑名单、登录失败、返回空数据或临时网络异常，A股日线、沪深300基准和股票池会自动尝试AKShare，不再直接让分析/选股失败。")
