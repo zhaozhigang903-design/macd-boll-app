@@ -1222,6 +1222,21 @@ def render_cockpit(report):
             f"正EV折数 {wf.get('正EV折数',0)}/{wf.get('折数',0)}"
         )
 
+    wcheck=report.get("weekly_crosscheck") or {}
+    if report.get("weekly_source"):
+        agg_score=report.get("weekly_aggregate_score")
+        agg_txt=f"{agg_score:.0f}/100" if agg_score is not None and pd.notna(agg_score) else "—"
+        level=str(wcheck.get("level","不可校验"))
+        source=str(report.get("weekly_source","—"))
+        if level=="高":
+            st.success(f"周线数据：{source}为主 · 日K聚合 {agg_txt} · 一致性高")
+        elif level=="中":
+            st.info(f"周线数据：{source}为主 · 日K聚合 {agg_txt} · 一致性中")
+        elif level=="低":
+            st.warning(f"周线数据：{source}为主 · 日K聚合 {agg_txt} · 一致性低，注意数据口径分歧")
+        else:
+            st.caption(f"周线数据：{source}为主 · 聚合周K暂不可校验")
+
     op=report.get("operation_strategy") or {}
     if op:
         st.markdown("### 🎯 具体操作策略")
@@ -2499,10 +2514,19 @@ def build_operation_strategy(
 
 def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_df=None,compute_ev=True):
     di=add_indicators(df)
-    wi=weekly_from_daily(df,completed_only=True)
+    agg_w=weekly_from_daily(df,completed_only=True)
+    try:
+        native_w=fetch_stock_weekly(code,years=5)
+        native_w=confirmed_native_weekly(native_w,di["trade_date"].max()) if not native_w.empty else native_w
+    except Exception:
+        native_w=pd.DataFrame()
+    wi=native_w if native_w is not None and not native_w.empty else agg_w
+    weekly_source="原生周K" if native_w is not None and not native_w.empty else "日K聚合兜底"
+    weekly_check=weekly_consistency(native_w,agg_w)
+
     if len(di)<60:
         raise RuntimeError("历史数据不足，无法计算指标")
-    if len(wi)<20:
+    if wi is None or len(wi)<20:
         raise RuntimeError("确认周线历史不足，无法生成中长线决策")
 
     drow=di.iloc[-1].to_dict()
@@ -2605,6 +2629,9 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
         "rs_score":rs_score,"excess20":ex20,"excess60":ex60,
         "ev":ev,"liquidity_ok":liq_ok,"amount20":amount20,
         "risk_price":risk_price,"target_price":target_price,
+        "weekly_source":weekly_source,
+        "weekly_crosscheck":weekly_check,
+        "weekly_aggregate_score":weekly_check.get("aggregate_score",np.nan),
         "operation_strategy":operation_strategy,
         "daily":{
             "boll_mid_direction":boll_dir,"price_vs_mid":pos_txt,
@@ -2616,7 +2643,13 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
         },
         "boll_analysis":f"中轨{boll_dir}，收盘{drow.get('close',np.nan):.2f}，中轨{mid:.2f}。" if pd.notna(mid) else "",
         "macd_analysis":f"DIF {drow.get('dif',np.nan):.3f}，DEA {drow.get('dea',np.nan):.3f}，{cross}。",
-        "weekly_analysis":f"已确认周线技术分 {weekly:.0f}/100；未完成本周K不用于硬性决策。",
+        "weekly_analysis":(
+            f"{weekly_source}主评分 {weekly:.0f}/100；"
+            f"日K聚合校验 {weekly_check.get('aggregate_score',np.nan):.0f}/100；"
+            f"一致性 {weekly_check.get('level','不可校验')}。"
+            if pd.notna(weekly_check.get("aggregate_score",np.nan))
+            else f"{weekly_source}主评分 {weekly:.0f}/100；聚合周K暂不可校验。"
+        ),
         "resonance":f"相对强度{rs_score}/100；{benchmark_label_for_code(code)}环境{mkt_regime}{mkt_score}/100。",
         "data_source":data_source_for_code(code),"market":market_of_code(code),
         "benchmark":benchmark_label_for_code(code),"adjustment":"前复权",
@@ -3784,7 +3817,7 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     policy=automatic_entry_policy(mkt_score)
     stats={
         "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
-        "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"数据异常":0
+        "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"周线低一致性":0,"数据异常":0
     }
     total_codes=len(codes)
 
@@ -3807,10 +3840,20 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
 
             name=name_map.get(code) or stock_basic_name(code)
             di=add_indicators(d)
-            wi=weekly_from_daily(d,completed_only=True)
-            if wi.empty:
+            agg_w=weekly_from_daily(d,completed_only=True)
+            try:
+                native_w=fetch_stock_weekly(code,years=2)
+                native_w=confirmed_native_weekly(native_w,di["trade_date"].max()) if not native_w.empty else native_w
+            except Exception:
+                native_w=pd.DataFrame()
+            wi=native_w if native_w is not None and not native_w.empty else agg_w
+            weekly_source="原生周K" if native_w is not None and not native_w.empty else "日K聚合兜底"
+            weekly_check=weekly_consistency(native_w,agg_w)
+            if wi is None or wi.empty:
                 tick(i,code,name,"确认周线不足，跳过")
                 continue
+            if weekly_check.get("level")=="低":
+                stats["周线低一致性"]+=1
 
             lr=di.iloc[-1].to_dict()
             lr["macd_prev"]=di.iloc[-2]["macd"] if len(di)>1 else np.nan
@@ -3873,7 +3916,14 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 "OOS EV(R)":round(float(wf.get("OOS_EV_R")),2) if pd.notna(wf.get("OOS_EV_R")) else np.nan,
                 "OOS稳定性":wf.get("稳定性","样本不足"),
                 "机会分/100":opp,"技术分/100":technical,"买点分/100":buy_score,
-                "周线/100":weekly,"盈亏比":rr,
+                "周线/100":weekly,
+                "聚合周线/100":(
+                    round(float(weekly_check.get("aggregate_score")),1)
+                    if pd.notna(weekly_check.get("aggregate_score",np.nan)) else np.nan
+                ),
+                "周线一致性":weekly_check.get("level","不可校验"),
+                "周线来源":weekly_source,
+                "盈亏比":rr,
                 "大盘":f"{mkt_regime} {mkt_score}/100","_market_score":mkt_score,
                 "相对强度/100":rs_score,
                 "20日超额":f"{ex20:.1%}" if pd.notna(ex20) else "—",
