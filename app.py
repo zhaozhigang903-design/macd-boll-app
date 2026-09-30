@@ -6925,15 +6925,39 @@ with tab1:
             if not auto_code.strip():
                 st.error("请输入A股或港股代码/名称。")
             else:
-                with st.spinner("正在获取行情并计算日线/周线、EV与操作策略..."):
+                with st.spinner("正在快速读取当前结构；历史EV如未缓存会转后台更新..."):
+                    t0=time.perf_counter()
+                    bs_open=False
                     try:
-                        bs_login()
+                        if not ifind_configured():
+                            bs_open=bool(bs_login(retries=1,strict=False))
                         code,name=resolve_symbol_input(auto_code)
-                        df_auto=fetch_stock_daily(code,years=5)
-                        benchmark_df=fetch_benchmark_for_code(code,years=5)
+
+                        if ifind_configured():
+                            prefetch_ifind_analysis_bundle(
+                                code,daily_years=2,weekly_years=3
+                            )
+
+                        df_auto=fetch_stock_daily(code,years=2)
+                        benchmark_df=fetch_benchmark_for_code(code,years=2)
+                        try:
+                            native_weekly=fetch_stock_weekly(code,years=3)
+                        except Exception:
+                            native_weekly=None
+
+                        ev_cached,ev_age=get_recent_cached_ev(code,max_age_days=7)
                         report=deterministic_report(
-                            code,name,df_auto,auto_position,auto_fund,benchmark_df
+                            code,name,df_auto,auto_position,auto_fund,benchmark_df,
+                            compute_ev=False,
+                            native_weekly_df=native_weekly,
+                            ev_override=ev_cached
                         )
+                        report["ev_cache_age_days"]=ev_age
+                        if ev_cached is None and report.get("opportunity_label")!="不通过":
+                            started=start_analysis_ev_background(code)
+                            report["ev_pending"]=bool(started or analysis_ev_running(code))
+
+                        report["analysis_seconds"]=round(time.perf_counter()-t0,2)
                         prev=previous(report["symbol"])
                         if prev and prev.get("score") is not None:
                             try:
@@ -6949,8 +6973,11 @@ with tab1:
                     except Exception as e:
                         st.error(f"自动分析失败：{e}")
                     finally:
-                        try: bs_logout_safe()
-                        except Exception: pass
+                        try:
+                            if bs_open:
+                                bs_logout_safe()
+                        except Exception:
+                            pass
 
         st.divider()
         st.subheader("当前分析结果")
