@@ -316,6 +316,92 @@ def basic_names(app_codes):
     return out
 
 
+
+def _flatten_generic_response(obj):
+    """Best-effort conversion of iFinD HTTP table/data responses to one DataFrame."""
+    frames=[]
+    for entry in _table_entries(obj):
+        code=entry.get("thscode") or entry.get("code") or entry.get("THSCODE")
+        table=entry.get("table") or entry.get("data") or {}
+        if isinstance(table,dict):
+            lengths=[
+                len(v) for v in table.values()
+                if isinstance(v,(list,tuple,np.ndarray,pd.Series))
+            ]
+            n=max(lengths) if lengths else 1
+            frame=pd.DataFrame({k:_as_list(v,n) for k,v in table.items()})
+        elif isinstance(table,list):
+            try:
+                frame=pd.DataFrame(table)
+            except Exception:
+                continue
+        else:
+            continue
+        if code and "thscode" not in [str(x).lower() for x in frame.columns]:
+            frame["thscode"]=str(code)
+        if not frame.empty:
+            frames.append(frame)
+
+    if frames:
+        return pd.concat(frames,ignore_index=True,sort=False)
+
+    data=obj.get("data")
+    if isinstance(data,list):
+        try:
+            return pd.json_normalize(data)
+        except Exception:
+            pass
+    if isinstance(data,dict):
+        # Some HTTP functions return {column:[...], ...}.
+        try:
+            lengths=[
+                len(v) for v in data.values()
+                if isinstance(v,(list,tuple,np.ndarray,pd.Series))
+            ]
+            n=max(lengths) if lengths else 1
+            return pd.DataFrame({k:_as_list(v,n) for k,v in data.items()})
+        except Exception:
+            pass
+
+    # WCQuery may expose thscode/indicators/data at top level.
+    codes=obj.get("thscode")
+    raw=obj.get("data")
+    if codes is not None and raw is not None:
+        try:
+            frame=pd.DataFrame(raw)
+            code_list=_as_list(codes,len(frame))
+            if len(code_list)==len(frame):
+                frame["thscode"]=code_list
+            return frame
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def smart_stock_picking(query):
+    """Run one iFinD/WenCai stock query and return a normalized DataFrame."""
+    if not configured():
+        raise RuntimeError("iFind未配置")
+    payload={"searchstring":str(query),"searchtype":"stock"}
+    obj=_post("/api/v1/smart_stock_picking",payload,timeout=35,retries=2)
+    return _flatten_generic_response(obj)
+
+
+def basic_data_many(app_codes, indicator_specs):
+    """
+    Generic iFinD basic-data request.
+    indicator_specs: [{"indicator":"...", "indiparams":[...]}]
+    """
+    if not configured():
+        raise RuntimeError("iFind未配置")
+    app_codes=[str(x) for x in app_codes if str(x).strip()]
+    if not app_codes:
+        return pd.DataFrame()
+    ths_codes=[_to_ifind_code(x) for x in app_codes]
+    payload={"codes":",".join(ths_codes),"indipara":indicator_specs}
+    obj=_post("/api/v1/basic_data_service",payload,timeout=25,retries=2)
+    return _flatten_generic_response(obj)
+
 def status(test_data=False):
     if not configured():
         return {"configured": False, "ok": False, "message": "未配置 IFIND_REFRESH_TOKEN"}
