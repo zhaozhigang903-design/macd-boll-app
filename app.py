@@ -4545,9 +4545,12 @@ def midlong_composite_score(
     )
     return round(float(np.clip(score,0,100)),1)
 
-def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
+def screen_codes(
+    codes,name_map=None,benchmark_df=None,progress_callback=None,factor_map=None
+):
     rows=[]
     name_map=name_map or {}
+    factor_map=factor_map or {}
     benchmark_df=benchmark_df if benchmark_df is not None else pd.DataFrame()
     benchmark_features=market_score_series(benchmark_df) if not benchmark_df.empty else pd.DataFrame()
     if benchmark_features is not None and not benchmark_features.empty:
@@ -4557,19 +4560,21 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
         mkt_score,mkt_regime=(50,"未知")
     policy=automatic_entry_policy(mkt_score)
     stats={
-        "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
-        "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"周线低一致性":0,"数据异常":0
+        "扫描":0,"粗筛通过":0,"快速初筛通过":0,
+        "优先机会":0,"候选观察":0,"EV阶段":0,"EV缓存命中":0,
+        "流动性不足":0,"周线低一致性":0,"基本面覆盖":0,"数据异常":0
     }
     total_codes=len(codes)
 
+    # 阶段0：一次批量拉取当前筛选所需的1年日K，避免逐股网络请求。
     if ifind_configured() and total_codes:
         try:
-            pf=prefetch_ifind_daily(codes,years=1)
-            stats["iFinD批量预取"]=int(pf.get("saved",0) or 0)
-            stats["iFinD预取异常"]=len(pf.get("errors",[]) or [])
+            pf=prefetch_ifind_daily(codes,years=1,batch_size=20)
+            stats["iFinD日K预取"]=int(pf.get("saved",0) or 0)
+            stats["iFinD日K异常"]=len(pf.get("errors",[]) or [])
         except Exception:
-            stats["iFinD批量预取"]=0
-            stats["iFinD预取异常"]=1
+            stats["iFinD日K预取"]=0
+            stats["iFinD日K异常"]=1
 
     def tick(i,code,name,stage):
         if progress_callback is not None:
@@ -4578,21 +4583,22 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             except Exception:
                 pass
 
+    # 阶段1：只做便宜的1年日K + 聚合周K结构筛选。
+    coarse=[]
     for i,code in enumerate(codes,start=1):
         name=name_map.get(code) or display_code(code)
         try:
-            tick(i-1,code,name,"读取行情")
+            tick(i-1,code,name,"快速结构预筛")
             d=fetch_stock_daily(code,years=1)
             stats["扫描"]+=1
             if len(d)<150:
                 tick(i,code,name,"历史不足，跳过")
                 continue
 
-            name=name_map.get(code) or display_code(code)
             di=add_indicators(d)
             agg_w=weekly_from_daily(d,completed_only=True)
-            if agg_w is None or agg_w.empty:
-                tick(i,code,name,"聚合周线不足，跳过")
+            if di.empty or agg_w is None or agg_w.empty:
+                tick(i,code,name,"技术数据不足，跳过")
                 continue
 
             lr=di.iloc[-1].to_dict()
@@ -4606,11 +4612,13 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 tick(i,code,name,"流动性不足")
                 continue
 
-            rs_score,ex20,ex60=relative_strength(d,benchmark_df) if not benchmark_df.empty else (50,np.nan,np.nan)
-            agg_opp=opportunity_score(agg_technical,buy_score,rr,None,mkt_score,rs_score)
-
-            # 第一层只用已在内存中的日K+聚合周K做“宽松预筛”。
-            # 原生周K仍是最终周线依据，但只为有可能入选的股票请求，避免全市场逐只额外网络请求。
+            rs_score,ex20,ex60=(
+                relative_strength(d,benchmark_df)
+                if not benchmark_df.empty else (50,np.nan,np.nan)
+            )
+            agg_opp=opportunity_score(
+                agg_technical,buy_score,rr,None,mkt_score,rs_score
+            )
             coarse_pass=(
                 agg_weekly is not None and pd.notna(rr) and
                 agg_technical>=policy["技术"]-5 and
@@ -4624,58 +4632,134 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 tick(i,code,name,"快速预筛未通过")
                 continue
 
+            stats["粗筛通过"]+=1
+            coarse.append({
+                "i":i,"code":code,"name":name,"d":d,"di":di,"agg_w":agg_w,
+                "lr":lr,"buy_score":buy_score,"rr":rr,"stop":stop,"target":target,
+                "liq_ok":liq_ok,"amount20":amount20,
+                "rs_score":rs_score,"ex20":ex20,"ex60":ex60
+            })
+        except Exception:
+            stats["数据异常"]+=1
+            tick(i,code,name,"数据异常，跳过")
+            continue
+
+    if not coarse:
+        return pd.DataFrame(),stats
+
+    # 阶段2：只有粗筛通过的股票才批量请求原生周K。
+    if ifind_configured():
+        try:
+            wp=prefetch_ifind_weekly([x["code"] for x in coarse],years=2)
+            stats["iFinD周K预取"]=int(wp.get("saved",0) or 0)
+            stats["iFinD周K异常"]=len(wp.get("errors",[]) or [])
+        except Exception:
+            stats["iFinD周K预取"]=0
+            stats["iFinD周K异常"]=1
+
+    final_candidates=[]
+    for item in coarse:
+        i=item["i"]; code=item["code"]; name=item["name"]
+        try:
+            di=item["di"]; agg_w=item["agg_w"]; lr=item["lr"]
+            buy_score=item["buy_score"]; rr=item["rr"]
             try:
                 native_w=fetch_stock_weekly(code,years=2)
-                native_w=confirmed_native_weekly(native_w,di["trade_date"].max()) if not native_w.empty else native_w
+                native_w=(
+                    confirmed_native_weekly(native_w,di["trade_date"].max())
+                    if native_w is not None and not native_w.empty else pd.DataFrame()
+                )
             except Exception:
                 native_w=pd.DataFrame()
 
             wi=native_w if native_w is not None and not native_w.empty else agg_w
-            weekly_source="原生周K" if native_w is not None and not native_w.empty else "日K聚合兜底"
+            weekly_source=(
+                "原生周K" if native_w is not None and not native_w.empty
+                else "日K聚合兜底"
+            )
             weekly_check=weekly_consistency(native_w,agg_w)
             if weekly_check.get("level")=="低":
                 stats["周线低一致性"]+=1
 
             wr=wi.iloc[-1].to_dict()
             technical,trend,momentum,weekly,confirm=numeric_score(lr,wr)
-            opp=opportunity_score(technical,buy_score,rr,None,mkt_score,rs_score)
-
-            # 第二层使用“原生周K为主”的最终结构门槛。
+            opp=opportunity_score(
+                technical,buy_score,rr,None,mkt_score,item["rs_score"]
+            )
             quick_pass=(
                 weekly is not None and pd.notna(rr) and
                 technical>=policy["技术"]-4 and
                 buy_score>=policy["买点"]-4 and
                 weekly>=policy["周线"]-4 and
                 rr>=max(0.80,policy["盈亏比"]-0.20) and
-                rs_score>=policy["相对强度"]-5 and
+                item["rs_score"]>=policy["相对强度"]-5 and
                 opp>=policy["机会"]-4
             )
             if not quick_pass:
                 tick(i,code,name,"原生周K确认后未通过")
                 continue
 
-            stats["快速初筛通过"]+=1
-            stats["EV阶段"]+=1
-            tick(i-1,code,name,"计算5年真实交易EV")
+            factor=factor_map.get(normalize_code(code),{}) or {}
+            if int(factor.get("基本面覆盖",0) or 0)>=3:
+                stats["基本面覆盖"]+=1
 
-            # EV是慢变量：日常选股优先复用最近7天同规则EV。
-            # 当前技术结构仍使用当天数据；只有EV缓存缺失/过期才重跑5年历史。
-            ev,ev_cache_age=get_recent_cached_ev(code,max_age_days=7)
-            if ev is not None:
-                trades=pd.DataFrame()
-                cache_hit=True
-                stats["EV缓存命中"]+=1
+            item.update({
+                "native_w":native_w,"weekly_source":weekly_source,
+                "weekly_check":weekly_check,"technical":technical,
+                "trend":trend,"momentum":momentum,"weekly":weekly,
+                "confirm":confirm,"opp":opp,"factor":factor
+            })
+            final_candidates.append(item)
+            stats["快速初筛通过"]+=1
+            tick(i,code,name,"进入EV验证")
+        except Exception:
+            stats["数据异常"]+=1
+            tick(i,code,name,"周线确认异常，跳过")
+            continue
+
+    if not final_candidates:
+        return pd.DataFrame(),stats
+
+    # 阶段3：EV是慢变量，14天内直接复用；只有真正缺失的才批量补5年历史。
+    ev_cache={}
+    ev_miss=[]
+    for item in final_candidates:
+        ev,age=get_recent_cached_ev(item["code"],max_age_days=14)
+        if ev is not None:
+            ev_cache[item["code"]]=(ev,age)
+            stats["EV缓存命中"]+=1
+        else:
+            ev_miss.append(item["code"])
+
+    if ifind_configured() and ev_miss:
+        try:
+            ep=prefetch_ifind_daily(ev_miss,years=5,batch_size=3)
+            stats["iFinD5年预取"]=int(ep.get("saved",0) or 0)
+            stats["iFinD5年异常"]=len(ep.get("errors",[]) or [])
+        except Exception:
+            stats["iFinD5年预取"]=0
+            stats["iFinD5年异常"]=1
+
+    for item in final_candidates:
+        i=item["i"]; code=item["code"]; name=item["name"]
+        try:
+            stats["EV阶段"]+=1
+            tick(i-1,code,name,"EV验证")
+            if code in ev_cache:
+                ev,ev_cache_age=ev_cache[code]
             else:
                 hist_df=fetch_stock_daily(code,years=5)
-                ev,trades,cache_hit=realized_trade_ev(
+                ev,_,cache_hit=realized_trade_ev(
                     hist_df,benchmark_df,code,use_cache=True,
                     benchmark_features=benchmark_features
                 )
                 ev_cache_age=0.0
                 if cache_hit:
                     stats["EV缓存命中"]+=1
+
             tier,reason,policy_used=ev_opportunity_decision(
-                technical,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
+                item["technical"],item["buy_score"],item["weekly"],item["rr"],
+                mkt_score,item["rs_score"],item["opp"],ev,item["liq_ok"]
             )
             if tier=="不通过":
                 tick(i,code,name,f"未通过：{reason}")
@@ -4684,9 +4768,29 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             stats[tier]+=1
             wf=ev.get("walk_forward") or {}
             pf=ev.get("盈亏因子")
+            factor=item.get("factor") or {}
+            composite=midlong_composite_score(
+                item["technical"],item["buy_score"],item["weekly"],
+                item["rs_score"],mkt_score,ev,factor
+            )
+
             rows.append({
                 "市场":market_of_code(code),"代码":display_code(code),"名称":name,
                 "机会状态":tier,"判定说明":reason,
+                "中长线综合分/100":composite,
+                "基本面分/100":factor.get("基本面分",np.nan),
+                "质量分/100":factor.get("质量分",np.nan),
+                "成长分/100":factor.get("成长分",np.nan),
+                "估值分/100":factor.get("估值分",np.nan),
+                "财务健康/100":factor.get("财务健康分",np.nan),
+                "基本面覆盖":factor.get("基本面覆盖",0),
+                "ROE%":round(float(factor["ROE"]),1) if pd.notna(factor.get("ROE")) else np.nan,
+                "营收同比%":round(float(factor["营收同比"]),1) if pd.notna(factor.get("营收同比")) else np.nan,
+                "归母净利同比%":round(float(factor["归母净利同比"]),1) if pd.notna(factor.get("归母净利同比")) else np.nan,
+                "资产负债率%":round(float(factor["资产负债率"]),1) if pd.notna(factor.get("资产负债率")) else np.nan,
+                "PE(TTM)":round(float(factor["PE_TTM"]),1) if pd.notna(factor.get("PE_TTM")) else np.nan,
+                "PB":round(float(factor["PB"]),2) if pd.notna(factor.get("PB")) else np.nan,
+                "股息率%":round(float(factor["股息率"]),2) if pd.notna(factor.get("股息率")) else np.nan,
                 "历史净EV(R)":round(float(ev["EV_R"]),2) if pd.notna(ev.get("EV_R")) else np.nan,
                 "保守EV(R)":round(float(ev["保守EV_R"]),2) if pd.notna(ev.get("保守EV_R")) else np.nan,
                 "2倍成本EV(R)":round(float(ev["压力EV_R"]),2) if pd.notna(ev.get("压力EV_R")) else np.nan,
@@ -4695,28 +4799,35 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 "交易胜率":f"{ev.get('胜率'):.0%}" if pd.notna(ev.get("胜率")) else "—",
                 "平均盈利R":round(float(ev["平均盈利R"]),2) if pd.notna(ev.get("平均盈利R")) else np.nan,
                 "平均亏损R":round(float(ev["平均亏损R"]),2) if pd.notna(ev.get("平均亏损R")) else np.nan,
-                "盈亏因子":round(float(pf),2) if pd.notna(pf) and np.isfinite(pf) else ("∞" if pf==np.inf else np.nan),
+                "盈亏因子":(
+                    round(float(pf),2) if pd.notna(pf) and np.isfinite(pf)
+                    else ("∞" if pf==np.inf else np.nan)
+                ),
                 "OOS EV(R)":round(float(wf.get("OOS_EV_R")),2) if pd.notna(wf.get("OOS_EV_R")) else np.nan,
                 "OOS稳定性":wf.get("稳定性","样本不足"),
-                "机会分/100":opp,"技术分/100":technical,"买点分/100":buy_score,
-                "周线/100":weekly,
+                "机会分/100":item["opp"],"技术分/100":item["technical"],
+                "买点分/100":item["buy_score"],"周线/100":item["weekly"],
                 "聚合周线/100":(
-                    round(float(weekly_check.get("aggregate_score")),1)
-                    if pd.notna(weekly_check.get("aggregate_score",np.nan)) else np.nan
+                    round(float(item["weekly_check"].get("aggregate_score")),1)
+                    if pd.notna(item["weekly_check"].get("aggregate_score",np.nan))
+                    else np.nan
                 ),
-                "周线一致性":weekly_check.get("level","不可校验"),
-                "周线来源":weekly_source,
-                "盈亏比":rr,
+                "周线一致性":item["weekly_check"].get("level","不可校验"),
+                "周线来源":item["weekly_source"],"盈亏比":item["rr"],
                 "大盘":f"{mkt_regime} {mkt_score}/100","_market_score":mkt_score,
-                "相对强度/100":rs_score,
-                "20日超额":f"{ex20:.1%}" if pd.notna(ex20) else "—",
-                "60日超额":f"{ex60:.1%}" if pd.notna(ex60) else "—",
-                "20日中位成交额":round(float(amount20)/1e6,1) if pd.notna(amount20) else np.nan,
-                "趋势/100":trend,"动能/100":momentum,"量能/100":confirm,
-                "收盘":round(float(lr["close"]),2),
-                "风险位":round(float(stop),2) if pd.notna(stop) else np.nan,
-                "参考压力":round(float(target),2) if pd.notna(target) else np.nan,
-                "信号日":pd.Timestamp(di.iloc[-1]["trade_date"]).strftime("%Y-%m-%d"),
+                "相对强度/100":item["rs_score"],
+                "20日超额":f"{item['ex20']:.1%}" if pd.notna(item["ex20"]) else "—",
+                "60日超额":f"{item['ex60']:.1%}" if pd.notna(item["ex60"]) else "—",
+                "20日中位成交额":(
+                    round(float(item["amount20"])/1e6,1)
+                    if pd.notna(item["amount20"]) else np.nan
+                ),
+                "趋势/100":item["trend"],"动能/100":item["momentum"],
+                "量能/100":item["confirm"],
+                "收盘":round(float(item["lr"]["close"]),2),
+                "风险位":round(float(item["stop"]),2) if pd.notna(item["stop"]) else np.nan,
+                "参考压力":round(float(item["target"]),2) if pd.notna(item["target"]) else np.nan,
+                "信号日":pd.Timestamp(item["di"].iloc[-1]["trade_date"]).strftime("%Y-%m-%d"),
                 "系统规则":(
                     f"技≥{policy_used['技术']} / 买≥{policy_used['买点']} / "
                     f"周≥{policy_used['周线']} / RR≥{policy_used['盈亏比']:.2f} / "
@@ -4726,7 +4837,7 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             tick(i,code,name,f"发现{tier}")
         except Exception:
             stats["数据异常"]+=1
-            tick(i,code,name,"数据异常，跳过")
+            tick(i,code,name,"EV异常，跳过")
             continue
 
     if not rows:
@@ -4735,11 +4846,12 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     out=pd.DataFrame(rows)
     tier_order={"优先机会":0,"候选观察":1}
     out["_tier"]=out["机会状态"].map(tier_order).fillna(9)
+    out["_composite"]=pd.to_numeric(out["中长线综合分/100"],errors="coerce").fillna(-999)
     out["_evsort"]=pd.to_numeric(out["保守EV(R)"],errors="coerce").fillna(-999)
     out=out.sort_values(
-        ["_tier","_evsort","历史净EV(R)","技术分/100"],
+        ["_tier","_composite","_evsort","历史净EV(R)"],
         ascending=[True,False,False,False]
-    ).drop(columns=["_tier","_evsort"]).reset_index(drop=True)
+    ).drop(columns=["_tier","_composite","_evsort"]).reset_index(drop=True)
     save_forward_candidates(out)
     return out,stats
 
