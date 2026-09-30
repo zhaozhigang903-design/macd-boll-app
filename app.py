@@ -1989,6 +1989,43 @@ def prefetch_ifind_daily(codes,years=1):
             errors.append(str(ex))
     return {"requested":len(need),"saved":saved,"errors":errors}
 
+def prefetch_ifind_weekly(codes,years=3):
+    if not ifind_configured():
+        return {"requested":0,"saved":0,"errors":[]}
+    clean=[normalize_code(x) for x in codes if normalize_code(x)]
+    clean=list(dict.fromkeys(clean))
+    if not clean:
+        return {"requested":0,"saved":0,"errors":[]}
+    end=datetime.now().strftime("%Y-%m-%d")
+    start=(pd.Timestamp.today()-pd.Timedelta(days=365*int(years)+240)).strftime("%Y-%m-%d")
+    need=[]
+    current_week_start=(
+        pd.Timestamp.today().normalize()-pd.Timedelta(days=pd.Timestamp.today().weekday())
+    ).strftime("%Y-%m-%d")
+    for code in clean:
+        flag=market_cache_flag(code,"weekly")
+        cmin,cmax,_=_cache_bounds(code,flag)
+        if not cmin or not cmax or cmin>start or str(cmax)<current_week_start:
+            need.append(code)
+    if not need:
+        return {"requested":0,"saved":0,"errors":[]}
+
+    saved=0
+    errors=[]
+    for pos in range(0,len(need),20):
+        batch=need[pos:pos+20]
+        try:
+            got=ifind_history_many(batch,start,end,interval="W",cps=2)
+            for code,df in got.items():
+                if df is None or df.empty:
+                    continue
+                _save_daily_cache(df,code,market_cache_flag(code,"weekly"))
+                saved+=1
+        except Exception as ex:
+            errors.append(str(ex))
+    return {"requested":len(need),"saved":saved,"errors":errors}
+
+
 def prefetch_ifind_analysis_bundle(code,daily_years=2,weekly_years=3):
     """Warm stock daily + A-share benchmark daily + native weekly in at most two parallel iFinD calls."""
     if not ifind_configured():
