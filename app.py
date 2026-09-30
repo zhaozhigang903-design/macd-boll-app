@@ -2123,19 +2123,192 @@ def add_indicators(df):
     d["ret60"]=close/close.shift(60)-1
     return d
 
-def weekly_from_daily(df,completed_only=True):
+def _download_a_weekly_ak(code,start,end):
+    symbol=display_code(code)
+    s=str(start).replace("-","")
+    e=str(end).replace("-","")
+    errors=[]
+    getters=[
+        ("东财A股周K",lambda: ak.stock_zh_a_hist(
+            symbol=symbol,period="weekly",start_date=s,end_date=e,adjust="qfq"
+        )),
+        ("新浪A股周K",lambda: ak.stock_zh_a_daily(
+            symbol=("sh"+symbol if code.startswith("sh.") else "sz"+symbol),
+            start_date=start,end_date=end,adjust="qfq"
+        ))
+    ]
+    for label,getter in getters:
+        try:
+            raw=getter()
+            if label.startswith("新浪") and raw is not None and not raw.empty:
+                # 新浪接口通常给日K；作为最后兜底时本地聚合为周K。
+                daily=_normalize_a_history(raw,code)
+                if not daily.empty:
+                    return weekly_from_daily(daily,completed_only=True,with_indicators=False)
+            df=_normalize_a_history(raw,code)
+            if not df.empty:
+                mask=(df["trade_date"]>=pd.Timestamp(start))&(df["trade_date"]<=pd.Timestamp(end))
+                out=df.loc[mask].reset_index(drop=True)
+                if not out.empty:
+                    return out
+        except Exception as ex:
+            errors.append(f"{label}:{ex}")
+    raise RuntimeError("AKShare A股周K失败："+"；".join(errors[-2:]))
+
+def _download_a_weekly(code,start,end):
+    if start>end:
+        return pd.DataFrame()
+    bs_error=None
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            fields="date,code,open,high,low,close,volume,amount,pctChg,turn"
+            rs=bs.query_history_k_data_plus(
+                code,fields,start_date=start,end_date=end,frequency="w",adjustflag="2"
+            )
+            if getattr(rs,"error_code","0")!="0":
+                raise RuntimeError(getattr(rs,"error_msg","BaoStock返回错误"))
+            df=_rs_to_df(rs)
+            if not df.empty:
+                df=df.rename(columns={"date":"trade_date","volume":"vol"})
+                for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+                    if col in df.columns:
+                        df[col]=pd.to_numeric(df[col],errors="coerce")
+                df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
+                df["tradestatus"]="1"; df["isST"]=""
+                df=sanitize_daily(df)
+                if not df.empty:
+                    return df.sort_values("trade_date").reset_index(drop=True)
+        except Exception as ex:
+            bs_error=ex
+    try:
+        return _download_a_weekly_ak(code,start,end)
+    except Exception as ak_ex:
+        raise RuntimeError(
+            f"A股周K双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
+        )
+
+def _download_hk_weekly(code,start,end):
+    symbol=display_code(code).zfill(5)
+    s=str(start).replace("-","")
+    e=str(end).replace("-","")
+    errors=[]
+    try:
+        raw=ak.stock_hk_hist(
+            symbol=symbol,period="weekly",start_date=s,end_date=e,adjust="qfq"
+        )
+        df=_normalize_hk_history(raw,code)
+        if not df.empty:
+            return df.reset_index(drop=True)
+    except Exception as ex:
+        errors.append(f"东财港股周K:{ex}")
+    try:
+        daily=_download_hk_daily(code,start,end)
+        if not daily.empty:
+            return weekly_from_daily(daily,completed_only=True,with_indicators=False)
+    except Exception as ex:
+        errors.append(f"港股日K聚合兜底:{ex}")
+    raise RuntimeError("港股周K获取失败："+"；".join(errors[-2:]))
+
+def fetch_stock_weekly(code,years=5):
+    code=normalize_code(code)
+    end=datetime.now().strftime("%Y-%m-%d")
+    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+240)).strftime("%Y-%m-%d")
+    flag="hk_w_qfq" if code.startswith("hk.") else "w2"
+    cache_min,cache_max,last_checked=_cache_bounds(code,flag)
+
+    if not cache_min or not cache_max:
+        fresh=_download_hk_weekly(code,start,end) if code.startswith("hk.") else _download_a_weekly(code,start,end)
+        _save_daily_cache(fresh,code,flag)
+    else:
+        if start<cache_min:
+            pre_end=(pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            older=_download_hk_weekly(code,start,pre_end) if code.startswith("hk.") else _download_a_weekly(code,start,pre_end)
+            _save_daily_cache(older,code,flag)
+        # 周K不需要盘中反复刷新；若缓存最后周早于当前周，则尝试补齐。
+        current_week_start=(pd.Timestamp.today().normalize()-pd.Timedelta(days=pd.Timestamp.today().weekday())).strftime("%Y-%m-%d")
+        if str(cache_max)<current_week_start:
+            next_start=(pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            newer=_download_hk_weekly(code,next_start,end) if code.startswith("hk.") else _download_a_weekly(code,next_start,end)
+            _save_daily_cache(newer,code,flag)
+
+    out=_read_daily_cache(code,start,end,flag)
+    return add_indicators(out) if out is not None and not out.empty else pd.DataFrame()
+
+def weekly_consistency(native_weekly,aggregated_weekly):
+    if native_weekly is None or native_weekly.empty or aggregated_weekly is None or aggregated_weekly.empty:
+        return {
+            "level":"不可校验","score_gap":np.nan,"close_gap_pct":np.nan,
+            "direction_match":False,"native_score":np.nan,"aggregate_score":np.nan
+        }
+    nw=native_weekly.copy().sort_values("trade_date")
+    aw=aggregated_weekly.copy().sort_values("trade_date")
+    # 仅比较双方都已经出现的最近完成周，避免日期标签差异造成错配。
+    merged=pd.merge_asof(
+        nw[["trade_date","close","boll_slope","dif","dea"]].sort_values("trade_date"),
+        aw[["trade_date","close","boll_slope","dif","dea"]].sort_values("trade_date"),
+        on="trade_date",direction="nearest",tolerance=pd.Timedelta(days=4),
+        suffixes=("_native","_agg")
+    ).dropna(subset=["close_agg"])
+    if merged.empty:
+        return {
+            "level":"不可校验","score_gap":np.nan,"close_gap_pct":np.nan,
+            "direction_match":False,"native_score":np.nan,"aggregate_score":np.nan
+        }
+    r=merged.iloc[-1]
+    nrow={
+        "boll_slope":r["boll_slope_native"],"close":r["close_native"],
+        "boll_mid":nw.iloc[-1].get("boll_mid",np.nan),
+        "dif":r["dif_native"],"dea":r["dea_native"]
+    }
+    arow={
+        "boll_slope":r["boll_slope_agg"],"close":r["close_agg"],
+        "boll_mid":aw.iloc[-1].get("boll_mid",np.nan),
+        "dif":r["dif_agg"],"dea":r["dea_agg"]
+    }
+    # 周线子分只依赖周线结构；用一个中性的日线占位，仅取numeric_score返回的weekly分。
+    dummy={"boll_slope":0,"close":1,"boll_mid":1,"boll_up":1.1,"boll_low":0.9,
+           "dif":0,"dea":0,"macd":0,"dif_slope":0,"vol":1,"vol_ma5":1,"vol_ma10":1,"ret1":0}
+    ns=numeric_score(dummy,nrow)[3]
+    ag=numeric_score(dummy,arow)[3]
+    close_gap=abs(float(r["close_native"])-float(r["close_agg"]))/max(abs(float(r["close_native"])),1e-9)
+    dir_match=(
+        np.sign(float(r["boll_slope_native"]) if pd.notna(r["boll_slope_native"]) else 0)==
+        np.sign(float(r["boll_slope_agg"]) if pd.notna(r["boll_slope_agg"]) else 0)
+    )
+    gap=abs(float(ns)-float(ag)) if pd.notna(ns) and pd.notna(ag) else np.nan
+    if pd.notna(gap) and gap<=5 and close_gap<=0.005 and dir_match:
+        level="高"
+    elif pd.notna(gap) and gap<=10 and close_gap<=0.015:
+        level="中"
+    else:
+        level="低"
+    return {
+        "level":level,"score_gap":gap,"close_gap_pct":close_gap,
+        "direction_match":bool(dir_match),"native_score":ns,"aggregate_score":ag
+    }
+
+def weekly_from_daily(df,completed_only=True,with_indicators=True):
     if df is None or df.empty:
         return pd.DataFrame()
-    src=df.copy().sort_values("trade_date")
+    src=df.copy().sort_values("trade_date").reset_index(drop=True)
+    src["trade_date"]=pd.to_datetime(src["trade_date"],errors="coerce")
+    src=src.dropna(subset=["trade_date","close"])
+    if src.empty:
+        return pd.DataFrame()
     latest_daily=pd.Timestamp(src["trade_date"].max()).normalize()
-    d=src.set_index("trade_date")
-    agg={"open":"first","high":"max","low":"min","close":"last","vol":"sum"}
-    if "amount" in d.columns:
+    src["_week"]=src["trade_date"].dt.to_period("W-FRI")
+    agg={"trade_date":"max","open":"first","high":"max","low":"min","close":"last","vol":"sum"}
+    if "amount" in src.columns:
         agg["amount"]="sum"
-    w=d.resample("W-FRI").agg(agg).dropna(subset=["close"]).reset_index()
+    w=src.groupby("_week",as_index=False).agg(agg).dropna(subset=["close"])
     if completed_only and not w.empty:
-        w=w[pd.to_datetime(w["trade_date"]).dt.normalize()<=latest_daily]
-    return add_indicators(w.reset_index(drop=True))
+        # 常规情况下只有周五收盘后才把本周视为确认周；历史周天然保留。
+        latest_period=latest_daily.to_period("W-FRI")
+        current_mask=w["_week"]==latest_period
+        if current_mask.any() and latest_daily.weekday()!=4:
+            w=w[~current_mask]
+    w=w.drop(columns=["_week"],errors="ignore").reset_index(drop=True)
+    return add_indicators(w) if with_indicators else sanitize_daily(w)
 
 def numeric_score(latest_d,latest_w=None):
     trend=0
