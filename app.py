@@ -11,6 +11,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,16 @@ else:
 DATA_DIR = Path(os.getenv("MACD_DATA_DIR", str(_default_data_dir))).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = Path(os.getenv("MACD_LOCAL_DB_PATH", str(DATA_DIR / "analysis_history.db"))).expanduser()
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+def bj_now():
+    """Naive Beijing wall-clock time for DB/UI timestamps."""
+    return datetime.now(BEIJING_TZ).replace(tzinfo=None)
+
+def bj_ts():
+    """Naive pandas Timestamp in Beijing time."""
+    return pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
 
 RULE_VERSION = "EV1.1-WEEKLY-NATIVE-2026-09-30"
 _SCREENER_THREADS = {}
@@ -867,7 +878,7 @@ def init_db():
         """INSERT OR IGNORE INTO screener_settings(
            id,auto_daily,universe,exclude_st,batch_size,run_after_hour,updated_at
         ) VALUES(1,1,'中证500',1,100,18,?)""",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),)
+        (bj_now().strftime("%Y-%m-%d %H:%M:%S"),)
     )
     fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
     if "rule_version" not in fcols:
@@ -915,7 +926,7 @@ def save_cached_extraction(signature, payload, raw_result):
            VALUES(?,?,?,?)""",
         (
             signature,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            bj_now().strftime("%Y-%m-%d %H:%M:%S"),
             json.dumps(payload, ensure_ascii=False, separators=(",",":")),
             raw_result
         )
@@ -1130,7 +1141,7 @@ def save_result(meta, x, metrics, raw):
       price,boll_mid,data_quality,key_support,key_resistance,model_mode,weekly_used,raw_result
     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+      bj_now().strftime("%Y-%m-%d %H:%M:%S"),
       meta["symbol"], meta["market"], meta["horizon"], meta["position_state"],
       meta["rating"], meta["state"], meta["stage"], score, trend, momentum,
       weekly, confirm, meta["confidence"],
@@ -1694,7 +1705,7 @@ def _cache_bounds(code, adjustflag="2"):
 def _save_daily_cache(df, code, adjustflag="2"):
     if df is None or df.empty:
         return
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = bj_now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     for _,r in df.iterrows():
         rows.append((
@@ -1970,8 +1981,8 @@ def prefetch_ifind_daily(codes,years=1):
     clean=[normalize_code(x) for x in codes if normalize_code(x)]
     if not clean:
         return {"requested":0,"saved":0,"errors":[]}
-    end=datetime.now().strftime("%Y-%m-%d")
-    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    end=bj_now().strftime("%Y-%m-%d")
+    start=(bj_ts()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
     need=[]
     for code in clean:
         flag=market_cache_flag(code,"daily")
@@ -2003,11 +2014,11 @@ def prefetch_ifind_weekly(codes,years=3):
     clean=list(dict.fromkeys(clean))
     if not clean:
         return {"requested":0,"saved":0,"errors":[]}
-    end=datetime.now().strftime("%Y-%m-%d")
-    start=(pd.Timestamp.today()-pd.Timedelta(days=365*int(years)+240)).strftime("%Y-%m-%d")
+    end=bj_now().strftime("%Y-%m-%d")
+    start=(bj_ts()-pd.Timedelta(days=365*int(years)+240)).strftime("%Y-%m-%d")
     need=[]
     current_week_start=(
-        pd.Timestamp.today().normalize()-pd.Timedelta(days=pd.Timestamp.today().weekday())
+        bj_ts().normalize()-pd.Timedelta(days=bj_ts().weekday())
     ).strftime("%Y-%m-%d")
     for code in clean:
         flag=market_cache_flag(code,"weekly")
@@ -2039,9 +2050,9 @@ def prefetch_ifind_analysis_bundle(code,daily_years=2,weekly_years=3):
         return {"daily_saved":0,"weekly_saved":0,"errors":[]}
 
     code=normalize_code(code)
-    end=datetime.now().strftime("%Y-%m-%d")
-    dstart=(pd.Timestamp.today()-pd.Timedelta(days=365*int(daily_years)+180)).strftime("%Y-%m-%d")
-    wstart=(pd.Timestamp.today()-pd.Timedelta(days=365*int(weekly_years)+240)).strftime("%Y-%m-%d")
+    end=bj_now().strftime("%Y-%m-%d")
+    dstart=(bj_ts()-pd.Timedelta(days=365*int(daily_years)+180)).strftime("%Y-%m-%d")
+    wstart=(bj_ts()-pd.Timedelta(days=365*int(weekly_years)+240)).strftime("%Y-%m-%d")
     errors=[]
     daily_saved=0
     weekly_saved=0
@@ -2062,7 +2073,7 @@ def prefetch_ifind_analysis_bundle(code,daily_years=2,weekly_years=3):
     wflag=market_cache_flag(code,"weekly")
     wmin,wmax,_=_cache_bounds(code,wflag)
     current_week_start=(
-        pd.Timestamp.today().normalize()-pd.Timedelta(days=pd.Timestamp.today().weekday())
+        bj_ts().normalize()-pd.Timedelta(days=bj_ts().weekday())
     ).strftime("%Y-%m-%d")
     need_weekly=(not wmin or not wmax or wmin>wstart or str(wmax)<current_week_start)
 
@@ -2105,8 +2116,8 @@ def prefetch_ifind_analysis_bundle(code,daily_years=2,weekly_years=3):
 
 def fetch_stock_daily(code,years=3):
     code=normalize_code(code)
-    end=datetime.now().strftime("%Y-%m-%d")
-    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    end=bj_now().strftime("%Y-%m-%d")
+    start=(bj_ts()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
     cache_flag=market_cache_flag(code,"daily")
     cache_min,cache_max,last_checked=_cache_bounds(code,cache_flag)
 
@@ -2241,8 +2252,8 @@ def _download_index_daily(code,start,end):
     raise RuntimeError("指数历史多源失败："+"；".join(errors[-3:]))
 
 def fetch_benchmark_daily(years=5,code="sh.000300"):
-    end=datetime.now().strftime("%Y-%m-%d")
-    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    end=bj_now().strftime("%Y-%m-%d")
+    start=(bj_ts()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
     flag=market_cache_flag(code,"index")
     cache_min,cache_max,last_checked=_cache_bounds(code,flag)
 
@@ -2341,10 +2352,10 @@ def _download_hk_benchmark(start,end):
 def fetch_hk_benchmark_daily(years=5):
     key = "hkidx.HSI"
     flag = "index"
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    end = bj_now().strftime("%Y-%m-%d")
+    start = (bj_ts()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
     cache_min,cache_max,last_checked = _cache_bounds(key,flag)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = bj_now().strftime("%Y-%m-%d")
     if not cache_min or not cache_max:
         fresh = _download_hk_benchmark(start,end)
         _save_daily_cache(fresh,key,flag)
@@ -2546,8 +2557,8 @@ def _download_hk_weekly(code,start,end):
 
 def fetch_stock_weekly(code,years=5):
     code=normalize_code(code)
-    end=datetime.now().strftime("%Y-%m-%d")
-    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+240)).strftime("%Y-%m-%d")
+    end=bj_now().strftime("%Y-%m-%d")
+    start=(bj_ts()-pd.Timedelta(days=365*years+240)).strftime("%Y-%m-%d")
     flag=market_cache_flag(code,"weekly")
     cache_min,cache_max,last_checked=_cache_bounds(code,flag)
 
@@ -2560,7 +2571,7 @@ def fetch_stock_weekly(code,years=5):
             older=_download_hk_weekly(code,start,pre_end) if code.startswith("hk.") else _download_a_weekly(code,start,pre_end)
             _save_daily_cache(older,code,flag)
         # 周K不需要盘中反复刷新；若缓存最后周早于当前周，则尝试补齐。
-        current_week_start=(pd.Timestamp.today().normalize()-pd.Timedelta(days=pd.Timestamp.today().weekday())).strftime("%Y-%m-%d")
+        current_week_start=(bj_ts().normalize()-pd.Timedelta(days=bj_ts().weekday())).strftime("%Y-%m-%d")
         if str(cache_max)<current_week_start:
             next_start=(pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             newer=_download_hk_weekly(code,next_start,end) if code.startswith("hk.") else _download_a_weekly(code,next_start,end)
@@ -2969,7 +2980,7 @@ def deterministic_report(
     )
 
     return {
-        "updated_at":datetime.now().strftime("%m-%d %H:%M"),
+        "updated_at":bj_now().strftime("%m-%d %H:%M"),
         "symbol":f"{name} / {display_code(code)}",
         "state":state,"rating":rating,"stage":stage,"state_reason":reason,
         "score":score,"trend":trend,"momentum":momentum,"weekly_score":weekly,
@@ -3055,8 +3066,8 @@ def persist_analysis_report(report,code,horizon,position_state):
     )
 
 def latest_trade_date():
-    end=pd.Timestamp.today().strftime("%Y-%m-%d")
-    start=(pd.Timestamp.today()-pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    end=bj_ts().strftime("%Y-%m-%d")
+    start=(bj_ts()-pd.Timedelta(days=45)).strftime("%Y-%m-%d")
     if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
         try:
             rs=bs.query_trade_dates(start_date=start,end_date=end)
@@ -4056,7 +4067,7 @@ def get_cached_ev(df,benchmark_df,code):
 
 def get_recent_cached_ev(code,max_age_days=7):
     code=normalize_code(code)
-    cutoff=(datetime.now()-pd.Timedelta(days=int(max_age_days))).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff=(bj_now()-pd.Timedelta(days=int(max_age_days))).strftime("%Y-%m-%d %H:%M:%S")
     conn=sqlite3.connect(DB_PATH)
     row=conn.execute(
         """SELECT payload,updated_at,stock_date,benchmark_date
@@ -4087,7 +4098,7 @@ def save_cached_ev(df,benchmark_df,code,ev):
         """INSERT OR REPLACE INTO ev_cache(
            code,stock_date,benchmark_date,rule_version,payload,updated_at
         ) VALUES(?,?,?,?,?,?)""",
-        (*key,payload,datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        (*key,payload,bj_now().strftime("%Y-%m-%d %H:%M:%S"))
     )
     conn.commit()
     conn.close()
@@ -4221,12 +4232,12 @@ def ev_opportunity_decision(technical,buy_score,weekly,rr,market_score,rs_score,
 def save_forward_candidates(df):
     if df is None or df.empty:
         return
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     conn=sqlite3.connect(DB_PATH)
     for _,r in df.iterrows():
         try:
             code=normalize_code(str(r.get("代码","")).strip())
-            signal_date=str(r.get("信号日") or pd.Timestamp.today().strftime("%Y-%m-%d"))
+            signal_date=str(r.get("信号日") or bj_ts().strftime("%Y-%m-%d"))
             conn.execute("""
                 INSERT INTO forward_signals(
                   code,name,market,signal_date,price,tier,technical_score,buy_score,weekly_score,
@@ -4473,7 +4484,7 @@ def _scan_json_value(v):
 def _save_screener_rows(job_id,df):
     if df is None or df.empty:
         return
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     conn=sqlite3.connect(DB_PATH)
     rows=[]
     for _,r in df.iterrows():
@@ -4538,11 +4549,11 @@ def create_screener_job(
     universe="中证500",exclude_st=True,batch_size=100,
     trade_date=None,job_type="manual"
 ):
-    trade_date=trade_date or datetime.now().strftime("%Y-%m-%d")
+    trade_date=trade_date or bj_now().strftime("%Y-%m-%d")
     job_type="scheduled" if str(job_type)=="scheduled" else "manual"
     prefix="AUTO" if job_type=="scheduled" else "MAN"
-    job_id=f"{prefix}_SCAN_"+datetime.now().strftime("%Y%m%d_%H%M%S")
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job_id=f"{prefix}_SCAN_"+bj_now().strftime("%Y%m%d_%H%M%S")
+    now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     conn=sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO screener_jobs(
@@ -4642,7 +4653,7 @@ def resume_scheduled_after_manual():
 def _update_screener_job(job_id,**kwargs):
     if not kwargs:
         return
-    kwargs["updated_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kwargs["updated_at"]=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     cols=list(kwargs.keys())
     sql="UPDATE screener_jobs SET "+",".join([f"{x}=?" for x in cols])+" WHERE job_id=?"
     vals=[kwargs[x] for x in cols]+[job_id]
@@ -4822,7 +4833,7 @@ def save_screener_settings(auto_daily,universe,exclude_st,batch_size,run_after_h
         (
             1 if auto_daily else 0,str(universe),1 if exclude_st else 0,
             int(batch_size),int(run_after_hour),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            bj_now().strftime("%Y-%m-%d %H:%M:%S")
         )
     )
     conn.commit(); conn.close()
@@ -4997,7 +5008,7 @@ def add_screener_rows_to_positions(df):
         return 0,[]
     ok = 0
     errors = []
-    now_date = pd.Timestamp.today().strftime("%Y-%m-%d")
+    now_date = bj_ts().strftime("%Y-%m-%d")
     for idx,row in df.iterrows():
         try:
             raw = str(row.get("代码","")).strip()
@@ -5028,7 +5039,7 @@ def add_screener_rows_to_positions(df):
                     (
                         float(tech),float(tech),float(tech),float(tech),
                         float(tech),float(price),mkt,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),code
+                        bj_now().strftime("%Y-%m-%d %H:%M:%S"),code
                     )
                 )
                 conn.commit(); conn.close()
@@ -5081,7 +5092,7 @@ def save_edited_positions(df):
             if pd.isna(price) or float(price)<=0:
                 raise ValueError("买入均价必须>0")
             shares = 0 if pd.isna(shares) else float(shares)
-            entry_date = str(row.get("买入日期") or "").strip() or pd.Timestamp.today().strftime("%Y-%m-%d")
+            entry_date = str(row.get("买入日期") or "").strip() or bj_ts().strftime("%Y-%m-%d")
             stop = pd.to_numeric(row.get("技术失效价"),errors="coerce")
             stop = float(stop) if pd.notna(stop) and float(stop)>0 else None
             note = str(row.get("备注") or "")
@@ -5093,7 +5104,7 @@ def save_edited_positions(df):
 
 def upsert_position(code, name, entry_date, entry_price, shares, initial_stop=None, note=""):
     code = normalize_code(code)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = bj_now().strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_PATH)
     old = conn.execute(
         "SELECT entry_score,peak_score,last_score,last_price,last_market_score,last_action,created_at FROM positions WHERE code=?",
@@ -5131,7 +5142,7 @@ def close_position(code):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "UPDATE positions SET active=0,updated_at=? WHERE code=?",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),code)
+        (bj_now().strftime("%Y-%m-%d %H:%M:%S"),code)
     )
     conn.commit()
     conn.close()
@@ -5191,7 +5202,7 @@ def import_positions_dataframe(df):
             shares = pd.to_numeric(row.get(shares_col),errors="coerce") if shares_col else 0
             shares = 0 if pd.isna(shares) else float(shares)
 
-            entry_date = pd.Timestamp.today().strftime("%Y-%m-%d")
+            entry_date = bj_ts().strftime("%Y-%m-%d")
             if date_col and pd.notna(row.get(date_col)):
                 try:
                     entry_date = pd.to_datetime(row.get(date_col)).strftime("%Y-%m-%d")
@@ -5232,7 +5243,7 @@ def refresh_positions():
 
     benchmarks = {}
     rows = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = bj_now().strftime("%Y-%m-%d %H:%M:%S")
 
     for _,p in pos.iterrows():
         code = p["code"]
@@ -5349,7 +5360,7 @@ def recent_analyses(limit=12):
     return df
 
 def _research_month_end_trade_dates(years):
-    end=pd.Timestamp.today().normalize()
+    end=bj_ts().normalize()
     start=(end-pd.DateOffset(years=int(years))-pd.DateOffset(months=1)).normalize()
     rs=bs.query_trade_dates(
         start_date=start.strftime("%Y-%m-%d"),
@@ -5399,7 +5410,7 @@ def _fetch_universe_at_date(kind,day):
 
 def _build_historical_membership(universe,years):
     market="港股" if universe=="港股主板" else "A股"
-    end=pd.Timestamp.today().normalize()
+    end=bj_ts().normalize()
 
     if market=="港股":
         # 公开免费数据源目前没有稳定的港股历史主板成分快照。
@@ -5460,10 +5471,10 @@ def create_research_run(universe,years):
         raise RuntimeError("研究股票池为空，无法创建任务。")
 
     pool=pool.drop_duplicates("code").reset_index(drop=True)
-    run_id=datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((universe,int(years),RULE_VERSION)))%10000).zfill(4)
+    run_id=bj_now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((universe,int(years),RULE_VERSION)))%10000).zfill(4)
     market="港股" if universe=="港股主板" else "A股"
     benchmark_name="恒生指数" if market=="港股" else "沪深300"
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     note=(
         "历史股票池：按月使用BaoStock历史成分/历史在市股票，显著降低幸存者偏差。"
         if membership_mode=="historical_monthly"
@@ -5553,7 +5564,7 @@ def filter_research_trades_by_membership(run_id,code,trades):
     return trades.loc[keep].reset_index(drop=True)
 
 def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     pf=ev.get("盈亏因子")
     pf_db=float(pf) if pd.notna(pf) and np.isfinite(pf) else None
     conn=sqlite3.connect(DB_PATH)
@@ -5675,7 +5686,7 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
                    WHERE run_id=?""",
                 (
                     new_cursor,status,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),run_id
+                    bj_now().strftime("%Y-%m-%d %H:%M:%S"),run_id
                 )
             )
             conn.commit(); conn.close()
@@ -6186,7 +6197,7 @@ def _strategy_experiment_period(run_id):
         start=pd.Timestamp(row[0]); end=pd.Timestamp(row[1])
     else:
         run=get_research_run(run_id)
-        end=pd.Timestamp.today().normalize()
+        end=bj_ts().normalize()
         start=end-pd.DateOffset(years=int(run.get("years",5) or 5))
     span=max((end-start).days,10)
     train_end=start+pd.Timedelta(days=int(span*0.60))
@@ -6199,8 +6210,8 @@ def create_strategy_experiment(research_run_id,module):
         raise RuntimeError("请先创建研究任务。")
     configs=strategy_variant_configs(module)
     _,train_end,val_end,_=_strategy_experiment_period(research_run_id)
-    exp_id="EXP_"+datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((research_run_id,module)))%10000).zfill(4)
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exp_id="EXP_"+bj_now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((research_run_id,module)))%10000).zfill(4)
+    now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     conn=sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO strategy_experiments(
@@ -6347,7 +6358,7 @@ def run_strategy_experiment_batch(experiment_id,batch_size=5,progress_callback=N
                    SET cursor=?,status=?,updated_at=? WHERE experiment_id=?""",
                 (
                     new_cursor,status,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    bj_now().strftime("%Y-%m-%d %H:%M:%S"),
                     experiment_id
                 )
             )
@@ -6486,7 +6497,7 @@ def reveal_strategy_test(experiment_id):
     conn.execute(
         """UPDATE strategy_experiments
            SET test_revealed=1,updated_at=? WHERE experiment_id=?""",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),experiment_id)
+        (bj_now().strftime("%Y-%m-%d %H:%M:%S"),experiment_id)
     )
     conn.commit(); conn.close()
     exp=get_strategy_experiment(experiment_id)
@@ -6504,14 +6515,14 @@ def save_strategy_candidate(experiment_id,config_id):
     cfg=next((x for x in configs if x["config_id"]==config_id),None)
     if not cfg:
         raise RuntimeError("找不到该参数方案")
-    cid="CAND_"+datetime.now().strftime("%Y%m%d_%H%M%S")
+    cid="CAND_"+bj_now().strftime("%Y%m%d_%H%M%S")
     conn=sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO strategy_candidates(
            candidate_id,experiment_id,created_at,module,config_id,config_json,status,note
         ) VALUES(?,?,?,?,?,?,?,?)""",
         (
-            cid,experiment_id,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            cid,experiment_id,bj_now().strftime("%Y-%m-%d %H:%M:%S"),
             exp["module"],config_id,json.dumps(cfg,ensure_ascii=False),
             "candidate","仅保存为候选版本；不会自动替换EV1.0实盘规则。"
         )
@@ -6629,7 +6640,7 @@ def refresh_forward_tests(max_items=25):
                     status,
                     float(r_value) if pd.notna(r_value) else None,
                     exit_date,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    bj_now().strftime("%Y-%m-%d %H:%M:%S"),
                     int(sig["id"])
                 )
             )
