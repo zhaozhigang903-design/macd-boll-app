@@ -5503,6 +5503,9 @@ def sync_shared_experiment_safe(experiment_id,research_run_id=None,mode="both"):
 # 轻量共享状态自动双向同步；行情K线/EV缓存始终留在每台机器本地。
 _shared_boot=sync_shared_light_safe(force=False)
 
+# 选股在独立后台线程运行；页面刷新、切换页签或做其它分析不会终止任务。
+_background_scan_job=maybe_resume_or_start_daily_screener()
+
 st.markdown("<div style='height:.15rem'></div>", unsafe_allow_html=True)
 st.title("📈 日线 × 周线 中长线决策引擎")
 _runtime_label="Windows计算端" if RUNTIME_MODE=="windows" else ("云端访问端" if RUNTIME_MODE=="cloud" else "本地运行")
@@ -5947,192 +5950,173 @@ with tab1:
         st.caption("单股与批量分析都会进入最近分析记录。")
 
 with tab2:
-    st.subheader("自动选股")
-    st.caption("已启用两阶段快速扫描：先做1年当前结构过滤，只有最终可能进入“优先/观察”的股票才计算5年EV；同一交易日EV自动缓存。提速不放宽正期望标准。")
+    st.subheader("自动选股 · 后台任务")
+    st.caption("选股已改为独立后台任务：开始后可以切换到分析、持仓或研究页面，任务会继续运行；每完成一批就把进度和候选写入数据库，临时网络异常或页面刷新后可从断点继续。")
 
-    sopt1,sopt2,sopt3 = st.columns(3)
+    settings=get_screener_settings()
+    sopt1,sopt2,sopt3=st.columns(3)
     with sopt1:
-        universe = st.selectbox("选股范围",["全A股（沪深）","沪深300","中证500","上证50","港股主板"],index=0)
+        universe=st.selectbox(
+            "选股范围",
+            ["全A股（沪深）","沪深300","中证500","上证50","港股主板"],
+            index=(["全A股（沪深）","沪深300","中证500","上证50","港股主板"].index(settings["universe"])
+                   if settings["universe"] in ["全A股（沪深）","沪深300","中证500","上证50","港股主板"] else 2),
+            key="bg_scan_universe"
+        )
     with sopt2:
-        batch_size = st.selectbox("每批扫描",[100,200,300,500],index=2)
+        batch_size=st.selectbox(
+            "后台每批处理",[50,100,200],
+            index=([50,100,200].index(settings["batch_size"]) if settings["batch_size"] in [50,100,200] else 1),
+            key="bg_scan_batch_size"
+        )
     with sopt3:
-        exclude_st = st.checkbox("排除ST/*ST",value=True)
+        exclude_st=st.checkbox("排除ST/*ST",value=bool(settings["exclude_st"]),key="bg_scan_exclude_st")
 
-    scan_market = st.session_state.get("scan_market")
-    if scan_market and st.session_state.get("scan_universe") == universe:
-        p = automatic_entry_policy(scan_market[0])
-        bench_label = scan_market[2] if len(scan_market)>2 else "沪深300"
-        st.info(
-            f"当前{bench_label}：{scan_market[1]} {scan_market[0]}/100。系统基础门槛自动调整为："
-            f"技术≥{p['技术']}、买点≥{p['买点']}、周线≥{p['周线']}、"
-            f"盈亏比≥{p['盈亏比']:.2f}、相对强度≥{p['相对强度']}、机会≥{p['机会']}。"
-            "结构通过后再计算5年真实交易EV；优先机会要求EV、保守EV和2倍成本压力EV为正。"
+    st.markdown("#### 每日自动扫描")
+    au1,au2=st.columns(2)
+    with au1:
+        auto_daily=st.checkbox(
+            "每天自动运行一次",
+            value=bool(settings["auto_daily"]),
+            help="Render免费服务休眠时不能保证整点唤醒；18点后首次有页面活动时会自动开始/续跑。",
+            key="bg_auto_daily"
+        )
+    with au2:
+        run_hour=st.selectbox(
+            "北京时间几点后启动",[16,17,18,19,20,21],
+            index=([16,17,18,19,20,21].index(settings["run_after_hour"])
+                   if settings["run_after_hour"] in [16,17,18,19,20,21] else 2),
+            key="bg_run_hour"
         )
 
-    sb1,sb2 = st.columns(2)
-    start_scan = sb1.button("🔎 开始/重新扫描",type="primary",use_container_width=True)
-    continue_scan = sb2.button("➡️ 扫描下一批",use_container_width=True)
+    sc1,sc2,sc3=st.columns([1.3,1,1])
+    start_bg=sc1.button("🚀 启动新的后台扫描",type="primary",use_container_width=True,key="start_bg_scan")
+    save_auto=sc2.button("💾 保存每日设置",use_container_width=True,key="save_bg_scan_settings")
+    refresh_bg=sc3.button("🔄 刷新进度",use_container_width=True,key="refresh_bg_scan")
 
-    if start_scan:
-        st.session_state["scan_cursor"] = 0
-        st.session_state["scan_results"] = pd.DataFrame()
-        st.session_state["scan_universe"] = universe
-        st.session_state["scan_done"] = False
+    if save_auto:
+        save_screener_settings(auto_daily,universe,exclude_st,batch_size,run_hour)
+        st.success("每日选股设置已保存。")
+        st.rerun()
 
-    if start_scan or continue_scan:
-        with st.spinner("正在按系统自动门槛扫描交易机会..."):
-            try:
-                bs_login()
-                if universe == "港股主板":
-                    benchmark_df = fetch_hk_benchmark_daily(years=5)
-                    benchmark_name = "恒生指数"
-                else:
-                    benchmark_df = fetch_benchmark_daily(years=5)
-                    benchmark_name = "沪深300"
-                current_market_score,current_market_regime = market_environment(benchmark_df)
-                st.session_state["scan_market"] = (current_market_score,current_market_regime,benchmark_name)
-
-                pool = fetch_universe(universe)
-                if exclude_st and universe != "港股主板" and not pool.empty:
-                    pool = pool[~pool["code_name"].str.upper().str.contains(r"(^ST|\*ST)",regex=True,na=False)]
-                pool = pool.reset_index(drop=True)
-
-                total = len(pool)
-                cursor = int(st.session_state.get("scan_cursor",0))
-                if st.session_state.get("scan_universe") != universe:
-                    cursor = 0
-                    st.session_state["scan_results"] = pd.DataFrame()
-                    st.session_state["scan_universe"] = universe
-
-                end_i = min(cursor+int(batch_size),total)
-                batch = pool.iloc[cursor:end_i]
-                codes = batch["code"].tolist()
-                names = dict(zip(batch["code"],batch["code_name"]))
-                live_progress = st.progress(
-                    min(cursor/total,1.0) if total else 0.0,
-                    text=f"准备扫描：已完成 {cursor:,}/{total:,}"
+    if start_bg:
+        try:
+            # 同一时刻只保留一个正在运行/排队的扫描，避免BaoStock连接互相干扰。
+            conn=sqlite3.connect(DB_PATH)
+            active=conn.execute(
+                """SELECT job_id,status FROM screener_jobs
+                   WHERE status IN ('queued','running')
+                   ORDER BY created_at DESC LIMIT 1"""
+            ).fetchone()
+            conn.close()
+            if active:
+                st.warning(f"已有后台任务 {active[0]} 正在运行，请等待完成或刷新进度。")
+            else:
+                jid=create_screener_job(
+                    universe,exclude_st,batch_size,
+                    trade_date=pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")
                 )
-                live_status = st.empty()
-                live_diag = st.empty()
+                start_screener_job_background(jid)
+                st.session_state["active_screener_job"]=jid
+                st.success("后台扫描已启动。你现在可以切换到其它页面继续操作。")
+                st.rerun()
+        except Exception as e:
+            st.error(f"启动后台选股失败：{e}")
 
-                def _scan_progress(done,batch_total,code_now,name_now,stage,found,stats_now):
-                    overall_done = min(cursor+done,total)
-                    overall_pct = (overall_done/total) if total else 0.0
-                    live_progress.progress(
-                        min(overall_pct,1.0),
-                        text=(
-                            f"实时进度 {overall_done:,}/{total:,}（{overall_pct:.1%}） · "
-                            f"本批 {done:,}/{batch_total:,} · 已发现 {found} 只"
-                        )
-                    )
-                    live_status.caption(
-                        f"当前：{display_code(code_now)} {name_now} · {stage}"
-                    )
-                    live_diag.caption(
-                        f"结构初筛 {stats_now.get('快速初筛通过',0)} · "
-                        f"EV计算 {stats_now.get('EV阶段',0)} · 缓存 {stats_now.get('EV缓存命中',0)} · "
-                        f"优先 {stats_now.get('优先机会',0)} · 观察 {stats_now.get('候选观察',0)} · "
-                        f"流动性不足 {stats_now.get('流动性不足',0)}"
-                    )
+    latest_job=load_screener_job(st.session_state.get("active_screener_job")) if st.session_state.get("active_screener_job") else load_screener_job()
+    if latest_job:
+        job_id=str(latest_job["job_id"])
+        st.session_state["active_screener_job"]=job_id
+        status=str(latest_job.get("status",""))
+        cursor=int(latest_job.get("cursor",0) or 0)
+        total=int(latest_job.get("total",0) or 0)
+        pct=(cursor/total) if total else 0.0
 
-                batch_result,batch_stats = screen_codes(
-                    codes,names,benchmark_df=benchmark_df,
-                    progress_callback=_scan_progress
-                )
-                st.session_state["scan_last_stats"] = batch_stats
-                live_progress.progress(
-                    (end_i/total) if total else 1.0,
-                    text=f"本批完成：已扫描 {end_i:,}/{total:,}"
-                )
-                live_status.caption("本批扫描完成。")
+        status_label={
+            "queued":"排队中","running":"后台运行中",
+            "paused":"等待自动续跑","completed":"已完成"
+        }.get(status,status)
 
-                old_result = st.session_state.get("scan_results")
-                if not isinstance(old_result,pd.DataFrame) or old_result.empty:
-                    merged = batch_result.copy()
-                elif batch_result.empty:
-                    merged = old_result.copy()
-                else:
-                    merged = pd.concat([old_result,batch_result],ignore_index=True)
-                    merged = merged.drop_duplicates("代码",keep="last")
-                    tier_order={"优先机会":0,"候选观察":1}
-                    merged["_tier"]=merged["机会状态"].map(tier_order).fillna(9)
-                    merged["_evsort"]=pd.to_numeric(merged["保守EV(R)"],errors="coerce").fillna(-999)
-                    merged = merged.sort_values(
-                        ["_tier","_evsort","历史净EV(R)","技术分/100"],
-                        ascending=[True,False,False,False]
-                    ).drop(columns=["_tier","_evsort"]).reset_index(drop=True)
+        j1,j2,j3,j4=st.columns(4)
+        j1.metric("任务状态",status_label)
+        j2.metric("进度",f"{cursor:,}/{total:,}" if total else f"{cursor:,}/—")
+        j3.metric("股票池",str(latest_job.get("universe","")))
+        j4.metric("交易日",str(latest_job.get("trade_date","")))
+        st.progress(min(max(pct,0.0),1.0),text=f"后台选股进度 {pct:.1%}" if total else "正在准备股票池…")
 
-                st.session_state["scan_results"] = merged
-                st.session_state["scan_cursor"] = end_i
-                st.session_state["scan_total"] = total
-                st.session_state["scan_done"] = end_i>=total
-            except Exception as e:
-                st.error(f"选股失败：{e}")
-            finally:
-                try: bs.logout()
-                except Exception: pass
+        if latest_job.get("market_score") is not None:
+            p=automatic_entry_policy(float(latest_job["market_score"]))
+            st.info(
+                f"{latest_job.get('benchmark_name','大盘')}：{latest_job.get('market_regime','')} "
+                f"{float(latest_job['market_score']):.0f}/100；本轮门槛："
+                f"技≥{p['技术']} / 买≥{p['买点']} / 周≥{p['周线']} / "
+                f"RR≥{p['盈亏比']:.2f} / RS≥{p['相对强度']} / 机会≥{p['机会']}。"
+            )
 
-    scan_market = st.session_state.get("scan_market")
-    if scan_market:
-        p = automatic_entry_policy(scan_market[0])
-        bench_label = scan_market[2] if len(scan_market)>2 else "沪深300"
-        st.info(
-            f"大盘环境（{bench_label}）：{scan_market[1]} · {scan_market[0]}/100；"
-            f"本轮自动门槛：技≥{p['技术']} / 买≥{p['买点']} / 周≥{p['周线']} / "
-            f"RR≥{p['盈亏比']:.2f} / RS≥{p['相对强度']} / 机会≥{p['机会']}。"
-        )
+        stats={}
+        try:
+            stats=json.loads(latest_job.get("stats_json") or "{}")
+        except Exception:
+            stats={}
+        if stats:
+            st.caption(
+                f"累计扫描 {stats.get('扫描',0)} · 结构初筛 {stats.get('快速初筛通过',0)} · "
+                f"EV计算 {stats.get('EV阶段',0)} · EV缓存 {stats.get('EV缓存命中',0)} · "
+                f"优先 {stats.get('优先机会',0)} · 观察 {stats.get('候选观察',0)} · "
+                f"数据异常 {stats.get('数据异常',0)}"
+            )
 
-    total = int(st.session_state.get("scan_total",0))
-    cursor = int(st.session_state.get("scan_cursor",0))
-    result = st.session_state.get("scan_results")
+        if latest_job.get("error"):
+            st.warning(
+                f"最近一次后台异常：{latest_job['error']}。任务已保存断点；"
+                "下次页面活动会自动尝试续跑。"
+            )
 
-    if total>0:
-        pct = min(cursor/total,1.0)
-        st.progress(pct,text=f"已扫描 {cursor:,} / {total:,} 只（{pct:.1%}）")
-        if cursor<total:
-            st.info(f"还有 {total-cursor:,} 只未扫描。点击“扫描下一批”继续。")
-        else:
-            st.success("✅ 当前股票池已全部扫描完成。")
+        if status in ("queued","running","paused"):
+            if status=="paused":
+                if st.button("▶️ 立即从断点续跑",use_container_width=True,key="resume_bg_scan"):
+                    _update_screener_job(job_id,status="queued",error=None)
+                    start_screener_job_background(job_id)
+                    st.rerun()
+            else:
+                st.success("✅ 任务在后台独立运行。切换页签、做个股分析、查看持仓都不会中断它。")
+        elif status=="completed":
+            st.success("✅ 本轮后台选股已经全部完成。")
 
-    if isinstance(result,pd.DataFrame):
-        if result.empty:
-            if cursor>0:
-                st.warning("已扫描部分暂未发现“优先机会/候选观察”。这代表当前结构普遍较弱，不会为了凑数量强行选股。")
-        else:
-            n_priority = int((result["机会状态"]=="优先机会").sum()) if "机会状态" in result.columns else 0
-            n_watch = int((result["机会状态"]=="候选观察").sum()) if "机会状态" in result.columns else 0
-            st.success(f"当前累计 {len(result)} 只：优先机会 {n_priority} · 候选观察 {n_watch}")
-            pick = result.head(100).drop(columns=["_market_score"],errors="ignore").copy()
+        result=load_screener_job_results(job_id)
+        if isinstance(result,pd.DataFrame) and not result.empty:
+            n_priority=int((result["机会状态"]=="优先机会").sum()) if "机会状态" in result.columns else 0
+            n_watch=int((result["机会状态"]=="候选观察").sum()) if "机会状态" in result.columns else 0
+            st.markdown(f"### 当前候选 · {len(result)}只（优先 {n_priority} / 观察 {n_watch}）")
+            pick=result.head(150).drop(columns=["_market_score"],errors="ignore").copy()
             pick.insert(0,"加入持仓",False)
-            edited_pick = st.data_editor(
-                pick,
-                use_container_width=True,
-                hide_index=True,
+            edited_pick=st.data_editor(
+                pick,use_container_width=True,hide_index=True,
                 disabled=[x for x in pick.columns if x!="加入持仓"],
                 column_config={
-                    "加入持仓":st.column_config.CheckboxColumn("加入持仓",help="勾选后可批量加入持仓")
+                    "加入持仓":st.column_config.CheckboxColumn("加入持仓",help="勾选后批量加入持仓")
                 },
-                key="screen_pick_editor"
+                key=f"bg_screen_pick_editor_{job_id}"
             )
-            ab1,ab2 = st.columns(2)
-            add_selected = ab1.button("➕ 加入勾选持仓",type="primary",use_container_width=True)
-            add_all = ab2.button("➕ 全部候选加入持仓",use_container_width=True)
+            ab1,ab2=st.columns(2)
+            add_selected=ab1.button("➕ 加入勾选持仓",type="primary",use_container_width=True,key=f"bg_add_selected_{job_id}")
+            add_priority=ab2.button("➕ 全部优先机会加入持仓",use_container_width=True,key=f"bg_add_priority_{job_id}")
 
-            if add_selected or add_all:
-                chosen = pick if add_all else edited_pick[edited_pick["加入持仓"]==True].drop(columns=["加入持仓"],errors="ignore")
-                if add_all:
-                    chosen = chosen.drop(columns=["加入持仓"],errors="ignore")
+            if add_selected or add_priority:
+                if add_priority:
+                    chosen=result[result["机会状态"]=="优先机会"].copy()
+                else:
+                    chosen=edited_pick[edited_pick["加入持仓"]==True].drop(columns=["加入持仓"],errors="ignore")
                 if chosen.empty:
-                    st.warning("请先勾选要加入持仓的股票。")
+                    st.warning("没有可加入的股票。")
                 else:
                     try:
                         bs_login()
-                        ok,errs = add_screener_rows_to_positions(chosen)
+                        ok,errs=add_screener_rows_to_positions(chosen)
                         if ok:
-                            st.success(f"已加入/更新 {ok} 只持仓。加入时暂用筛选收盘价作为成本，可在持仓页直接修改成实际成交价。")
-                            st.session_state.pop("holding_view",None)
+                            st.success(f"已加入/更新 {ok} 只持仓。请在持仓页把筛选收盘价改成真实成交成本。")
                         if errs:
-                            st.warning("部分加入失败："+"；".join(errs[:8]))
+                            st.warning("部分失败："+"；".join(errs[:8]))
                     except Exception as e:
                         st.error(f"加入持仓失败：{e}")
                     finally:
@@ -6140,21 +6124,18 @@ with tab2:
                         except Exception: pass
 
             st.download_button(
-                "⬇️ 导出当前候选",
+                "⬇️ 导出本轮后台候选",
                 result.drop(columns=["_market_score"],errors="ignore").to_csv(index=False).encode("utf-8-sig"),
-                "screen_candidates.csv","text/csv",use_container_width=True
+                f"screen_candidates_{job_id}.csv","text/csv",use_container_width=True,
+                key=f"download_bg_candidates_{job_id}"
             )
-            stats_last = st.session_state.get("scan_last_stats") or {}
-            if stats_last:
-                st.caption(
-                    f"本批诊断：扫描 {stats_last.get('扫描',0)} · "
-                    f"快速初筛通过 {stats_last.get('快速初筛通过',0)} · "
-                    f"进入EV阶段 {stats_last.get('EV阶段',0)} · "
-                    f"EV缓存命中 {stats_last.get('EV缓存命中',0)} · "
-                    f"流动性不足 {stats_last.get('流动性不足',0)} · "
-                    f"数据异常 {stats_last.get('数据异常',0)}"
-                )
-            st.caption("排序核心已改为保守EV：优先机会要求真实交易EV、保守EV与2倍成本压力EV为正；候选观察表示EV点估计为正但样本或置信度不足。")
+        elif cursor>0:
+            st.warning("当前已扫描部分尚未发现满足EV1.0条件的候选。")
+
+    st.caption(
+        "后台机制说明：每批完成都会持久化断点和候选，所以页面交互不会打断。"
+        "Render免费实例如果被平台休眠/重启，进程本身会停止，但下一次服务被唤醒后会从已保存的cursor继续，而不是从头开始。"
+    )
 
 with tab3:
     st.subheader("持仓管理")
