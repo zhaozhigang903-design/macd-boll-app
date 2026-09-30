@@ -6800,112 +6800,53 @@ with tab1:
         st.caption("单股与批量分析都会进入最近分析记录。")
 
 with tab2:
-    st.subheader("自动选股 · 后台任务")
-    st.caption("选股已改为独立后台任务：开始后可以切换到分析、持仓或研究页面，任务会继续运行；每完成一批就把进度和候选写入数据库，临时网络异常或页面刷新后可从断点继续。")
+    st.subheader("自动选股")
+    st.caption("现在分成两条完全独立的任务线：**临时手动扫描** 和 **每日定时扫描**。两类任务各自保存进度、结果和历史，不再互相占用“当天任务名额”。手动扫描优先，运行时会暂挂每日任务；手动完成后每日任务自动续跑。")
 
+    repair_stale_screener_jobs()
     settings=get_screener_settings()
-    sopt1,sopt2,sopt3=st.columns(3)
-    with sopt1:
-        universe=st.selectbox(
-            "选股范围",
-            ["全A股（沪深）","沪深300","中证500","上证50","港股主板"],
-            index=(["全A股（沪深）","沪深300","中证500","上证50","港股主板"].index(settings["universe"])
-                   if settings["universe"] in ["全A股（沪深）","沪深300","中证500","上证50","港股主板"] else 2),
-            key="bg_scan_universe"
-        )
-    with sopt2:
-        batch_size=st.selectbox(
-            "后台每批处理",[50,100,200],
-            index=([50,100,200].index(settings["batch_size"]) if settings["batch_size"] in [50,100,200] else 1),
-            key="bg_scan_batch_size"
-        )
-    with sopt3:
-        exclude_st=st.checkbox("排除ST/*ST",value=bool(settings["exclude_st"]),key="bg_scan_exclude_st")
 
-    st.markdown("#### 每日自动扫描")
-    au1,au2=st.columns(2)
-    with au1:
-        auto_daily=st.checkbox(
-            "每天自动运行一次",
-            value=bool(settings["auto_daily"]),
-            help="Render免费服务休眠时不能保证整点唤醒；18点后首次有页面活动时会自动开始/续跑。",
-            key="bg_auto_daily"
-        )
-    with au2:
-        run_hour=st.selectbox(
-            "北京时间几点后启动",[16,17,18,19,20,21],
-            index=([16,17,18,19,20,21].index(settings["run_after_hour"])
-                   if settings["run_after_hour"] in [16,17,18,19,20,21] else 2),
-            key="bg_run_hour"
-        )
+    def _render_screener_panel(job,panel_key,title):
+        st.markdown(f"### {title}")
+        if not job:
+            st.caption("暂无任务。")
+            return
 
-    sc1,sc2,sc3=st.columns([1.3,1,1])
-    start_bg=sc1.button("🚀 启动新的后台扫描",type="primary",use_container_width=True,key="start_bg_scan")
-    save_auto=sc2.button("💾 保存每日设置",use_container_width=True,key="save_bg_scan_settings")
-    refresh_bg=sc3.button("🔄 刷新进度",use_container_width=True,key="refresh_bg_scan")
-
-    if save_auto:
-        save_screener_settings(auto_daily,universe,exclude_st,batch_size,run_hour)
-        st.success("每日选股设置已保存。")
-        st.rerun()
-
-    if start_bg:
-        try:
-            # 同一时刻只保留一个正在运行/排队的扫描，避免BaoStock连接互相干扰。
-            conn=sqlite3.connect(DB_PATH)
-            active=conn.execute(
-                """SELECT job_id,status FROM screener_jobs
-                   WHERE status IN ('queued','running')
-                   ORDER BY created_at DESC LIMIT 1"""
-            ).fetchone()
-            conn.close()
-            if active:
-                st.warning(f"已有后台任务 {active[0]} 正在运行，请等待完成或刷新进度。")
-            else:
-                jid=create_screener_job(
-                    universe,exclude_st,batch_size,
-                    trade_date=pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")
-                )
-                start_screener_job_background(jid)
-                st.session_state["active_screener_job"]=jid
-                st.success("后台扫描已启动。你现在可以切换到其它页面继续操作。")
-                st.rerun()
-        except Exception as e:
-            st.error(f"启动后台选股失败：{e}")
-
-    latest_job=load_screener_job(st.session_state.get("active_screener_job")) if st.session_state.get("active_screener_job") else load_screener_job()
-    if latest_job:
-        job_id=str(latest_job["job_id"])
-        st.session_state["active_screener_job"]=job_id
-        status=str(latest_job.get("status",""))
-        cursor=int(latest_job.get("cursor",0) or 0)
-        total=int(latest_job.get("total",0) or 0)
+        job_id=str(job["job_id"])
+        status=str(job.get("status",""))
+        cursor=int(job.get("cursor",0) or 0)
+        total=int(job.get("total",0) or 0)
         pct=(cursor/total) if total else 0.0
-
         status_label={
-            "queued":"排队中","running":"后台运行中",
-            "paused":"等待自动续跑","completed":"已完成"
+            "queued":"排队中",
+            "running":"后台运行中",
+            "paused":"断点暂停",
+            "paused_manual":"被临时手动任务暂挂",
+            "completed":"已完成"
         }.get(status,status)
 
         j1,j2,j3,j4=st.columns(4)
-        j1.metric("任务状态",status_label)
+        j1.metric("状态",status_label)
         j2.metric("进度",f"{cursor:,}/{total:,}" if total else f"{cursor:,}/—")
-        j3.metric("股票池",str(latest_job.get("universe","")))
-        j4.metric("交易日",str(latest_job.get("trade_date","")))
-        st.progress(min(max(pct,0.0),1.0),text=f"后台选股进度 {pct:.1%}" if total else "正在准备股票池…")
+        j3.metric("股票池",str(job.get("universe","")))
+        j4.metric("交易日",str(job.get("trade_date","")))
+        st.progress(
+            min(max(pct,0.0),1.0),
+            text=f"{title}进度 {pct:.1%}" if total else "正在准备股票池…"
+        )
 
-        if latest_job.get("market_score") is not None:
-            p=automatic_entry_policy(float(latest_job["market_score"]))
+        if job.get("market_score") is not None:
+            p=automatic_entry_policy(float(job["market_score"]))
             st.info(
-                f"{latest_job.get('benchmark_name','大盘')}：{latest_job.get('market_regime','')} "
-                f"{float(latest_job['market_score']):.0f}/100；本轮门槛："
+                f"{job.get('benchmark_name','大盘')}：{job.get('market_regime','')} "
+                f"{float(job['market_score']):.0f}/100；本轮门槛："
                 f"技≥{p['技术']} / 买≥{p['买点']} / 周≥{p['周线']} / "
                 f"RR≥{p['盈亏比']:.2f} / RS≥{p['相对强度']} / 机会≥{p['机会']}。"
             )
 
         stats={}
         try:
-            stats=json.loads(latest_job.get("stats_json") or "{}")
+            stats=json.loads(job.get("stats_json") or "{}")
         except Exception:
             stats={}
         if stats:
@@ -6916,47 +6857,62 @@ with tab2:
                 f"数据异常 {stats.get('数据异常',0)}"
             )
 
-        if latest_job.get("error"):
-            st.warning(
-                f"最近一次后台异常：{latest_job['error']}。任务已保存断点；"
-                "下次页面活动会自动尝试续跑。"
-            )
+        if job.get("error"):
+            st.warning(f"最近异常：{job['error']}")
 
-        if status in ("queued","running","paused"):
-            if status=="paused":
-                if st.button("▶️ 立即从断点续跑",use_container_width=True,key="resume_bg_scan"):
-                    _update_screener_job(job_id,status="queued",error=None)
-                    start_screener_job_background(job_id)
-                    st.rerun()
-            else:
-                st.success("✅ 任务在后台独立运行。切换页签、做个股分析、查看持仓都不会中断它。")
+        if status=="paused":
+            if st.button(
+                "▶️ 从断点续跑",
+                use_container_width=True,
+                key=f"resume_{panel_key}_{job_id}"
+            ):
+                if str(job.get("job_type"))=="manual":
+                    pause_scheduled_for_manual()
+                elif active_screener_job("manual"):
+                    st.warning("当前有临时手动任务运行，每日任务会继续保持暂停。")
+                    st.stop()
+                _update_screener_job(job_id,status="queued",error=None)
+                start_screener_job_background(job_id)
+                st.rerun()
+        elif status=="paused_manual":
+            st.info("⏸️ 每日任务已为临时手动扫描让路；手动任务结束后会自动继续。")
+        elif status=="running":
+            st.success("✅ 后台运行中。可以切换到分析、持仓或研究页面。")
         elif status=="completed":
-            st.success("✅ 本轮后台选股已经全部完成。")
+            st.success("✅ 本轮扫描已完成。完成的任务不会阻止你发起下一次扫描。")
 
         result=load_screener_job_results(job_id)
         if isinstance(result,pd.DataFrame) and not result.empty:
             n_priority=int((result["机会状态"]=="优先机会").sum()) if "机会状态" in result.columns else 0
             n_watch=int((result["机会状态"]=="候选观察").sum()) if "机会状态" in result.columns else 0
-            st.markdown(f"### 当前候选 · {len(result)}只（优先 {n_priority} / 观察 {n_watch}）")
+            st.markdown(f"#### 候选结果 · {len(result)}只（优先 {n_priority} / 观察 {n_watch}）")
             pick=result.head(150).drop(columns=["_market_score"],errors="ignore").copy()
             pick.insert(0,"加入持仓",False)
             edited_pick=st.data_editor(
                 pick,use_container_width=True,hide_index=True,
                 disabled=[x for x in pick.columns if x!="加入持仓"],
                 column_config={
-                    "加入持仓":st.column_config.CheckboxColumn("加入持仓",help="勾选后批量加入持仓")
+                    "加入持仓":st.column_config.CheckboxColumn("加入持仓")
                 },
-                key=f"bg_screen_pick_editor_{job_id}"
+                key=f"screen_pick_editor_{panel_key}_{job_id}"
             )
             ab1,ab2=st.columns(2)
-            add_selected=ab1.button("➕ 加入勾选持仓",type="primary",use_container_width=True,key=f"bg_add_selected_{job_id}")
-            add_priority=ab2.button("➕ 全部优先机会加入持仓",use_container_width=True,key=f"bg_add_priority_{job_id}")
-
+            add_selected=ab1.button(
+                "➕ 加入勾选持仓",
+                type="primary",use_container_width=True,
+                key=f"add_selected_{panel_key}_{job_id}"
+            )
+            add_priority=ab2.button(
+                "➕ 全部优先机会加入持仓",
+                use_container_width=True,
+                key=f"add_priority_{panel_key}_{job_id}"
+            )
             if add_selected or add_priority:
-                if add_priority:
-                    chosen=result[result["机会状态"]=="优先机会"].copy()
-                else:
-                    chosen=edited_pick[edited_pick["加入持仓"]==True].drop(columns=["加入持仓"],errors="ignore")
+                chosen=(
+                    result[result["机会状态"]=="优先机会"].copy()
+                    if add_priority
+                    else edited_pick[edited_pick["加入持仓"]==True].drop(columns=["加入持仓"],errors="ignore")
+                )
                 if chosen.empty:
                     st.warning("没有可加入的股票。")
                 else:
@@ -6964,7 +6920,7 @@ with tab2:
                         bs_login()
                         ok,errs=add_screener_rows_to_positions(chosen)
                         if ok:
-                            st.success(f"已加入/更新 {ok} 只持仓。请在持仓页把筛选收盘价改成真实成交成本。")
+                            st.success(f"已加入/更新 {ok} 只持仓。")
                         if errs:
                             st.warning("部分失败："+"；".join(errs[:8]))
                     except Exception as e:
@@ -6974,17 +6930,162 @@ with tab2:
                         except Exception: pass
 
             st.download_button(
-                "⬇️ 导出本轮后台候选",
+                "⬇️ 导出本轮候选",
                 result.drop(columns=["_market_score"],errors="ignore").to_csv(index=False).encode("utf-8-sig"),
-                f"screen_candidates_{job_id}.csv","text/csv",use_container_width=True,
-                key=f"download_bg_candidates_{job_id}"
+                f"screen_candidates_{job_id}.csv","text/csv",
+                use_container_width=True,key=f"download_{panel_key}_{job_id}"
             )
         elif cursor>0:
-            st.warning("当前已扫描部分尚未发现满足EV1.0条件的候选。")
+            st.caption("当前已扫描部分暂无满足EV1.0条件的候选。")
+
+    manual_tab,daily_tab=st.tabs(["⚡ 临时手动扫描","🕒 每日定时扫描"])
+
+    with manual_tab:
+        st.markdown("#### 临时手动扫描")
+        st.caption("这是你随时主动发起的扫描，与每日自动任务完全分开。即使今天的每日任务已经完成，也可以继续发起任意次数的临时扫描。")
+        m1,m2,m3=st.columns(3)
+        with m1:
+            manual_universe=st.selectbox(
+                "手动股票池",
+                ["全A股（沪深）","沪深300","中证500","上证50","港股主板"],
+                index=3,key="manual_scan_universe"
+            )
+        with m2:
+            manual_batch=st.selectbox(
+                "后台批次",[20,50,100],
+                index=1,key="manual_scan_batch"
+            )
+        with m3:
+            manual_exclude_st=st.checkbox(
+                "排除ST/*ST",value=True,key="manual_scan_exclude_st"
+            )
+
+        mm1,mm2=st.columns([1.5,1])
+        start_manual=mm1.button(
+            "🚀 发起新的临时扫描",
+            type="primary",use_container_width=True,
+            key="start_manual_scan"
+        )
+        mm2.caption("手动任务优先；如果每日任务正在跑，会先把每日任务暂停在当前断点。")
+
+        if start_manual:
+            active_manual=active_screener_job("manual")
+            if active_manual:
+                st.warning(f"已有临时手动任务 {active_manual[0]} 正在运行。")
+            else:
+                try:
+                    pause_scheduled_for_manual()
+                    jid=create_screener_job(
+                        manual_universe,manual_exclude_st,manual_batch,
+                        trade_date=pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d"),
+                        job_type="manual"
+                    )
+                    start_screener_job_background(jid)
+                    st.session_state["active_manual_screener_job"]=jid
+                    st.success("新的临时扫描已启动。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"启动临时扫描失败：{e}")
+
+        manual_job=latest_screener_job("manual")
+        _render_screener_panel(manual_job,"manual","临时手动任务")
+
+    with daily_tab:
+        st.markdown("#### 每日定时扫描设置")
+        st.caption("每日任务只负责固定日常扫描；它不会因为你今天做过临时扫描而跳过，也不会阻止你继续手动发起新的扫描。")
+        d1,d2,d3=st.columns(3)
+        daily_universes=["全A股（沪深）","沪深300","中证500","上证50","港股主板"]
+        with d1:
+            daily_universe=st.selectbox(
+                "每日股票池",daily_universes,
+                index=(daily_universes.index(settings["universe"]) if settings["universe"] in daily_universes else 2),
+                key="daily_scan_universe"
+            )
+        with d2:
+            daily_batch=st.selectbox(
+                "每日后台批次",[20,50,100],
+                index=([20,50,100].index(settings["batch_size"]) if settings["batch_size"] in [20,50,100] else 1),
+                key="daily_scan_batch"
+            )
+        with d3:
+            daily_exclude_st=st.checkbox(
+                "每日排除ST/*ST",
+                value=bool(settings["exclude_st"]),
+                key="daily_scan_exclude_st"
+            )
+
+        da1,da2=st.columns(2)
+        with da1:
+            auto_daily=st.checkbox(
+                "每天自动运行一次",
+                value=bool(settings["auto_daily"]),
+                key="daily_auto_enabled"
+            )
+        with da2:
+            hours=[16,17,18,19,20,21]
+            run_hour=st.selectbox(
+                "北京时间几点后启动",hours,
+                index=(hours.index(settings["run_after_hour"]) if settings["run_after_hour"] in hours else 2),
+                key="daily_run_hour"
+            )
+
+        ds1,ds2,ds3=st.columns([1.2,1.2,1])
+        save_auto=ds1.button(
+            "💾 保存每日设置",
+            use_container_width=True,key="save_daily_scan_settings"
+        )
+        run_daily_now=ds2.button(
+            "▶️ 立即运行/续跑每日任务",
+            use_container_width=True,key="run_daily_now"
+        )
+        refresh_daily=ds3.button(
+            "🔄 刷新状态",
+            use_container_width=True,key="refresh_daily_status"
+        )
+
+        if save_auto:
+            save_screener_settings(
+                auto_daily,daily_universe,daily_exclude_st,daily_batch,run_hour
+            )
+            st.success("每日扫描设置已保存。")
+            st.rerun()
+
+        if run_daily_now:
+            if active_screener_job("manual"):
+                st.warning("当前有临时手动任务运行。每日任务会在手动任务完成后自动继续。")
+            else:
+                daily_job=latest_screener_job("scheduled")
+                today=pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")
+                if (
+                    daily_job
+                    and str(daily_job.get("trade_date"))==today
+                    and str(daily_job.get("status")) in ("queued","running","paused","paused_manual")
+                ):
+                    jid=str(daily_job["job_id"])
+                    _update_screener_job(jid,status="queued",error=None)
+                elif (
+                    daily_job
+                    and str(daily_job.get("trade_date"))==today
+                    and str(daily_job.get("status"))=="completed"
+                ):
+                    st.info("今天的每日定时任务已经完成。若要再扫一次，请到“临时手动扫描”发起，不会受此限制。")
+                    jid=None
+                else:
+                    jid=create_screener_job(
+                        daily_universe,daily_exclude_st,daily_batch,
+                        trade_date=today,job_type="scheduled"
+                    )
+                if jid:
+                    start_screener_job_background(jid)
+                    st.success("每日任务已启动/续跑。")
+                    st.rerun()
+
+        scheduled_job=latest_screener_job("scheduled")
+        _render_screener_panel(scheduled_job,"scheduled","每日定时任务")
 
     st.caption(
-        "后台机制说明：每批完成都会持久化断点和候选，所以页面交互不会打断。"
-        "Render免费实例如果被平台休眠/重启，进程本身会停止，但下一次服务被唤醒后会从已保存的cursor继续，而不是从头开始。"
+        "任务隔离规则：每日任务和临时任务分别建档、分别保存结果。临时任务优先，最多只会暂挂每日任务，不会覆盖或复用它。"
+        "完成的任务永远不会阻止下一次临时扫描。"
     )
 
 with tab3:
