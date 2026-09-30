@@ -3110,6 +3110,7 @@ def _normalize_a_universe(raw):
     out=out[out["raw_code"].astype(str).str.startswith(("0","3","6"))]
     return out[["code","code_name"]].drop_duplicates("code").reset_index(drop=True)
 
+@st.cache_data(ttl=21600, show_spinner=False)
 def _ak_all_a_universe():
     errors=[]
     getters=[
@@ -3125,6 +3126,7 @@ def _ak_all_a_universe():
             errors.append(f"{label}:{ex}")
     raise RuntimeError("AKShare全A股票池失败："+"；".join(errors[-2:]))
 
+@st.cache_data(ttl=21600, show_spinner=False)
 def _ak_index_universe(index_code):
     errors=[]
     getters=[]
@@ -4714,6 +4716,14 @@ def _background_screener_worker(job_id):
             if use_bs_session:
                 bs_login()
             try:
+                if ifind_configured():
+                    try:
+                        outer_codes=pool.iloc[cursor:outer_end]["code"].tolist()
+                        if outer_codes:
+                            prefetch_ifind_daily(outer_codes,years=1)
+                    except Exception as ex:
+                        print("SCREENER_OUTER_PREFETCH_WARN",job_id,ex)
+
                 while cursor<outer_end:
                     current=load_screener_job(job_id)
                     if not current or str(current.get("status"))=="paused_manual":
