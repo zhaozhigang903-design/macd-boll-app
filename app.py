@@ -3219,13 +3219,14 @@ def trade_cost_profile(code):
         return 15.0,8.0
     return 8.0,5.0
 
-def prepare_strategy_frame(df,benchmark_df,code=None,weekly_df=None):
+def prepare_strategy_frame(df,benchmark_df,code=None,weekly_df=None,benchmark_features=None):
     code=normalize_code(code or (str(df.iloc[-1].get("code","")) if df is not None and not df.empty and "code" in df.columns else ""))
     m=build_score_series(df,weekly_df=weekly_df,code=code)
     if m.empty:
         return m
-    bm=market_score_series(benchmark_df)
-    if not bm.empty:
+
+    bm=benchmark_features if benchmark_features is not None else market_score_series(benchmark_df)
+    if bm is not None and not bm.empty:
         bm2=bm[["trade_date","ret20","ret60","market_score"]].copy()
         bm2.columns=["trade_date","bm_ret20","bm_ret60","market_score"]
         m=pd.merge_asof(
@@ -3233,28 +3234,30 @@ def prepare_strategy_frame(df,benchmark_df,code=None,weekly_df=None):
             on="trade_date",direction="backward"
         )
     else:
-        m["market_score"]=50
+        m["market_score"]=50.0
         m["bm_ret20"]=np.nan
         m["bm_ret60"]=np.nan
 
-    rs_scores=[]
-    opp_scores=[]
-    for _,r in m.iterrows():
-        ex20=r.get("ret20")-r.get("bm_ret20") if pd.notna(r.get("ret20")) and pd.notna(r.get("bm_ret20")) else np.nan
-        ex60=r.get("ret60")-r.get("bm_ret60") if pd.notna(r.get("ret60")) and pd.notna(r.get("bm_ret60")) else np.nan
-        rs=50
-        if pd.notna(ex20):
-            rs+=120*ex20
-        if pd.notna(ex60):
-            rs+=60*ex60
-        rs=clamp(rs)
-        rs_scores.append(rs)
-        opp_scores.append(opportunity_score(
-            r.get("score",0),r.get("buy_score",0),r.get("rr",np.nan),
-            None,float(r.get("market_score",50) or 50),rs
-        ))
-    m["rs_score"]=rs_scores
-    m["opportunity_score"]=opp_scores
+    # 向量化计算RS与机会分，避免5年历史逐行iterrows。
+    ex20=pd.to_numeric(m.get("ret20"),errors="coerce")-pd.to_numeric(m.get("bm_ret20"),errors="coerce")
+    ex60=pd.to_numeric(m.get("ret60"),errors="coerce")-pd.to_numeric(m.get("bm_ret60"),errors="coerce")
+    rs=np.full(len(m),50.0,dtype=float)
+    rs+=np.where(ex20.notna(),120.0*ex20.fillna(0).to_numpy(dtype=float),0.0)
+    rs+=np.where(ex60.notna(),60.0*ex60.fillna(0).to_numpy(dtype=float),0.0)
+    rs=np.clip(rs,0,100)
+    m["rs_score"]=np.round(rs,1)
+
+    technical=pd.to_numeric(m.get("score"),errors="coerce").fillna(0).to_numpy(dtype=float)
+    buy=pd.to_numeric(m.get("buy_score"),errors="coerce").fillna(0).to_numpy(dtype=float)
+    rr=pd.to_numeric(m.get("rr"),errors="coerce")
+    market=pd.to_numeric(m.get("market_score"),errors="coerce").fillna(50).to_numpy(dtype=float)
+    rr_score=np.where(rr.notna(),np.clip(rr.fillna(0).to_numpy(dtype=float)/2.5*100,0,100),30.0)
+    opp=0.30*technical+0.30*buy+0.15*rr_score+0.15*market+0.10*rs
+    opp=np.where(market<35,opp-6,opp)
+    opp=np.where(buy<55,np.minimum(opp,64),opp)
+    rr_arr=rr.to_numpy(dtype=float)
+    opp=np.where(np.isfinite(rr_arr)&(rr_arr<1.0),np.minimum(opp,60),opp)
+    m["opportunity_score"]=np.round(np.clip(opp,0,100),1)
     return m
 
 def structural_entry_ok(row,code,relax=0):
@@ -3285,8 +3288,8 @@ def holding_exit_condition(row,peak_score):
         (market_score<25 and score<60)
     )
 
-def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0):
-    m=prepare_strategy_frame(df,benchmark_df,code=code)
+def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0,benchmark_features=None):
+    m=prepare_strategy_frame(df,benchmark_df,code=code,benchmark_features=benchmark_features)
     if m.empty or len(m)<180:
         return pd.DataFrame(),m
 
@@ -3715,13 +3718,15 @@ def save_cached_ev(df,benchmark_df,code,ev):
     conn.commit()
     conn.close()
 
-def realized_trade_ev(df,benchmark_df,code,use_cache=True):
+def realized_trade_ev(df,benchmark_df,code,use_cache=True,benchmark_features=None):
     if use_cache:
         cached=get_cached_ev(df,benchmark_df,code)
         if cached is not None:
             return cached,pd.DataFrame(),True
 
-    trades,_=simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0)
+    trades,_=simulate_structural_trades(
+        df,benchmark_df,code,cost_mult=1.0,benchmark_features=benchmark_features
+    )
     stress=reprice_trades_for_cost(trades,code,cost_mult=2.0)
     base=summarize_ev(trades)
     stress_s=summarize_ev(stress)
