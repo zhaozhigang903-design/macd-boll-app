@@ -40,6 +40,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = Path(os.getenv("MACD_LOCAL_DB_PATH", str(DATA_DIR / "analysis_history.db"))).expanduser()
 
 RULE_VERSION = "EV1.0-2026-09-30"
+_SCREENER_THREADS = {}
+_SCREENER_THREADS_LOCK = threading.Lock()
 
 st.set_page_config(
     page_title="中长线技术决策引擎",
@@ -3390,6 +3392,292 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     ).drop(columns=["_tier","_evsort"]).reset_index(drop=True)
     save_forward_candidates(out)
     return out,stats
+
+def _scan_json_value(v):
+    if isinstance(v,np.generic):
+        v=v.item()
+    if isinstance(v,(pd.Timestamp,datetime)):
+        return pd.Timestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v,float) and (np.isnan(v) or np.isinf(v)):
+        return None
+    return v
+
+def _save_screener_rows(job_id,df):
+    if df is None or df.empty:
+        return
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
+    rows=[]
+    for _,r in df.iterrows():
+        payload={k:_scan_json_value(v) for k,v in r.to_dict().items()}
+        code=str(payload.get("代码") or "")
+        if not code:
+            continue
+        rows.append((job_id,code,json.dumps(payload,ensure_ascii=False),now))
+    if rows:
+        conn.executemany(
+            """INSERT INTO screener_job_results(job_id,code,payload,updated_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(job_id,code) DO UPDATE SET
+                 payload=excluded.payload,updated_at=excluded.updated_at""",
+            rows
+        )
+    conn.commit(); conn.close()
+
+def load_screener_job(job_id=None):
+    conn=sqlite3.connect(DB_PATH)
+    if job_id:
+        df=pd.read_sql_query(
+            "SELECT * FROM screener_jobs WHERE job_id=?",
+            conn,params=(job_id,)
+        )
+    else:
+        df=pd.read_sql_query(
+            "SELECT * FROM screener_jobs ORDER BY created_at DESC LIMIT 1",
+            conn
+        )
+    conn.close()
+    return df.iloc[0].to_dict() if not df.empty else None
+
+def load_screener_job_results(job_id):
+    if not job_id:
+        return pd.DataFrame()
+    conn=sqlite3.connect(DB_PATH)
+    rows=conn.execute(
+        "SELECT payload FROM screener_job_results WHERE job_id=?",
+        (job_id,)
+    ).fetchall()
+    conn.close()
+    data=[]
+    for (payload,) in rows:
+        try:
+            data.append(json.loads(payload))
+        except Exception:
+            pass
+    if not data:
+        return pd.DataFrame()
+    out=pd.DataFrame(data)
+    if "机会状态" in out.columns:
+        order={"优先机会":0,"候选观察":1}
+        out["_tier"]=out["机会状态"].map(order).fillna(9)
+        out["_evsort"]=pd.to_numeric(out.get("保守EV(R)"),errors="coerce").fillna(-999)
+        sort_cols=[x for x in ["_tier","_evsort","历史净EV(R)","技术分/100"] if x in out.columns]
+        asc=[True,False,False,False][:len(sort_cols)]
+        out=out.sort_values(sort_cols,ascending=asc).drop(columns=["_tier","_evsort"],errors="ignore")
+    return out.reset_index(drop=True)
+
+def create_screener_job(universe="中证500",exclude_st=True,batch_size=100,trade_date=None):
+    trade_date=trade_date or datetime.now().strftime("%Y-%m-%d")
+    job_id="SCAN_"+datetime.now().strftime("%Y%m%d_%H%M%S")
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO screener_jobs(
+           job_id,trade_date,universe,exclude_st,batch_size,status,cursor,total,
+           created_at,updated_at
+        ) VALUES(?,?,?,?,?,'queued',0,0,?,?)""",
+        (job_id,trade_date,universe,1 if exclude_st else 0,int(batch_size),now,now)
+    )
+    conn.commit(); conn.close()
+    return job_id
+
+def _update_screener_job(job_id,**kwargs):
+    if not kwargs:
+        return
+    kwargs["updated_at"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cols=list(kwargs.keys())
+    sql="UPDATE screener_jobs SET "+",".join([f"{x}=?" for x in cols])+" WHERE job_id=?"
+    vals=[kwargs[x] for x in cols]+[job_id]
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(sql,vals)
+    conn.commit(); conn.close()
+
+def _background_screener_worker(job_id):
+    job=load_screener_job(job_id)
+    if not job:
+        return
+    try:
+        _update_screener_job(job_id,status="running",error=None)
+        bs_login()
+        universe=str(job["universe"])
+        exclude_st=bool(int(job.get("exclude_st",1) or 0))
+        batch_size=max(20,int(job.get("batch_size",100) or 100))
+
+        if universe=="港股主板":
+            benchmark_df=_retry_df_call(
+                "恒生指数",lambda: fetch_hk_benchmark_daily(years=5),retries=3
+            )
+            benchmark_name="恒生指数"
+        else:
+            benchmark_df=_retry_df_call(
+                "沪深300指数",lambda: fetch_benchmark_daily(years=5),retries=3
+            )
+            benchmark_name="沪深300"
+
+        mkt_score,mkt_regime=market_environment(benchmark_df)
+        pool=fetch_universe(universe)
+        if exclude_st and universe!="港股主板" and not pool.empty:
+            pool=pool[
+                ~pool["code_name"].astype(str).str.upper().str.contains(
+                    r"(^ST|\*ST)",regex=True,na=False
+                )
+            ]
+        pool=pool.drop_duplicates("code").reset_index(drop=True)
+        total=len(pool)
+        cursor=min(int(job.get("cursor",0) or 0),total)
+        _update_screener_job(
+            job_id,total=total,market_score=float(mkt_score),
+            market_regime=str(mkt_regime),benchmark_name=benchmark_name
+        )
+
+        agg_stats={
+            "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
+            "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"数据异常":0
+        }
+
+        old_stats=job.get("stats_json")
+        if old_stats:
+            try:
+                agg_stats.update(json.loads(old_stats))
+            except Exception:
+                pass
+
+        while cursor<total:
+            end=min(cursor+batch_size,total)
+            batch=pool.iloc[cursor:end]
+            codes=batch["code"].tolist()
+            names=dict(zip(batch["code"],batch["code_name"]))
+
+            # 单批最多重试2次。个股异常由screen_codes内部跳过，网络/股票池级异常才重试。
+            last_err=None
+            batch_result=None
+            batch_stats=None
+            for attempt in range(2):
+                try:
+                    batch_result,batch_stats=screen_codes(
+                        codes,names,benchmark_df=benchmark_df,progress_callback=None
+                    )
+                    last_err=None
+                    break
+                except Exception as e:
+                    last_err=e
+                    time.sleep(2.0*(attempt+1))
+            if last_err is not None:
+                raise RuntimeError(f"扫描 {cursor}-{end} 批次失败：{last_err}")
+
+            _save_screener_rows(job_id,batch_result)
+            for k,v in (batch_stats or {}).items():
+                agg_stats[k]=int(agg_stats.get(k,0) or 0)+int(v or 0)
+
+            cursor=end
+            _update_screener_job(
+                job_id,cursor=cursor,
+                stats_json=json.dumps(agg_stats,ensure_ascii=False),
+                status=("completed" if cursor>=total else "running")
+            )
+
+        _update_screener_job(job_id,status="completed",cursor=total,error=None)
+    except Exception as e:
+        err=f"{type(e).__name__}: {e}"
+        print("BACKGROUND_SCREENER_ERROR",job_id,err)
+        print(traceback.format_exc())
+        _update_screener_job(job_id,status="paused",error=err)
+    finally:
+        try: bs.logout()
+        except Exception: pass
+        with _SCREENER_THREADS_LOCK:
+            _SCREENER_THREADS.pop(job_id,None)
+
+def start_screener_job_background(job_id):
+    if not job_id:
+        return False
+    with _SCREENER_THREADS_LOCK:
+        t=_SCREENER_THREADS.get(job_id)
+        if t is not None and t.is_alive():
+            return True
+        t=threading.Thread(
+            target=_background_screener_worker,args=(job_id,),
+            daemon=True,name=f"screener-{job_id}"
+        )
+        _SCREENER_THREADS[job_id]=t
+        t.start()
+    return True
+
+def get_screener_settings():
+    conn=sqlite3.connect(DB_PATH)
+    row=conn.execute(
+        """SELECT auto_daily,universe,exclude_st,batch_size,run_after_hour
+           FROM screener_settings WHERE id=1"""
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"auto_daily":1,"universe":"中证500","exclude_st":1,"batch_size":100,"run_after_hour":18}
+    return {
+        "auto_daily":int(row[0]),"universe":str(row[1]),
+        "exclude_st":int(row[2]),"batch_size":int(row[3]),
+        "run_after_hour":int(row[4])
+    }
+
+def save_screener_settings(auto_daily,universe,exclude_st,batch_size,run_after_hour):
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO screener_settings(
+           id,auto_daily,universe,exclude_st,batch_size,run_after_hour,updated_at
+        ) VALUES(1,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          auto_daily=excluded.auto_daily,universe=excluded.universe,
+          exclude_st=excluded.exclude_st,batch_size=excluded.batch_size,
+          run_after_hour=excluded.run_after_hour,updated_at=excluded.updated_at""",
+        (
+            1 if auto_daily else 0,str(universe),1 if exclude_st else 0,
+            int(batch_size),int(run_after_hour),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    )
+    conn.commit(); conn.close()
+
+def maybe_resume_or_start_daily_screener():
+    settings=get_screener_settings()
+    # 先恢复被网页刷新/交互打断前已经持久化的任务。
+    conn=sqlite3.connect(DB_PATH)
+    running=pd.read_sql_query(
+        """SELECT * FROM screener_jobs
+           WHERE status IN ('running','queued','paused')
+           ORDER BY created_at DESC LIMIT 1""",
+        conn
+    )
+    conn.close()
+    if not running.empty:
+        job=running.iloc[0].to_dict()
+        # paused通常是临时网络错误；下次页面活动时自动续跑。
+        if str(job.get("status")) in ("running","queued","paused"):
+            start_screener_job_background(str(job["job_id"]))
+            return str(job["job_id"])
+
+    if not int(settings.get("auto_daily",0)):
+        return None
+    now=datetime.now()
+    if now.hour<int(settings.get("run_after_hour",18)):
+        return None
+
+    today=now.strftime("%Y-%m-%d")
+    conn=sqlite3.connect(DB_PATH)
+    row=conn.execute(
+        """SELECT job_id FROM screener_jobs
+           WHERE trade_date=? AND universe=?
+           ORDER BY created_at DESC LIMIT 1""",
+        (today,settings["universe"])
+    ).fetchone()
+    conn.close()
+    if row:
+        return str(row[0])
+
+    job_id=create_screener_job(
+        settings["universe"],bool(settings["exclude_st"]),
+        settings["batch_size"],trade_date=today
+    )
+    start_screener_job_background(job_id)
+    return job_id
 
 def run_backtest(df,benchmark_df,code=None,fee_bps=None):
     code=normalize_code(code or (str(df.iloc[-1].get("code","")) if df is not None and not df.empty else ""))
