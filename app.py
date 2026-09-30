@@ -1167,6 +1167,21 @@ def render_cockpit(report):
             f"正EV折数 {wf.get('正EV折数',0)}/{wf.get('折数',0)}"
         )
 
+    op=report.get("operation_strategy") or {}
+    if op:
+        st.markdown("### 🎯 具体操作策略")
+        oa,ob=st.columns([1,2])
+        oa.metric("当前动作",op.get("action","—"))
+        ob.info(op.get("position_plan",""))
+        st.markdown(f"**买入/确认触发**：{op.get('entry_trigger','—')}")
+        st.markdown(f"**加仓条件**：{op.get('add_trigger','—')}")
+        st.markdown(f"**减仓条件**：{op.get('reduce_trigger','—')}")
+        st.markdown(f"**退出条件**：{op.get('exit_trigger','—')}")
+        oc,od=st.columns(2)
+        oc.caption(f"风险位：{op.get('risk_line','—')}")
+        od.caption(f"压力/目标观察区：{op.get('target_zone','—')}")
+        st.caption("执行依据："+str(op.get("evidence","")))
+
     with st.expander("详细技术证据"):
         d = report.get("daily",{}) or {}
         rows = [
@@ -2133,6 +2148,13 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
     if pd.notna(mid):
         down.append(f"持续运行于中轨{mid:.2f}下方")
 
+    operation_strategy=build_operation_strategy(
+        code,position_state,fundamentals_ok,score,buy_score,weekly,rr,
+        mkt_score,rs_score,opp,tier,ev,
+        float(drow.get("close")) if pd.notna(drow.get("close")) else np.nan,
+        mid,risk_price,target_price,drow.get("atr14",np.nan)
+    )
+
     return {
         "updated_at":datetime.now().strftime("%m-%d %H:%M"),
         "symbol":f"{name} / {display_code(code)}",
@@ -2148,6 +2170,7 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
         "rs_score":rs_score,"excess20":ex20,"excess60":ex60,
         "ev":ev,"liquidity_ok":liq_ok,"amount20":amount20,
         "risk_price":risk_price,"target_price":target_price,
+        "operation_strategy":operation_strategy,
         "daily":{
             "boll_mid_direction":boll_dir,"price_vs_mid":pos_txt,
             "macd_zero_zone":zero,"dif_direction":"向上" if drow.get("dif_slope",0)>0 else "向下",
@@ -2165,6 +2188,49 @@ def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_d
         "latest_date":di.iloc[-1]["trade_date"].strftime("%Y-%m-%d"),
         "latest_close":float(di.iloc[-1]["close"]),"_df":di
     }
+
+def persist_analysis_report(report,code,horizon,position_state):
+    if not report:
+        return
+    rdf=report.get("_df")
+    price=""
+    boll_mid=""
+    if isinstance(rdf,pd.DataFrame) and not rdf.empty:
+        price=str(rdf.iloc[-1].get("close",""))
+        boll_mid=str(rdf.iloc[-1].get("boll_mid",""))
+    xsave={
+        "data_quality":100,
+        "daily":{"price":price,"boll_mid":boll_mid},
+        "key_support":report.get("support",""),
+        "key_resistance":report.get("resistance",""),
+    }
+    meta={
+        "symbol":report.get("symbol",""),
+        "market":market_of_code(code),
+        "horizon":horizon,
+        "position_state":position_state,
+        "rating":report.get("rating",""),
+        "state":report.get("state",""),
+        "stage":report.get("stage",""),
+        "confidence":100,
+        "mode":f"{data_source_for_code(code)}自动数据",
+        "weekly_used":True
+    }
+    metrics=(
+        report.get("score"),report.get("trend"),report.get("momentum"),
+        report.get("weekly_score"),report.get("confirm"),False,False
+    )
+    save_result(
+        meta,xsave,metrics,
+        json.dumps(
+            {
+                "source":data_source_for_code(code),
+                "market":market_of_code(code),
+                "operation_strategy":report.get("operation_strategy",{})
+            },
+            ensure_ascii=False
+        )
+    )
 
 def latest_trade_date():
     end = pd.Timestamp.today().strftime("%Y-%m-%d")
