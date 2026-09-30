@@ -805,6 +805,7 @@ def init_db():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS screener_jobs(
       job_id TEXT PRIMARY KEY,
+      job_type TEXT NOT NULL DEFAULT 'manual',
       trade_date TEXT NOT NULL,
       universe TEXT NOT NULL,
       exclude_st INTEGER NOT NULL DEFAULT 1,
@@ -824,6 +825,13 @@ def init_db():
     conn.execute("""
     CREATE INDEX IF NOT EXISTS idx_screener_jobs_trade_date
     ON screener_jobs(trade_date,universe,status)
+    """)
+    sjcols={r[1] for r in conn.execute("PRAGMA table_info(screener_jobs)").fetchall()}
+    if "job_type" not in sjcols:
+        conn.execute("ALTER TABLE screener_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT 'manual'")
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_screener_jobs_type_status
+    ON screener_jobs(job_type,status,created_at)
     """)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS screener_job_results(
