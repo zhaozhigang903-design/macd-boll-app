@@ -4424,7 +4424,9 @@ def _background_screener_worker(job_id):
         outer_batch=min(50,max(20,int(job.get("batch_size",50) or 50)))
         micro_batch=10
 
-        bs_login()
+        use_bs_session=not ifind_configured()
+        if use_bs_session:
+            bs_login()
         try:
             if universe=="港股主板":
                 benchmark_df=_retry_df_call(
@@ -4439,7 +4441,8 @@ def _background_screener_worker(job_id):
             mkt_score,mkt_regime=market_environment(benchmark_df)
             pool=fetch_universe(universe)
         finally:
-            bs_logout_safe()
+            if use_bs_session:
+                bs_logout_safe()
 
         if exclude_st and universe!="港股主板" and not pool.empty:
             pool=pool[
@@ -4472,7 +4475,8 @@ def _background_screener_worker(job_id):
             if not current or str(current.get("status"))=="paused_manual":
                 return
             outer_end=min(cursor+outer_batch,total)
-            bs_login()
+            if use_bs_session:
+                bs_login()
             try:
                 while cursor<outer_end:
                     current=load_screener_job(job_id)
@@ -4511,7 +4515,8 @@ def _background_screener_worker(job_id):
                         status=("completed" if cursor>=total else "running")
                     )
             finally:
-                bs_logout_safe()
+                if use_bs_session:
+                    bs_logout_safe()
 
             time.sleep(0.25)
 
