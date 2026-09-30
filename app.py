@@ -1247,6 +1247,13 @@ def render_cockpit(report):
             f"OOS：{wf.get('稳定性','样本不足')} · "
             f"正EV折数 {wf.get('正EV折数',0)}/{wf.get('折数',0)}"
         )
+        if report.get("ev_pending"):
+            st.info("⚡ 当前结构已经先返回；5年历史EV正在后台计算。稍后再次点击“生成/替换当前分析”即可自动带入最新EV，不需要重新等待完整历史计算。")
+        elif report.get("ev_cache_age_days") is not None:
+            st.caption(f"EV缓存年龄约 {float(report.get('ev_cache_age_days')):.1f} 天；7天内复用，避免每次重复回测。")
+
+    if report.get("analysis_seconds") is not None:
+        st.caption(f"本次前台分析耗时约 {float(report.get('analysis_seconds')):.1f} 秒。")
 
     wcheck=report.get("weekly_crosscheck") or {}
     if report.get("weekly_source"):
