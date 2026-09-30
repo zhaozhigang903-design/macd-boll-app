@@ -1850,22 +1850,83 @@ def fetch_stock_daily(code,years=3):
 
     return _read_daily_cache(code,start,end,cache_flag)
 
+def _download_index_daily_ak(code,start,end):
+    symbol=display_code(code)
+    s=str(start).replace("-","")
+    e=str(end).replace("-","")
+    errors=[]
+    getters=[
+        ("东财指数历史",lambda: ak.index_zh_a_hist(
+            symbol=symbol,period="daily",start_date=s,end_date=e
+        )),
+        ("新浪指数历史",lambda: ak.stock_zh_index_daily(
+            symbol=("sh"+symbol if code.startswith("sh.") else "sz"+symbol)
+        ))
+    ]
+    for label,getter in getters:
+        try:
+            raw=getter()
+            if raw is None or raw.empty:
+                continue
+            df=raw.copy().rename(columns={
+                "日期":"trade_date","date":"trade_date",
+                "开盘":"open","open":"open","最高":"high","high":"high",
+                "最低":"low","low":"low","收盘":"close","close":"close",
+                "成交量":"vol","volume":"vol","成交额":"amount","amount":"amount",
+                "涨跌幅":"pctChg"
+            })
+            for col in ["open","high","low","close","vol","amount","pctChg"]:
+                if col not in df.columns:
+                    df[col]=np.nan
+                df[col]=pd.to_numeric(df[col],errors="coerce")
+            df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
+            df["code"]=code
+            df["turn"]=np.nan
+            df["tradestatus"]="1"
+            df["isST"]=""
+            df=df.dropna(subset=["trade_date","close"])
+            mask=(df["trade_date"]>=pd.Timestamp(start))&(df["trade_date"]<=pd.Timestamp(end))
+            out=df.loc[mask,["trade_date","code","open","high","low","close","vol","amount","pctChg","turn","tradestatus","isST"]]
+            out=sanitize_daily(out)
+            if not out.empty:
+                return out.reset_index(drop=True)
+        except Exception as ex:
+            errors.append(f"{label}:{ex}")
+    raise RuntimeError("AKShare指数历史失败："+"；".join(errors[-2:]))
+
 def _download_index_daily(code,start,end):
     if start > end:
         return pd.DataFrame()
-    fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
-    rs = bs.query_history_k_data_plus(
-        code,fields,start_date=start,end_date=end,frequency="d",adjustflag="3"
-    )
-    df = _rs_to_df(rs)
-    if df.empty:
-        return df
-    df = df.rename(columns={"date":"trade_date","volume":"vol"})
-    for col in ["open","high","low","close","vol","amount","pctChg"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col],errors="coerce")
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    return df.sort_values("trade_date").reset_index(drop=True)
+    bs_error=None
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            fields="date,code,open,high,low,close,preclose,volume,amount,pctChg"
+            rs=bs.query_history_k_data_plus(
+                code,fields,start_date=start,end_date=end,frequency="d",adjustflag="3"
+            )
+            if getattr(rs,"error_code","0")!="0":
+                raise RuntimeError(getattr(rs,"error_msg","BaoStock返回错误"))
+            df=_rs_to_df(rs)
+            if not df.empty:
+                df=df.rename(columns={"date":"trade_date","volume":"vol"})
+                for col in ["open","high","low","close","vol","amount","pctChg"]:
+                    if col in df.columns:
+                        df[col]=pd.to_numeric(df[col],errors="coerce")
+                df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
+                df["turn"]=np.nan
+                df["tradestatus"]="1"
+                df["isST"]=""
+                df=sanitize_daily(df)
+                if not df.empty:
+                    return df.sort_values("trade_date").reset_index(drop=True)
+        except Exception as ex:
+            bs_error=ex
+    try:
+        return _download_index_daily_ak(code,start,end)
+    except Exception as ak_ex:
+        raise RuntimeError(
+            f"指数历史双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
+        )
 
 def fetch_benchmark_daily(years=5,code="sh.000300"):
     end = datetime.now().strftime("%Y-%m-%d")
