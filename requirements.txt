@@ -6,3 +6,4 @@ openai>=1.55
 akshare>=1.17.0
 psycopg[binary]>=3.2
 cos-python-sdk-v5>=1.9.35
+requests>=2.32
