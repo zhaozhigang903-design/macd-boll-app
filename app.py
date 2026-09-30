@@ -3703,6 +3703,29 @@ def get_cached_ev(df,benchmark_df,code):
     except Exception:
         return None
 
+def get_recent_cached_ev(code,max_age_days=7):
+    code=normalize_code(code)
+    cutoff=(datetime.now()-pd.Timedelta(days=int(max_age_days))).strftime("%Y-%m-%d %H:%M:%S")
+    conn=sqlite3.connect(DB_PATH)
+    row=conn.execute(
+        """SELECT payload,updated_at,stock_date,benchmark_date
+           FROM ev_cache
+           WHERE code=? AND rule_version=? AND updated_at>=?
+           ORDER BY updated_at DESC LIMIT 1""",
+        (code,RULE_VERSION,cutoff)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None,None
+    try:
+        payload=json.loads(row[0])
+        age=max(0.0,(pd.Timestamp.now()-pd.Timestamp(row[1])).total_seconds()/86400.0)
+        payload["_cache_stock_date"]=row[2]
+        payload["_cache_benchmark_date"]=row[3]
+        return payload,age
+    except Exception:
+        return None,None
+
 def save_cached_ev(df,benchmark_df,code,ev):
     key=_ev_cache_key(df,benchmark_df,code)
     if key is None:
@@ -3881,12 +3904,12 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             # 原生周K仍是最终周线依据，但只为有可能入选的股票请求，避免全市场逐只额外网络请求。
             coarse_pass=(
                 agg_weekly is not None and pd.notna(rr) and
-                agg_technical>=policy["技术"]-10 and
-                buy_score>=policy["买点"]-7 and
-                agg_weekly>=policy["周线"]-12 and
-                rr>=max(0.65,policy["盈亏比"]-0.35) and
-                rs_score>=policy["相对强度"]-9 and
-                agg_opp>=policy["机会"]-9
+                agg_technical>=policy["技术"]-5 and
+                buy_score>=policy["买点"]-4 and
+                agg_weekly>=policy["周线"]-6 and
+                rr>=max(0.75,policy["盈亏比"]-0.25) and
+                rs_score>=policy["相对强度"]-6 and
+                agg_opp>=policy["机会"]-5
             )
             if not coarse_pass:
                 tick(i,code,name,"快速预筛未通过")
@@ -3926,13 +3949,22 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
             stats["EV阶段"]+=1
             tick(i-1,code,name,"计算5年真实交易EV")
 
-            hist_df=fetch_stock_daily(code,years=5)
-            ev,trades,cache_hit=realized_trade_ev(
-                hist_df,benchmark_df,code,use_cache=True,
-                benchmark_features=benchmark_features
-            )
-            if cache_hit:
+            # EV是慢变量：日常选股优先复用最近7天同规则EV。
+            # 当前技术结构仍使用当天数据；只有EV缓存缺失/过期才重跑5年历史。
+            ev,ev_cache_age=get_recent_cached_ev(code,max_age_days=7)
+            if ev is not None:
+                trades=pd.DataFrame()
+                cache_hit=True
                 stats["EV缓存命中"]+=1
+            else:
+                hist_df=fetch_stock_daily(code,years=5)
+                ev,trades,cache_hit=realized_trade_ev(
+                    hist_df,benchmark_df,code,use_cache=True,
+                    benchmark_features=benchmark_features
+                )
+                ev_cache_age=0.0
+                if cache_hit:
+                    stats["EV缓存命中"]+=1
             tier,reason,policy_used=ev_opportunity_decision(
                 technical,buy_score,weekly,rr,mkt_score,rs_score,opp,ev,liq_ok
             )
@@ -3950,6 +3982,7 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
                 "保守EV(R)":round(float(ev["保守EV_R"]),2) if pd.notna(ev.get("保守EV_R")) else np.nan,
                 "2倍成本EV(R)":round(float(ev["压力EV_R"]),2) if pd.notna(ev.get("压力EV_R")) else np.nan,
                 "EV可信度":ev.get("可信度","不足"),"EV样本":ev.get("样本",0),
+                "EV缓存年龄(天)":round(float(ev_cache_age),1) if ev_cache_age is not None else np.nan,
                 "交易胜率":f"{ev.get('胜率'):.0%}" if pd.notna(ev.get("胜率")) else "—",
                 "平均盈利R":round(float(ev["平均盈利R"]),2) if pd.notna(ev.get("平均盈利R")) else np.nan,
                 "平均亏损R":round(float(ev["平均亏损R"]),2) if pd.notna(ev.get("平均亏损R")) else np.nan,
@@ -4108,10 +4141,9 @@ def _background_screener_worker(job_id):
         _update_screener_job(job_id,status="running",error=None)
         universe=str(job["universe"])
         exclude_st=bool(int(job.get("exclude_st",1) or 0))
-        # 后台批次故意较小，让前台分析能在批次间取得BaoStock会话。
-        batch_size=min(50,max(20,int(job.get("batch_size",50) or 50)))
+        outer_batch=min(50,max(20,int(job.get("batch_size",50) or 50)))
+        micro_batch=10
 
-        # 准备股票池/基准后立即释放BaoStock，不长期霸占连接。
         bs_login()
         try:
             if universe=="港股主板":
@@ -4124,7 +4156,6 @@ def _background_screener_worker(job_id):
                     "沪深300指数",lambda: fetch_benchmark_daily(years=5),retries=3
                 )
                 benchmark_name="沪深300"
-
             mkt_score,mkt_regime=market_environment(benchmark_df)
             pool=fetch_universe(universe)
         finally:
@@ -4146,7 +4177,8 @@ def _background_screener_worker(job_id):
 
         agg_stats={
             "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
-            "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"数据异常":0
+            "EV阶段":0,"EV缓存命中":0,"流动性不足":0,
+            "周线低一致性":0,"数据异常":0
         }
         old_stats=job.get("stats_json")
         if old_stats:
@@ -4156,44 +4188,46 @@ def _background_screener_worker(job_id):
                 pass
 
         while cursor<total:
-            end=min(cursor+batch_size,total)
-            batch=pool.iloc[cursor:end]
-            codes=batch["code"].tolist()
-            names=dict(zip(batch["code"],batch["code_name"]))
-            last_err=None
-            batch_result=None
-            batch_stats=None
+            outer_end=min(cursor+outer_batch,total)
+            bs_login()
+            try:
+                while cursor<outer_end:
+                    end=min(cursor+micro_batch,outer_end)
+                    batch=pool.iloc[cursor:end]
+                    codes=batch["code"].tolist()
+                    names=dict(zip(batch["code"],batch["code_name"]))
 
-            for attempt in range(2):
-                try:
-                    bs_login()
-                    try:
-                        batch_result,batch_stats=screen_codes(
-                            codes,names,benchmark_df=benchmark_df,progress_callback=None
-                        )
-                    finally:
-                        bs_logout_safe()
                     last_err=None
-                    break
-                except Exception as ex:
-                    last_err=ex
-                    time.sleep(2.0*(attempt+1))
+                    batch_result=None
+                    batch_stats=None
+                    for attempt in range(2):
+                        try:
+                            batch_result,batch_stats=screen_codes(
+                                codes,names,benchmark_df=benchmark_df,
+                                progress_callback=None
+                            )
+                            last_err=None
+                            break
+                        except Exception as ex:
+                            last_err=ex
+                            time.sleep(1.5*(attempt+1))
+                    if last_err is not None:
+                        raise RuntimeError(f"扫描 {cursor}-{end} 批次失败：{last_err}")
 
-            if last_err is not None:
-                raise RuntimeError(f"扫描 {cursor}-{end} 批次失败：{last_err}")
+                    _save_screener_rows(job_id,batch_result)
+                    for k,v in (batch_stats or {}).items():
+                        agg_stats[k]=int(agg_stats.get(k,0) or 0)+int(v or 0)
 
-            _save_screener_rows(job_id,batch_result)
-            for k,v in (batch_stats or {}).items():
-                agg_stats[k]=int(agg_stats.get(k,0) or 0)+int(v or 0)
+                    cursor=end
+                    _update_screener_job(
+                        job_id,cursor=cursor,
+                        stats_json=json.dumps(agg_stats,ensure_ascii=False),
+                        status=("completed" if cursor>=total else "running")
+                    )
+            finally:
+                bs_logout_safe()
 
-            cursor=end
-            _update_screener_job(
-                job_id,cursor=cursor,
-                stats_json=json.dumps(agg_stats,ensure_ascii=False),
-                status=("completed" if cursor>=total else "running")
-            )
-            # 主动让出CPU/会话窗口，前台批量分析可插队。
-            time.sleep(0.4)
+            time.sleep(0.25)
 
         _update_screener_job(job_id,status="completed",cursor=total,error=None)
     except Exception as ex:
