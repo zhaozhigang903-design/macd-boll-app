@@ -4620,7 +4620,7 @@ def repair_stale_screener_jobs():
         if not alive:
             _update_screener_job(
                 str(job_id),status="paused",
-                error="服务重启或后台线程已结束，任务已保留断点。"
+                error="后台线程已结束，任务断点已保留，可继续运行。"
             )
 
 def pause_scheduled_for_manual():
@@ -7383,8 +7383,14 @@ with tab2:
                 f"数据异常 {stats.get('数据异常',0)}"
             )
 
-        if job.get("error"):
+        if job.get("error") and status in ("paused","queued","running"):
             st.warning(f"最近异常：{job['error']}")
+        elif status=="completed" and job.get("error"):
+            # 历史异常不应在成功完成后继续误导用户。
+            try:
+                _update_screener_job(job_id,error=None)
+            except Exception:
+                pass
 
         if status=="paused":
             if st.button(
