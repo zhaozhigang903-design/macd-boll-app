@@ -8,6 +8,7 @@ import sqlite3
 import time
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from ifind_http import (
     status as ifind_status,
     history_one as ifind_history_one,
     history_many as ifind_history_many,
+    basic_names as ifind_basic_names,
 )
 from shared_store import (
     enabled as shared_db_enabled,
@@ -58,6 +60,8 @@ _SCREENER_THREADS = {}
 _SCREENER_THREADS_LOCK = threading.Lock()
 _BAOSTOCK_SESSION_LOCK = threading.RLock()
 _BAOSTOCK_SESSION_OWNER = threading.local()
+_ANALYSIS_EV_THREADS = {}
+_ANALYSIS_EV_LOCK = threading.Lock()
 
 st.set_page_config(
     page_title="中长线技术决策引擎",
@@ -1407,7 +1411,7 @@ def bs_logout_safe():
         _BAOSTOCK_SESSION_OWNER.depth=depth-1
         return
     try:
-        bs_logout_safe()
+        bs.logout()
     except Exception:
         pass
     finally:
