@@ -6,6 +6,8 @@ import os
 import re
 import sqlite3
 import time
+import threading
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -788,6 +790,55 @@ def init_db():
       note TEXT
     )
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS screener_jobs(
+      job_id TEXT PRIMARY KEY,
+      trade_date TEXT NOT NULL,
+      universe TEXT NOT NULL,
+      exclude_st INTEGER NOT NULL DEFAULT 1,
+      batch_size INTEGER NOT NULL DEFAULT 100,
+      status TEXT NOT NULL,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      total INTEGER NOT NULL DEFAULT 0,
+      market_score REAL,
+      market_regime TEXT,
+      benchmark_name TEXT,
+      error TEXT,
+      stats_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """)
+    conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_screener_jobs_trade_date
+    ON screener_jobs(trade_date,universe,status)
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS screener_job_results(
+      job_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(job_id,code)
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS screener_settings(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      auto_daily INTEGER NOT NULL DEFAULT 1,
+      universe TEXT NOT NULL DEFAULT '中证500',
+      exclude_st INTEGER NOT NULL DEFAULT 1,
+      batch_size INTEGER NOT NULL DEFAULT 100,
+      run_after_hour INTEGER NOT NULL DEFAULT 18,
+      updated_at TEXT NOT NULL
+    )
+    """)
+    conn.execute(
+        """INSERT OR IGNORE INTO screener_settings(
+           id,auto_daily,universe,exclude_st,batch_size,run_after_hour,updated_at
+        ) VALUES(1,1,'中证500',1,100,18,?)""",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),)
+    )
     fcols={r[1] for r in conn.execute("PRAGMA table_info(forward_signals)").fetchall()}
     if "rule_version" not in fcols:
         conn.execute("ALTER TABLE forward_signals ADD COLUMN rule_version TEXT")
