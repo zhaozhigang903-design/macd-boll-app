@@ -1737,7 +1737,7 @@ def _normalize_a_history(raw,code):
         "收盘":"close","close":"close",
         "成交量":"vol","volume":"vol",
         "成交额":"amount","amount":"amount",
-        "涨跌幅":"pctChg","换手率":"turn"
+        "涨跌幅":"pctChg","换手率":"turn","turnover":"turn"
     }
     df=df.rename(columns={k:v for k,v in rename.items() if k in df.columns})
     needed=["trade_date","open","high","low","close","vol"]
@@ -1757,29 +1757,47 @@ def _normalize_a_history(raw,code):
 
 def _download_a_daily_ak(code,start,end):
     symbol=display_code(code)
+    market_symbol=("sh"+symbol if code.startswith("sh.") else "sz"+symbol)
     s=str(start).replace("-","")
     e=str(end).replace("-","")
     errors=[]
+
     getters=[
         ("东财A股历史",lambda: ak.stock_zh_a_hist(
-            symbol=symbol,period="daily",start_date=s,end_date=e,adjust="qfq"
+            symbol=symbol,period="daily",start_date=s,end_date=e,
+            adjust="qfq",timeout=12
+        )),
+        ("腾讯A股历史",lambda: ak.stock_zh_a_hist_tx(
+            symbol=market_symbol,start_date=s,end_date=e,
+            adjust="qfq",timeout=12
         )),
         ("新浪A股历史",lambda: ak.stock_zh_a_daily(
-            symbol=("sh"+symbol if code.startswith("sh.") else "sz"+symbol),
-            start_date=start,end_date=end,adjust="qfq"
+            symbol=market_symbol,start_date=start,end_date=end,adjust="qfq"
         ))
     ]
+
     for label,getter in getters:
-        try:
-            df=_normalize_a_history(getter(),code)
-            if not df.empty:
-                mask=(df["trade_date"]>=pd.Timestamp(start))&(df["trade_date"]<=pd.Timestamp(end))
-                out=df.loc[mask].reset_index(drop=True)
-                if not out.empty:
-                    return out
-        except Exception as ex:
-            errors.append(f"{label}:{ex}")
-    raise RuntimeError("AKShare A股历史行情失败："+"；".join(errors[-2:]))
+        last=None
+        for attempt in range(1,4):
+            try:
+                raw=getter()
+                df=_normalize_a_history(raw,code)
+                if not df.empty:
+                    mask=(
+                        (df["trade_date"]>=pd.Timestamp(start))&
+                        (df["trade_date"]<=pd.Timestamp(end))
+                    )
+                    out=df.loc[mask].reset_index(drop=True)
+                    if not out.empty:
+                        return out
+                last=RuntimeError("返回空数据")
+            except Exception as ex:
+                last=ex
+            if attempt<3:
+                time.sleep(0.8*attempt)
+        errors.append(f"{label}:{last}")
+
+    raise RuntimeError("AKShare A股历史行情失败："+"；".join(errors[-3:]))
 
 def _download_a_daily(code,start,end):
     if start > end:
@@ -1879,29 +1897,51 @@ def _download_daily(code,start,end):
     return _download_hk_daily(code,start,end) if code.startswith("hk.") else _download_a_daily(code,start,end)
 
 def fetch_stock_daily(code,years=3):
-    code = normalize_code(code)
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
-    cache_flag = "hk_qfq" if code.startswith("hk.") else "2"
-    cache_min,cache_max,last_checked = _cache_bounds(code,cache_flag)
-    today = datetime.now().strftime("%Y-%m-%d")
+    code=normalize_code(code)
+    end=datetime.now().strftime("%Y-%m-%d")
+    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    cache_flag="hk_qfq" if code.startswith("hk.") else "2"
+    cache_min,cache_max,last_checked=_cache_bounds(code,cache_flag)
+
+    def _cached():
+        return _read_daily_cache(code,start,end,cache_flag)
 
     if not cache_min or not cache_max:
-        fresh = _download_daily(code,start,end)
-        _save_daily_cache(fresh,code,cache_flag)
-        _mark_cache_checked(code)
-    else:
-        if start < cache_min:
-            pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            older = _download_daily(code,start,pre_end)
-            _save_daily_cache(older,code,cache_flag)
-        if _should_refresh_cache(last_checked,cache_max):
-            next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            newer = _download_daily(code,next_start,end)
-            _save_daily_cache(newer,code,cache_flag)
+        try:
+            fresh=_download_daily(code,start,end)
+            _save_daily_cache(fresh,code,cache_flag)
             _mark_cache_checked(code)
+        except Exception:
+            cached=_cached()
+            if len(cached)>=60:
+                return cached
+            raise
+    else:
+        if start<cache_min:
+            pre_end=(pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                older=_download_daily(code,start,pre_end)
+                _save_daily_cache(older,code,cache_flag)
+            except Exception:
+                # 历史头部补齐失败时，已有缓存足够则继续，不阻塞当前分析。
+                cached=_cached()
+                if len(cached)<60:
+                    raise
 
-    return _read_daily_cache(code,start,end,cache_flag)
+        if _should_refresh_cache(last_checked,cache_max):
+            next_start=(pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                newer=_download_daily(code,next_start,end)
+                _save_daily_cache(newer,code,cache_flag)
+                _mark_cache_checked(code)
+            except Exception:
+                # 上游临时断开时优先使用已有缓存，避免整个分析失败。
+                cached=_cached()
+                if len(cached)>=60:
+                    return cached
+                raise
+
+    return _cached()
 
 def _download_index_daily_ak(code,start,end):
     symbol=display_code(code)
@@ -1982,25 +2022,47 @@ def _download_index_daily(code,start,end):
         )
 
 def fetch_benchmark_daily(years=5,code="sh.000300"):
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
-    cache_min,cache_max,last_checked = _cache_bounds(code,"3")
-    today = datetime.now().strftime("%Y-%m-%d")
+    end=datetime.now().strftime("%Y-%m-%d")
+    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    cache_min,cache_max,last_checked=_cache_bounds(code,"3")
+
+    def _cached():
+        return _read_daily_cache(code,start,end,"3")
+
     if not cache_min or not cache_max:
-        fresh = _download_index_daily(code,start,end)
-        _save_daily_cache(fresh,code,"3")
-        _mark_cache_checked(code)
-    else:
-        if start < cache_min:
-            pre_end = (pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            older = _download_index_daily(code,start,pre_end)
-            _save_daily_cache(older,code,"3")
-        if _should_refresh_cache(last_checked,cache_max):
-            next_start = (pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            newer = _download_index_daily(code,next_start,end)
-            _save_daily_cache(newer,code,"3")
+        try:
+            fresh=_download_index_daily(code,start,end)
+            _save_daily_cache(fresh,code,"3")
             _mark_cache_checked(code)
-    return _read_daily_cache(code,start,end,"3")
+        except Exception:
+            cached=_cached()
+            if len(cached)>=60:
+                return cached
+            raise
+    else:
+        if start<cache_min:
+            pre_end=(pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                older=_download_index_daily(code,start,pre_end)
+                _save_daily_cache(older,code,"3")
+            except Exception:
+                cached=_cached()
+                if len(cached)<60:
+                    raise
+
+        if _should_refresh_cache(last_checked,cache_max):
+            next_start=(pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                newer=_download_index_daily(code,next_start,end)
+                _save_daily_cache(newer,code,"3")
+                _mark_cache_checked(code)
+            except Exception:
+                cached=_cached()
+                if len(cached)>=60:
+                    return cached
+                raise
+
+    return _cached()
 
 def _download_hk_benchmark(start,end):
     last_error = None
