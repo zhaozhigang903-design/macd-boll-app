@@ -24,6 +24,14 @@ from shared_store import (
     sync_research_run as shared_sync_research_run,
     sync_experiment as shared_sync_experiment,
 )
+from cos_backup import (
+    configured as cos_backup_configured,
+    status as cos_backup_status,
+    backup_now as cos_backup_now,
+    list_backups as cos_list_backups,
+    restore_core as cos_restore_core,
+    maybe_daily_backup as cos_maybe_daily_backup,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 RUNTIME_MODE = os.getenv(
@@ -6082,6 +6090,19 @@ _shared_boot=sync_shared_light_safe(force=False)
 
 # 选股在独立后台线程运行；页面刷新、切换页签或做其它分析不会终止任务。
 _background_scan_job=maybe_resume_or_start_daily_screener()
+
+# COS只备份不可重建的核心业务数据。每个浏览器会话最多触发一次检查，
+# 真正是否需要上传由COS端“今日是否已有备份”决定。
+if cos_backup_configured() and not st.session_state.get("_cos_daily_backup_started"):
+    st.session_state["_cos_daily_backup_started"]=True
+    def _cos_daily_backup_worker():
+        try:
+            cos_maybe_daily_backup(DB_PATH,RUNTIME_MODE,keep=30)
+        except Exception as ex:
+            print("COS_DAILY_BACKUP_ERROR",ex)
+    threading.Thread(
+        target=_cos_daily_backup_worker,daemon=True,name="cos-daily-backup"
+    ).start()
 
 st.markdown("<div style='height:.15rem'></div>", unsafe_allow_html=True)
 st.title("📈 日线 × 周线 中长线决策引擎")
