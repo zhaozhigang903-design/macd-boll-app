@@ -57,6 +57,11 @@ DATA_DIR = Path(os.getenv("MACD_DATA_DIR", str(_default_data_dir))).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = Path(os.getenv("MACD_LOCAL_DB_PATH", str(DATA_DIR / "analysis_history.db"))).expanduser()
 
+def db_connect():
+    conn=sqlite3.connect(DB_PATH,timeout=30.0,check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 def bj_now():
@@ -509,7 +514,12 @@ EXTRACT_PROMPT = """
 """
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
+    # WAL allows background screener writes while the UI is reading the same SQLite DB.
+    # NORMAL sync + busy_timeout materially reduces "database is locked" without risking schema loss.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS analyses(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -917,7 +927,7 @@ def image_signature(daily_bytes, weekly_bytes=None):
     return h.hexdigest()
 
 def get_cached_extraction(signature):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     row = conn.execute(
         "SELECT payload, raw_result FROM extraction_cache WHERE signature=?",
         (signature,)
@@ -931,7 +941,7 @@ def get_cached_extraction(signature):
         return None, None
 
 def save_cached_extraction(signature, payload, raw_result):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     conn.execute(
         """INSERT OR REPLACE INTO extraction_cache(signature,created_at,payload,raw_result)
            VALUES(?,?,?,?)""",
@@ -1134,7 +1144,7 @@ def signal_color(score):
 def previous(symbol):
     if not symbol:
         return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     df = pd.read_sql_query(
         "SELECT * FROM analyses WHERE symbol=? ORDER BY id DESC LIMIT 1",
         conn, params=(symbol,)
@@ -1144,7 +1154,7 @@ def previous(symbol):
 
 def save_result(meta, x, metrics, raw):
     score, trend, momentum, weekly, confirm, _, _ = metrics
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     conn.execute("""
     INSERT INTO analyses(
       created_at,symbol,market,horizon,position_state,rating,state,stage,
@@ -1682,7 +1692,7 @@ def sanitize_daily(df):
     return d.reset_index(drop=True)
 
 def _read_daily_cache(code, start_date, end_date, adjustflag="2"):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     df = pd.read_sql_query(
         """SELECT trade_date,code,open,high,low,close,vol,amount,pctChg,turn,tradestatus,isST
            FROM market_daily_cache
@@ -1701,7 +1711,7 @@ def _read_daily_cache(code, start_date, end_date, adjustflag="2"):
     return sanitize_daily(df)
 
 def _cache_bounds(code, adjustflag="2"):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     row = conn.execute(
         "SELECT MIN(trade_date),MAX(trade_date) FROM market_daily_cache WHERE code=? AND adjustflag=?",
         (code,adjustflag)
@@ -1735,7 +1745,7 @@ def _save_daily_cache(df, code, adjustflag="2"):
             adjustflag,
             now
         ))
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     conn.executemany(
         """INSERT OR REPLACE INTO market_daily_cache(
            code,trade_date,open,high,low,close,vol,amount,pctChg,turn,
@@ -1748,7 +1758,7 @@ def _save_daily_cache(df, code, adjustflag="2"):
 
 def _mark_cache_checked(code):
     now=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT INTO market_cache_meta(code,last_checked,updated_at)
            VALUES(?,?,?)
@@ -2396,7 +2406,7 @@ def fetch_benchmark_for_code(code,years=5):
     return fetch_hk_benchmark_daily(years) if market_of_code(code)=="港股" else fetch_benchmark_daily(years)
 
 def market_cache_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     row = conn.execute(
         """SELECT COUNT(*),COUNT(DISTINCT code),MIN(trade_date),MAX(trade_date)
            FROM market_daily_cache"""
@@ -2414,7 +2424,7 @@ def market_cache_stats():
     }
 
 def clear_market_cache():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     conn.execute("DELETE FROM market_daily_cache")
     conn.execute("DELETE FROM market_cache_meta")
     conn.commit()
@@ -4071,7 +4081,7 @@ def get_cached_ev(df,benchmark_df,code):
     key=_ev_cache_key(df,benchmark_df,code)
     if key is None:
         return None
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     row=conn.execute(
         """SELECT payload FROM ev_cache
            WHERE code=? AND stock_date=? AND benchmark_date=? AND rule_version=?""",
@@ -4088,7 +4098,7 @@ def get_cached_ev(df,benchmark_df,code):
 def get_recent_cached_ev(code,max_age_days=7):
     code=normalize_code(code)
     cutoff=(bj_now()-pd.Timedelta(days=int(max_age_days))).strftime("%Y-%m-%d %H:%M:%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     row=conn.execute(
         """SELECT payload,updated_at,stock_date,benchmark_date
            FROM ev_cache
@@ -4113,7 +4123,7 @@ def save_cached_ev(df,benchmark_df,code,ev):
     if key is None:
         return
     payload=json.dumps(_ev_json_safe(ev),ensure_ascii=False,separators=(",",":"))
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT OR REPLACE INTO ev_cache(
            code,stock_date,benchmark_date,rule_version,payload,updated_at
@@ -4253,7 +4263,7 @@ def save_forward_candidates(df):
     if df is None or df.empty:
         return
     now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     for _,r in df.iterrows():
         try:
             code=normalize_code(str(r.get("代码","")).strip())
@@ -4448,7 +4458,7 @@ def load_midlong_factor_snapshot(universe,force=False):
     today=bj_now().strftime("%Y-%m-%d")
     source="iFinD-WenCai-v1"
     if not force:
-        conn=sqlite3.connect(DB_PATH)
+        conn=db_connect()
         row=conn.execute(
             """SELECT payload FROM factor_snapshot_cache
                WHERE trade_date=? AND universe=? AND source=?""",
@@ -4500,7 +4510,7 @@ def load_midlong_factor_snapshot(universe,force=False):
 
     if result:
         payload=json.dumps(result,ensure_ascii=False,separators=(",",":"))
-        conn=sqlite3.connect(DB_PATH)
+        conn=db_connect()
         conn.execute(
             """INSERT OR REPLACE INTO factor_snapshot_cache(
                trade_date,universe,source,payload,updated_at
@@ -4879,7 +4889,7 @@ def _save_screener_rows(job_id,df):
     if df is None or df.empty:
         return
     now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     rows=[]
     for _,r in df.iterrows():
         payload={k:_scan_json_value(v) for k,v in r.to_dict().items()}
@@ -4898,7 +4908,7 @@ def _save_screener_rows(job_id,df):
     conn.commit(); conn.close()
 
 def load_screener_job(job_id=None):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     if job_id:
         df=pd.read_sql_query(
             "SELECT * FROM screener_jobs WHERE job_id=?",
@@ -4915,7 +4925,7 @@ def load_screener_job(job_id=None):
 def load_screener_job_results(job_id):
     if not job_id:
         return pd.DataFrame()
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     rows=conn.execute(
         "SELECT payload FROM screener_job_results WHERE job_id=?",
         (job_id,)
@@ -4948,7 +4958,7 @@ def create_screener_job(
     prefix="AUTO" if job_type=="scheduled" else "MAN"
     job_id=f"{prefix}_SCAN_"+bj_now().strftime("%Y%m%d_%H%M%S")
     now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT INTO screener_jobs(
            job_id,job_type,trade_date,universe,exclude_st,batch_size,status,cursor,total,
@@ -4963,7 +4973,7 @@ def create_screener_job(
     return job_id
 
 def latest_screener_job(job_type=None):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     if job_type:
         df=pd.read_sql_query(
             """SELECT * FROM screener_jobs
@@ -4981,7 +4991,7 @@ def latest_screener_job(job_type=None):
     return df.iloc[0].to_dict() if not df.empty else None
 
 def active_screener_job(job_type=None):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     if job_type:
         row=conn.execute(
             """SELECT job_id,status FROM screener_jobs
@@ -5001,7 +5011,7 @@ def active_screener_job(job_type=None):
 def repair_stale_screener_jobs():
     # Streamlit/Render进程重启后，数据库可能仍写着running，但线程已经不存在。
     # 这种任务改成paused，避免“明明完成/已中断却永远挡住下一次扫描”。
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     rows=conn.execute(
         """SELECT job_id FROM screener_jobs
            WHERE status='running'"""
@@ -5018,7 +5028,7 @@ def repair_stale_screener_jobs():
             )
 
 def pause_scheduled_for_manual():
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     rows=conn.execute(
         """SELECT job_id FROM screener_jobs
            WHERE job_type='scheduled' AND status IN ('queued','running')"""
@@ -5030,7 +5040,7 @@ def pause_scheduled_for_manual():
 def resume_scheduled_after_manual():
     if active_screener_job("manual"):
         return None
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     row=conn.execute(
         """SELECT job_id FROM screener_jobs
            WHERE job_type='scheduled' AND status='paused_manual'
@@ -5051,9 +5061,25 @@ def _update_screener_job(job_id,**kwargs):
     cols=list(kwargs.keys())
     sql="UPDATE screener_jobs SET "+",".join([f"{x}=?" for x in cols])+" WHERE job_id=?"
     vals=[kwargs[x] for x in cols]+[job_id]
-    conn=sqlite3.connect(DB_PATH)
-    conn.execute(sql,vals)
-    conn.commit(); conn.close()
+    last=None
+    for attempt in range(5):
+        conn=None
+        try:
+            conn=db_connect()
+            conn.execute(sql,vals)
+            conn.commit()
+            return
+        except sqlite3.OperationalError as ex:
+            last=ex
+            if "locked" not in str(ex).lower() or attempt>=4:
+                raise
+            time.sleep(0.12*(attempt+1))
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
+    if last:
+        raise last
 
 def _background_screener_worker(job_id):
     job=load_screener_job(job_id)
@@ -5211,7 +5237,7 @@ def start_screener_job_background(job_id):
     return True
 
 def get_screener_settings():
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     row=conn.execute(
         """SELECT auto_daily,universe,exclude_st,batch_size,run_after_hour
            FROM screener_settings WHERE id=1"""
@@ -5226,7 +5252,7 @@ def get_screener_settings():
     }
 
 def save_screener_settings(auto_daily,universe,exclude_st,batch_size,run_after_hour):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT INTO screener_settings(
            id,auto_daily,universe,exclude_st,batch_size,run_after_hour,updated_at
@@ -5251,7 +5277,7 @@ def maybe_resume_or_start_daily_screener():
     if active_screener_job("manual"):
         return None
 
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     scheduled=pd.read_sql_query(
         """SELECT * FROM screener_jobs
            WHERE job_type='scheduled'
@@ -5276,7 +5302,7 @@ def maybe_resume_or_start_daily_screener():
         return None
 
     today=now.strftime("%Y-%m-%d")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     row=conn.execute(
         """SELECT job_id,status FROM screener_jobs
            WHERE job_type='scheduled' AND trade_date=? AND universe=?
@@ -5430,7 +5456,7 @@ def add_screener_rows_to_positions(df):
             mm = re.search(r"(\d+(?:\.\d+)?)/100",mkt_text)
             mkt = float(mm.group(1)) if mm else None
             if pd.notna(tech):
-                conn = sqlite3.connect(DB_PATH)
+                conn = db_connect()
                 conn.execute(
                     """UPDATE positions SET
                        entry_score=COALESCE(entry_score,?),
@@ -5510,7 +5536,7 @@ def save_edited_positions(df):
 def upsert_position(code, name, entry_date, entry_price, shares, initial_stop=None, note=""):
     code = normalize_code(code)
     now = bj_now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     old = conn.execute(
         "SELECT entry_score,peak_score,last_score,last_price,last_market_score,last_action,created_at FROM positions WHERE code=?",
         (code,)
@@ -5544,7 +5570,7 @@ def upsert_position(code, name, entry_date, entry_price, shares, initial_stop=No
 
 def close_position(code):
     code = normalize_code(code)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     conn.execute(
         "UPDATE positions SET active=0,updated_at=? WHERE code=?",
         (bj_now().strftime("%Y-%m-%d %H:%M:%S"),code)
@@ -5554,7 +5580,7 @@ def close_position(code):
     sync_shared_light_safe(force=True)
 
 def load_positions(active_only=True):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     q = "SELECT * FROM positions"
     if active_only:
         q += " WHERE active=1"
@@ -5630,7 +5656,7 @@ def import_positions_dataframe(df):
     return ok,errors
 
 def position_history(code, limit=120):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     df = pd.read_sql_query(
         """SELECT snapshot_date,price,technical_score,trend_score,momentum_score,
                   weekly_score,confirm_score,market_score,pnl_pct,action,reason
@@ -5684,7 +5710,7 @@ def refresh_positions():
                 report.get("weekly_score"),mkt_score,current_price,p.get("initial_stop")
             )
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = db_connect()
             conn.execute("""
                 UPDATE positions SET
                   name=?,entry_score=?,peak_score=?,last_score=?,last_price=?,
@@ -5752,7 +5778,7 @@ def refresh_positions():
     return out.sort_values(["_ord","技术分/100"],ascending=[True,True],na_position="last").drop(columns="_ord").reset_index(drop=True)
 
 def recent_analyses(limit=12):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     df = pd.read_sql_query(
         """SELECT created_at,symbol,market,horizon,position_state,state,rating,
                   score,trend_score,momentum_score,weekly_score,confirm_score,model_mode
@@ -5886,7 +5912,7 @@ def create_research_run(universe,years):
         else "港股免费数据源暂使用当前主板股票池回溯，仍存在幸存者偏差。"
     )
 
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT INTO research_runs(
            run_id,created_at,updated_at,universe,years,status,cursor,total,rule_version,benchmark_name,note
@@ -5922,7 +5948,7 @@ def create_research_run(universe,years):
     return run_id,len(pool)
 
 def load_research_runs(limit=30):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         """SELECT * FROM research_runs
            ORDER BY created_at DESC LIMIT ?""",
@@ -5932,7 +5958,7 @@ def load_research_runs(limit=30):
     return df
 
 def get_research_run(run_id):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         "SELECT * FROM research_runs WHERE run_id=?",
         conn,params=(run_id,)
@@ -5941,7 +5967,7 @@ def get_research_run(run_id):
     return df.iloc[0].to_dict() if not df.empty else None
 
 def _research_membership_periods(run_id,code):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         """SELECT period_start,period_end FROM research_membership
            WHERE run_id=? AND code=?
@@ -5972,7 +5998,7 @@ def save_research_stock_result(run_id,code,name,market,trades,ev,wf):
     now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
     pf=ev.get("盈亏因子")
     pf_db=float(pf) if pd.notna(pf) and np.isfinite(pf) else None
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute("DELETE FROM research_trades WHERE run_id=? AND code=?",(run_id,code))
     conn.execute(
         """INSERT OR REPLACE INTO research_stock_results(
@@ -6037,7 +6063,7 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
     cursor=int(run.get("cursor",0) or 0)
     total=int(run.get("total",0) or 0)
     end=min(cursor+int(batch_size),total)
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     members=pd.read_sql_query(
         """SELECT * FROM research_members
            WHERE run_id=? AND seq>=? AND seq<?
@@ -6084,7 +6110,7 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
             processed+=1
             new_cursor=seq+1
             status="completed" if new_cursor>=total else "running"
-            conn=sqlite3.connect(DB_PATH)
+            conn=db_connect()
             conn.execute(
                 """UPDATE research_runs
                    SET cursor=?,status=?,updated_at=?
@@ -6106,7 +6132,7 @@ def run_research_batch(run_id,batch_size=20,progress_callback=None):
 
 def _cached_close_series(code,start_date,end_date):
     code=normalize_code(code)
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         """SELECT trade_date,close FROM market_daily_cache
            WHERE code=? AND trade_date>=? AND trade_date<=?
@@ -6130,7 +6156,7 @@ def _cached_close_series(code,start_date,end_date):
 
 def _research_calendar(run,start_date,end_date):
     code="hkidx.HSI" if str(run.get("universe"))=="港股主板" else "sh.000300"
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         """SELECT DISTINCT trade_date FROM market_daily_cache
            WHERE code=? AND trade_date>=? AND trade_date<=?
@@ -6308,7 +6334,7 @@ def research_summary(run_id):
     if not run:
         return None,pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
 
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     stocks=pd.read_sql_query(
         "SELECT * FROM research_stock_results WHERE run_id=? ORDER BY ev_r DESC",
         conn,params=(run_id,)
@@ -6376,7 +6402,7 @@ def research_summary(run_id):
     return summary,stocks,trades,curve,calibration
 
 def delete_research_run(run_id):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute("DELETE FROM research_trades WHERE run_id=?",(run_id,))
     conn.execute("DELETE FROM research_stock_results WHERE run_id=?",(run_id,))
     conn.execute("DELETE FROM research_members WHERE run_id=?",(run_id,))
@@ -6591,7 +6617,7 @@ def simulate_strategy_variant(prepared_frame,code,params,cost_mult=1.0):
     return pd.DataFrame(trades)
 
 def _strategy_experiment_period(run_id):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     row=conn.execute(
         """SELECT MIN(period_start),MAX(period_end)
            FROM research_membership WHERE run_id=?""",
@@ -6617,7 +6643,7 @@ def create_strategy_experiment(research_run_id,module):
     _,train_end,val_end,_=_strategy_experiment_period(research_run_id)
     exp_id="EXP_"+bj_now().strftime("%Y%m%d_%H%M%S")+"_"+str(abs(hash((research_run_id,module)))%10000).zfill(4)
     now=bj_now().strftime("%Y-%m-%d %H:%M:%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT INTO strategy_experiments(
            experiment_id,research_run_id,module,created_at,updated_at,status,cursor,total,
@@ -6635,7 +6661,7 @@ def create_strategy_experiment(research_run_id,module):
     return exp_id
 
 def load_strategy_experiments(research_run_id=None,limit=30):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     if research_run_id:
         df=pd.read_sql_query(
             """SELECT * FROM strategy_experiments
@@ -6653,7 +6679,7 @@ def load_strategy_experiments(research_run_id=None,limit=30):
     return df
 
 def get_strategy_experiment(experiment_id):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         "SELECT * FROM strategy_experiments WHERE experiment_id=?",
         conn,params=(experiment_id,)
@@ -6662,7 +6688,7 @@ def get_strategy_experiment(experiment_id):
     return df.iloc[0].to_dict() if not df.empty else None
 
 def _save_strategy_experiment_trades(experiment_id,config_id,code,trades):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """DELETE FROM strategy_experiment_trades
            WHERE experiment_id=? AND config_id=? AND code=?""",
@@ -6703,7 +6729,7 @@ def run_strategy_experiment_batch(experiment_id,batch_size=5,progress_callback=N
     total=int(exp.get("total",0) or 0)
     end=min(cursor+int(batch_size),total)
 
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     members=pd.read_sql_query(
         """SELECT * FROM research_members
            WHERE run_id=? AND seq>=? AND seq<?
@@ -6757,7 +6783,7 @@ def run_strategy_experiment_batch(experiment_id,batch_size=5,progress_callback=N
             processed+=1
             new_cursor=seq+1
             status="completed" if new_cursor>=total else "running"
-            conn=sqlite3.connect(DB_PATH)
+            conn=db_connect()
             conn.execute(
                 """UPDATE strategy_experiments
                    SET cursor=?,status=?,updated_at=? WHERE experiment_id=?""",
@@ -6803,7 +6829,7 @@ def strategy_experiment_summary(experiment_id,include_test=None):
     train_end=pd.Timestamp(exp["train_end"])
     val_end=pd.Timestamp(exp["validation_end"])
 
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     trades=pd.read_sql_query(
         """SELECT * FROM strategy_experiment_trades
            WHERE experiment_id=?""",
@@ -6898,7 +6924,7 @@ def strategy_experiment_summary(experiment_id,include_test=None):
     return out,candidate
 
 def reveal_strategy_test(experiment_id):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """UPDATE strategy_experiments
            SET test_revealed=1,updated_at=? WHERE experiment_id=?""",
@@ -6921,7 +6947,7 @@ def save_strategy_candidate(experiment_id,config_id):
     if not cfg:
         raise RuntimeError("找不到该参数方案")
     cid="CAND_"+bj_now().strftime("%Y%m%d_%H%M%S")
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     conn.execute(
         """INSERT INTO strategy_candidates(
            candidate_id,experiment_id,created_at,module,config_id,config_json,status,note
@@ -6941,7 +6967,7 @@ def save_strategy_candidate(experiment_id,config_id):
     return cid
 
 def load_strategy_candidates(limit=30):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         """SELECT * FROM strategy_candidates
            ORDER BY created_at DESC LIMIT ?""",
@@ -6951,7 +6977,7 @@ def load_strategy_candidates(limit=30):
     return df
 
 def load_forward_signals(limit=300):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     df=pd.read_sql_query(
         """SELECT * FROM forward_signals
            ORDER BY signal_date DESC,id DESC LIMIT ?""",
@@ -7020,7 +7046,7 @@ def _evaluate_forward_signal_row(sig):
     return "tracking",float(last_r) if pd.notna(last_r) else np.nan,None
 
 def refresh_forward_tests(max_items=25):
-    conn=sqlite3.connect(DB_PATH)
+    conn=db_connect()
     pending=pd.read_sql_query(
         """SELECT * FROM forward_signals
            WHERE status='tracking'
@@ -7036,7 +7062,7 @@ def refresh_forward_tests(max_items=25):
     for _,sig in pending.iterrows():
         try:
             status,r_value,exit_date=_evaluate_forward_signal_row(sig)
-            conn=sqlite3.connect(DB_PATH)
+            conn=db_connect()
             conn.execute(
                 """UPDATE forward_signals SET
                    status=?,realized_r=?,exit_date=?,updated_at=?
@@ -7073,7 +7099,7 @@ def forward_test_summary():
     },df
 
 def history(limit=300):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     df = pd.read_sql_query("SELECT * FROM analyses ORDER BY id DESC LIMIT ?", conn, params=(limit,))
     conn.close()
     return df
