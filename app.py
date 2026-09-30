@@ -309,6 +309,85 @@ def extract_holdings_from_images(files):
         })
     return pd.DataFrame(rows)
 
+BATCH_SYMBOL_SCREENSHOT_PROMPT = """
+你是一个严谨的A股/港股股票列表读取器。用户会上传自选股、持仓、行情列表、选股结果等截图。
+你的任务只提取截图中明确出现的股票代码和股票名称，不做技术分析，不猜测看不清的数据。
+
+只输出合法JSON：
+{
+  "stocks":[
+    {
+      "symbol":"A股6位代码或港股5位代码；明确可见才填写，否则空字符串",
+      "name":"股票名称；明确可见才填写，否则空字符串",
+      "market":"A股或港股；不确定留空"
+    }
+  ],
+  "unclear":"无法确认的内容简述"
+}
+
+规则：
+- 同一股票在多张截图重复出现，只保留一条。
+- A股代码保留6位；港股代码统一补足5位，例如0700输出00700。
+- 不要输出指数、现金、基金、债券、美股。
+- 如果只有名称没有代码，也可以保留名称，后续系统会用名称解析。
+- 如果只有代码没有名称，也可以保留代码。
+- 看不清就留空，不要编造。
+"""
+
+def extract_batch_symbols_from_images(files):
+    api_key=os.getenv("DEEPSEEK_API_KEY","").strip()
+    if not api_key:
+        raise RuntimeError("服务器未配置截图识别接口。")
+    if not files:
+        return pd.DataFrame(columns=["分析","代码或名称","名称","市场"])
+
+    content=[{"type":"text","text":BATCH_SYMBOL_SCREENSHOT_PROMPT}]
+    for f in files:
+        blob=f.getvalue()
+        mime=getattr(f,"type",None) or "image/png"
+        content.append({
+            "type":"image_url",
+            "image_url":{"url":data_url_bytes(blob,mime)}
+        })
+
+    client=OpenAI(api_key=api_key,base_url="https://api.deepseek.com")
+    resp=client.chat.completions.create(
+        model="deepseek-flash",
+        messages=[{"role":"user","content":content}],
+        response_format={"type":"json_object"},
+        temperature=0
+    )
+    obj=parse_json(resp.choices[0].message.content)
+    if not obj or not isinstance(obj.get("stocks"),list):
+        raise RuntimeError("截图股票识别结果格式异常。")
+
+    rows=[]
+    seen=set()
+    for x in obj["stocks"]:
+        symbol=str(x.get("symbol") or "").strip()
+        name=str(x.get("name") or "").strip()
+        market=str(x.get("market") or "").strip()
+        digits=re.sub(r"\D","",symbol)
+        if market=="港股" and digits:
+            symbol=digits.zfill(5)[-5:]
+        elif market=="A股" and len(digits)==6:
+            symbol=digits
+        elif digits and 1<=len(digits)<=5:
+            symbol=digits.zfill(5)[-5:]
+        elif len(digits)==6:
+            symbol=digits
+        key=(symbol or name).upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "分析":True,
+            "代码或名称":symbol or name,
+            "名称":name,
+            "市场":market
+        })
+    return pd.DataFrame(rows)
+
 EXTRACT_PROMPT = """
 你是一个严谨的股票/ETF技术图表读取器。任务不是自由发挥，而是从用户上传的日K/周K截图中提取可验证事实，并做简短技术解释。
 核心体系：BOLL + MACD + 成交量；ATR仅在清晰可见时读取。
@@ -1856,6 +1935,117 @@ def numeric_score(latest_d,latest_w=None):
 
     overall=(0.50*trend+0.35*momentum+0.15*confirm) if weekly is None else (0.38*trend+0.30*momentum+0.22*weekly+0.10*confirm)
     return round(overall,1),round(trend,1),round(momentum,1),(round(weekly,1) if weekly is not None else None),round(confirm,1)
+
+def build_operation_strategy(
+    code,position_state,fundamentals_ok,technical,buy_score,weekly,rr,
+    market_score,rs_score,opp,tier,ev,close,mid,risk_price,target_price,atr
+):
+    holding=position_state!="未持有"
+    p=automatic_entry_policy(market_score)
+    ev_mean=ev.get("EV_R",np.nan)
+    ev_lcb=ev.get("保守EV_R",np.nan)
+    ev_stress=ev.get("压力EV_R",np.nan)
+    wf=ev.get("walk_forward") or {}
+    oos=wf.get("OOS_EV_R",np.nan)
+
+    ev_strong=(
+        pd.notna(ev_mean) and ev_mean>0 and
+        pd.notna(ev_lcb) and ev_lcb>0 and
+        pd.notna(ev_stress) and ev_stress>0
+    )
+    weekly_ok=pd.notna(weekly) and weekly>=p["周线"]
+
+    if holding:
+        if technical<45 or (pd.notna(weekly) and weekly<45):
+            action="退出/大幅减仓"
+            position_plan="优先把风险降到轻仓或清仓；不在技术失效状态下补仓。"
+        elif technical<55 or market_score<25:
+            action="减仓"
+            position_plan="降低一档仓位；剩余仓位只用于观察是否重新站回强势结构。"
+        elif technical<65:
+            action="谨慎持有"
+            position_plan="维持现有核心仓，不主动加仓；等待技术分重新回到65以上。"
+        elif tier=="优先机会" and ev_strong and weekly_ok:
+            action="持有，可等确认后加仓"
+            position_plan="已有仓位以持有为主；若回踩确认且未追高，可小幅加仓，单次新增风险建议不超过组合NAV的0.5%。"
+        else:
+            action="持有观察"
+            position_plan="维持仓位，不追涨；只有买点、周线和EV重新共振时才考虑加仓。"
+    else:
+        if tier=="优先机会" and ev_strong and fundamentals_ok:
+            action="分批建仓"
+            position_plan="先试仓约目标仓位的1/3～1/2；确认后再加，不一次满仓。单笔风险预算建议≤组合NAV的0.5%。"
+        elif tier=="优先机会" and not fundamentals_ok:
+            action="等待基本面/估值确认"
+            position_plan="技术与EV已通过，但在基本面/估值确认前不执行中长期建仓。"
+        elif tier=="候选观察":
+            action="观察，等待触发"
+            position_plan="暂不追价；满足下方买入触发后再考虑轻仓试单。"
+        else:
+            action="不买/继续等待"
+            position_plan="当前结构或EV证据不足，不因短期上涨放宽门槛。"
+
+    entry_parts=[]
+    if pd.notna(mid):
+        entry_parts.append(f"收盘保持/重新站稳BOLL中轨 {mid:.2f}")
+    entry_parts.append(f"技术分≥{p['技术']}、买点分≥{p['买点']}")
+    entry_parts.append(f"确认周线≥{p['周线']}、相对强度≥{p['相对强度']}")
+    entry_parts.append(f"结构RR≥{p['盈亏比']:.2f}")
+    if pd.notna(atr) and atr>0 and pd.notna(close):
+        entry_parts.append(f"次日开盘相对信号收盘跳空不超过约 {1.5*atr:.2f}（1.5ATR）")
+    if not holding:
+        entry_parts.append("历史EV、保守EV、2倍成本EV均为正时优先执行")
+
+    if holding:
+        add_parts=[
+            f"技术分维持≥{max(65,p['技术'])}",
+            f"买点分重新≥{p['买点']}且不明显追高",
+            f"周线≥{p['周线']}，市场环境不处于逆风区"
+        ]
+        if pd.notna(ev_lcb):
+            add_parts.append("保守EV继续>0")
+    else:
+        add_parts=["首仓后只有结构继续强化且风险位上移，才进行第二次加仓"]
+
+    reduce_parts=[
+        "技术分跌破55进入谨慎/减仓区",
+        "技术分较阶段峰值回落≥15且当前分<65",
+        "确认周线跌破45",
+        "市场环境<25且技术分<60"
+    ]
+    exit_parts=["技术分<45或周线<45"]
+    if pd.notna(risk_price):
+        exit_parts.insert(0,f"价格触及/跌破初始风险位 {risk_price:.2f}，按风险位优先执行")
+    if pd.notna(mid):
+        exit_parts.append(f"持续运行于中轨 {mid:.2f} 下方且动能没有修复")
+
+    target_txt=(
+        f"{target_price:.2f} 附近作为参考压力区；不是固定止盈，强趋势可继续持有。"
+        if pd.notna(target_price) else "暂无可靠固定压力位，使用技术退出而不是机械止盈。"
+    )
+    risk_txt=(
+        f"{risk_price:.2f}" if pd.notna(risk_price)
+        else "当前无法形成可靠结构风险位，暂不扩大仓位"
+    )
+    oos_txt=f"{oos:+.2f}R" if pd.notna(oos) else "样本不足"
+    weekly_txt=f"{weekly:.0f}" if pd.notna(weekly) else "—"
+    rr_txt=f"{rr:.2f}" if pd.notna(rr) else "—"
+
+    return {
+        "action":action,
+        "position_plan":position_plan,
+        "entry_trigger":"；".join(entry_parts),
+        "add_trigger":"；".join(add_parts),
+        "reduce_trigger":"；".join(reduce_parts),
+        "exit_trigger":"；".join(exit_parts),
+        "risk_line":risk_txt,
+        "target_zone":target_txt,
+        "evidence":(
+            f"技术{technical:.0f} / 买点{buy_score:.0f} / 周线{weekly_txt} / "
+            f"RR {rr_txt} / 市场{market_score:.0f} / RS{rs_score:.0f} / "
+            f"机会{opp:.0f} / OOS EV {oos_txt}"
+        )
+    }
 
 def deterministic_report(code,name,df,position_state,fundamentals_ok,benchmark_df=None,compute_ev=True):
     di=add_indicators(df)
