@@ -25,6 +25,7 @@ from ifind_http import (
     history_one as ifind_history_one,
     history_many as ifind_history_many,
     basic_names as ifind_basic_names,
+    smart_stock_picking as ifind_wencai,
 )
 from shared_store import (
     enabled as shared_db_enabled,
@@ -821,6 +822,16 @@ def init_db():
       config_json TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'candidate',
       note TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS factor_snapshot_cache(
+      trade_date TEXT NOT NULL,
+      universe TEXT NOT NULL,
+      source TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(trade_date,universe,source)
     )
     """)
     conn.execute("""
