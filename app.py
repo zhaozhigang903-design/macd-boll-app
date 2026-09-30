@@ -2849,9 +2849,6 @@ def deterministic_report(
         )
     else:
         p=automatic_entry_policy(mkt_score)
-        watch_pass=(
-            technical if False else score
-        )
         structure_watch=(
             score>=p["技术"]-4 and buy_score>=p["买点"]-4 and
             pd.notna(weekly) and weekly>=p["周线"]-4 and
@@ -4068,6 +4065,72 @@ def realized_trade_ev(df,benchmark_df,code,use_cache=True,benchmark_features=Non
     if use_cache:
         save_cached_ev(df,benchmark_df,code,base)
     return base,trades,False
+
+def _analysis_ev_worker(code):
+    code=normalize_code(code)
+    try:
+        cached,_=get_recent_cached_ev(code,max_age_days=7)
+        if cached is not None:
+            return
+        if ifind_configured():
+            try:
+                prefetch_ifind_analysis_bundle(code,daily_years=5,weekly_years=5)
+            except Exception:
+                pass
+
+        bs_open=False
+        if not ifind_configured():
+            try:
+                bs_open=bool(bs_login(retries=1,strict=False))
+            except Exception:
+                bs_open=False
+
+        df=fetch_stock_daily(code,years=5)
+        benchmark=fetch_benchmark_for_code(code,years=5)
+        try:
+            weekly=fetch_stock_weekly(code,years=5)
+        except Exception:
+            weekly=None
+        bench_features=market_score_series(benchmark) if benchmark is not None and not benchmark.empty else None
+        realized_trade_ev(
+            df,benchmark,code,use_cache=True,
+            benchmark_features=bench_features,weekly_df=weekly
+        )
+    except Exception as ex:
+        print("ANALYSIS_EV_BACKGROUND_ERROR",code,ex)
+    finally:
+        try:
+            if 'bs_open' in locals() and bs_open:
+                bs_logout_safe()
+        except Exception:
+            pass
+        with _ANALYSIS_EV_LOCK:
+            _ANALYSIS_EV_THREADS.pop(code,None)
+
+def start_analysis_ev_background(code):
+    code=normalize_code(code)
+    if not code:
+        return False
+    cached,_=get_recent_cached_ev(code,max_age_days=7)
+    if cached is not None:
+        return False
+    with _ANALYSIS_EV_LOCK:
+        t=_ANALYSIS_EV_THREADS.get(code)
+        if t is not None and t.is_alive():
+            return True
+        t=threading.Thread(
+            target=_analysis_ev_worker,args=(code,),
+            daemon=True,name=f"analysis-ev-{display_code(code)}"
+        )
+        _ANALYSIS_EV_THREADS[code]=t
+        t.start()
+    return True
+
+def analysis_ev_running(code):
+    code=normalize_code(code)
+    with _ANALYSIS_EV_LOCK:
+        t=_ANALYSIS_EV_THREADS.get(code)
+        return bool(t is not None and t.is_alive())
 
 def ev_opportunity_decision(technical,buy_score,weekly,rr,market_score,rs_score,opp,ev,liq_ok):
     p=automatic_entry_policy(market_score)
