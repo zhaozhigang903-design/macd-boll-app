@@ -6,6 +6,11 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+
+_SESSION = requests.Session()
+_SESSION.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0))
+_SESSION.mount("http://", HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0))
 
 BASE_URL = (os.getenv("IFIND_BASE_URL") or "https://quantapi.51ifind.com").rstrip("/")
 REFRESH_TOKEN = (os.getenv("IFIND_REFRESH_TOKEN") or "").strip()
@@ -67,9 +72,9 @@ def _get_access_token(force=False):
             "refresh_token": REFRESH_TOKEN,
         }
         last = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                resp = requests.post(url, headers=headers, timeout=20)
+                resp = _SESSION.post(url, headers=headers, timeout=12)
                 resp.raise_for_status()
                 obj = resp.json()
                 token = ((obj.get("data") or {}).get("access_token") or "").strip()
@@ -82,26 +87,27 @@ def _get_access_token(force=False):
                 return token
             except Exception as exc:
                 last = exc
-                if attempt < 2:
-                    time.sleep(1.2 * (attempt + 1))
+                if attempt < 1:
+                    time.sleep(1.0 * (attempt + 1))
         raise RuntimeError(f"iFind获取access token失败：{last}")
 
 
-def _post(endpoint, payload, timeout=30):
+def _post(endpoint, payload, timeout=25, retries=2):
     url = BASE_URL + endpoint
     last = None
-    for attempt in range(3):
+    for attempt in range(max(1, int(retries))):
         try:
-            token = _get_access_token(force=(attempt == 2))
+            token = _get_access_token(force=False)
             headers = {
                 "Content-Type": "application/json",
                 "access_token": token,
                 "ifindlang": "cn",
             }
-            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp = _SESSION.post(url, json=payload, headers=headers, timeout=timeout)
             if resp.status_code in (401, 403):
                 _get_access_token(force=True)
-                raise RuntimeError(f"iFind鉴权失败 HTTP {resp.status_code}")
+                headers["access_token"] = _get_access_token(force=False)
+                resp = _SESSION.post(url, json=payload, headers=headers, timeout=timeout)
             resp.raise_for_status()
             obj = resp.json()
             err = obj.get("errorcode", obj.get("errorCode", 0))
@@ -116,8 +122,8 @@ def _post(endpoint, payload, timeout=30):
             return obj
         except Exception as exc:
             last = exc
-            if attempt < 2:
-                time.sleep(1.0 * (attempt + 1))
+            if attempt < max(1, int(retries)) - 1:
+                time.sleep(0.8 * (attempt + 1))
     raise RuntimeError(str(last))
 
 
@@ -217,7 +223,8 @@ def history_many(app_codes, start, end, interval="D", cps=2):
             "Currency": "YSHB",
         },
     }
-    obj = _post("/api/v1/cmd_history_quotation", payload, timeout=45)
+    timeout = 20 if len(app_codes) <= 3 else 30
+    obj = _post("/api/v1/cmd_history_quotation", payload, timeout=timeout, retries=2)
     raw = _history_frames(obj)
     out = {}
 
@@ -260,6 +267,53 @@ def history_many(app_codes, start, end, interval="D", cps=2):
 def history_one(app_code, start, end, interval="D", cps=2):
     data = history_many([app_code], start, end, interval=interval, cps=cps)
     return data.get(str(app_code), pd.DataFrame())
+
+
+
+def basic_names(app_codes):
+    """Return {app_code: short_name} using iFinD basic-data service."""
+    if not configured():
+        return {}
+    app_codes=[str(x) for x in app_codes if str(x).strip()]
+    if not app_codes:
+        return {}
+    ths_codes=[_to_ifind_code(x) for x in app_codes]
+    payload={
+        "codes": ",".join(ths_codes),
+        "indipara": [{"indicator":"ths_stock_short_name_stock"}],
+    }
+    obj=_post("/api/v1/basic_data_service",payload,timeout=12,retries=2)
+    entries=_table_entries(obj)
+    by_ths={}
+    for entry in entries:
+        code=str(entry.get("thscode") or entry.get("code") or entry.get("THSCODE") or "").upper()
+        table=entry.get("table") or entry.get("data") or {}
+        name=None
+        if isinstance(table,dict):
+            for key in ["ths_stock_short_name_stock","stock_short_name","name"]:
+                if key in table:
+                    vals=_as_list(table.get(key))
+                    if vals:
+                        name=vals[0]
+                        break
+            if name is None:
+                for v in table.values():
+                    vals=_as_list(v)
+                    if vals and isinstance(vals[0],str):
+                        name=vals[0]
+                        break
+        elif isinstance(table,list) and table:
+            first=table[0]
+            if isinstance(first,dict):
+                name=first.get("ths_stock_short_name_stock") or first.get("name")
+        if code and name is not None and str(name).strip():
+            by_ths[code]=str(name).strip()
+    out={}
+    for app_code,ths_code in zip(app_codes,ths_codes):
+        name=by_ths.get(ths_code.upper())
+        if name:
+            out[str(app_code)]=name
+    return out
 
 
 def status(test_data=False):
