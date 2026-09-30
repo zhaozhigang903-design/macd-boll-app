@@ -4720,6 +4720,17 @@ def screen_codes(
     if not final_candidates:
         return pd.DataFrame(),stats
 
+    # 先按“当前技术+基本面+市场”预排序，让更有中长线质量的候选优先做EV验证。
+    # 这不会丢弃任何候选，只改变昂贵EV计算的先后顺序。
+    for item in final_candidates:
+        item["_pre_rank"]=midlong_composite_score(
+            item["technical"],item["buy_score"],item["weekly"],
+            item["rs_score"],mkt_score,{},item.get("factor") or {}
+        )
+    final_candidates=sorted(
+        final_candidates,key=lambda x:x.get("_pre_rank",0),reverse=True
+    )
+
     # 阶段3：EV是慢变量，14天内直接复用；只有真正缺失的才批量补5年历史。
     ev_cache={}
     ev_miss=[]
