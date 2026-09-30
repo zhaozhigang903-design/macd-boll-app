@@ -1304,7 +1304,7 @@ def benchmark_label_for_code(code):
     return "恒生指数" if market_of_code(code) == "港股" else "沪深300"
 
 def data_source_for_code(code):
-    return "AKShare" if market_of_code(code) == "港股" else "BaoStock"
+    return "AKShare" if market_of_code(code) == "港股" else "BaoStock→AKShare自动容灾"
 
 def extract_a_share_code(*values):
     for value in values:
@@ -1320,32 +1320,44 @@ def display_code(code):
     s = str(code or "")
     return s.split(".")[-1].upper() if "." in s else s.upper()
 
-def bs_login(retries=3):
-    # BaoStock使用全局socket，会话并不支持同一进程多线程并发登录。
-    # 用进程级RLock把“登录→查询→登出”串行化，避免后台选股与前台分析互相挤掉会话。
+def bs_login(retries=3,strict=False):
+    # BaoStock会话不支持同一进程多线程并发。若上游把Render IP临时列入黑名单，
+    # 默认不再让整个App失败，而是释放锁并交给AKShare容灾。
     depth=int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)
     if depth>0:
         _BAOSTOCK_SESSION_OWNER.depth=depth+1
-        return None
+        return True
 
-    acquired=_BAOSTOCK_SESSION_LOCK.acquire(timeout=120)
+    acquired=_BAOSTOCK_SESSION_LOCK.acquire(timeout=30)
     if not acquired:
-        raise RuntimeError("BaoStock当前正被后台任务占用，请稍后重试。")
+        if strict:
+            raise RuntimeError("BaoStock当前正被后台任务占用，请稍后重试。")
+        return False
 
     last_msg=""
     try:
         for attempt in range(1,int(retries)+1):
-            lg=bs.login()
-            if getattr(lg,"error_code","-1")=="0":
-                _BAOSTOCK_SESSION_OWNER.depth=1
-                return lg
-            last_msg=str(getattr(lg,"error_msg","未知错误"))
-            # 黑名单通常由短时间并发/频繁登录触发，先退避再试。
+            try:
+                lg=bs.login()
+                if getattr(lg,"error_code","-1")=="0":
+                    _BAOSTOCK_SESSION_OWNER.depth=1
+                    _BAOSTOCK_SESSION_OWNER.last_error=""
+                    return True
+                last_msg=str(getattr(lg,"error_msg","未知错误"))
+            except Exception as ex:
+                last_msg=str(ex)
             if attempt<int(retries):
-                time.sleep(2.0*attempt)
-        raise RuntimeError("BaoStock登录失败："+last_msg)
-    except Exception:
+                time.sleep(1.2*attempt)
+        _BAOSTOCK_SESSION_OWNER.last_error=last_msg
+        if strict:
+            raise RuntimeError("BaoStock登录失败："+last_msg)
         _BAOSTOCK_SESSION_LOCK.release()
+        return False
+    except Exception:
+        try:
+            _BAOSTOCK_SESSION_LOCK.release()
+        except Exception:
+            pass
         raise
 
 def bs_logout_safe():
