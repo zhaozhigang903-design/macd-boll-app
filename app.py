@@ -7143,22 +7143,55 @@ with tab1:
                     status=st.empty()
                     reports=[]
                     errors=[]
+                    resolved=[]
                     benchmark_cache={}
+                    bs_open=False
+                    t0=time.perf_counter()
                     try:
-                        bs_login()
-                        for idx,(_,row) in enumerate(selected.iterrows(),start=1):
+                        if not ifind_configured():
+                            bs_open=bool(bs_login(retries=1,strict=False))
+
+                        # 先解析代码，再一次性预取日K和原生周K，避免逐只发网络请求。
+                        for _,row in selected.iterrows():
                             raw=str(row.get("代码或名称","")).strip()
-                            status.caption(f"正在分析 {idx}/{len(selected)}：{raw}")
                             try:
                                 code,name=resolve_symbol_input(raw)
+                                resolved.append((raw,code,name))
+                            except Exception as ex:
+                                errors.append(f"{raw}: {ex}")
+
+                        if ifind_configured() and resolved:
+                            codes=[x[1] for x in resolved]
+                            status.caption(f"正在批量预取 {len(codes)} 只股票日K/周K…")
+                            prefetch_ifind_daily(codes,years=2)
+                            prefetch_ifind_weekly(codes,years=3)
+
+                        total_resolved=len(resolved)
+                        for idx,(raw,code,name) in enumerate(resolved,start=1):
+                            status.caption(f"正在分析 {idx}/{total_resolved}：{name} {display_code(code)}")
+                            try:
                                 market=market_of_code(code)
                                 if market not in benchmark_cache:
-                                    benchmark_cache[market]=fetch_benchmark_for_code(code,years=5)
-                                df_auto=fetch_stock_daily(code,years=5)
+                                    benchmark_cache[market]=fetch_benchmark_for_code(code,years=2)
+                                df_auto=fetch_stock_daily(code,years=2)
+                                try:
+                                    native_weekly=fetch_stock_weekly(code,years=3)
+                                except Exception:
+                                    native_weekly=None
+
+                                ev_cached,ev_age=get_recent_cached_ev(code,max_age_days=7)
                                 report=deterministic_report(
                                     code,name,df_auto,batch_position,batch_fund,
-                                    benchmark_cache[market]
+                                    benchmark_cache[market],
+                                    compute_ev=False,
+                                    native_weekly_df=native_weekly,
+                                    ev_override=ev_cached
                                 )
+                                report["ev_cache_age_days"]=ev_age
+                                if ev_cached is None and report.get("opportunity_label")!="不通过":
+                                    started=start_analysis_ev_background(code)
+                                    report["ev_pending"]=bool(started or analysis_ev_running(code))
+
                                 prev=previous(report["symbol"])
                                 if prev and prev.get("score") is not None:
                                     try:
@@ -7173,17 +7206,23 @@ with tab1:
                             except Exception as ex:
                                 errors.append(f"{raw}: {ex}")
                             progress.progress(
-                                idx/len(selected),
-                                text=f"批量分析 {idx}/{len(selected)} · 成功 {len(reports)} · 失败 {len(errors)}"
+                                idx/max(total_resolved,1),
+                                text=f"批量分析 {idx}/{total_resolved} · 成功 {len(reports)} · 失败 {len(errors)}"
                             )
                     finally:
-                        try: bs_logout_safe()
-                        except Exception: pass
+                        try:
+                            if bs_open:
+                                bs_logout_safe()
+                        except Exception:
+                            pass
 
+                    elapsed=round(time.perf_counter()-t0,1)
+                    for r in reports:
+                        r["batch_elapsed_seconds"]=elapsed
                     st.session_state["batch_reports"]=reports
                     st.session_state["batch_analysis_errors"]=errors
                     if reports:
-                        st.success(f"完成 {len(reports)} 只股票分析。")
+                        st.success(f"完成 {len(reports)} 只股票快速分析，用时约 {elapsed:.1f} 秒。未缓存的5年EV已转后台计算。")
                     if errors:
                         st.warning("部分股票失败："+"；".join(errors[:6]))
                     st.rerun()
