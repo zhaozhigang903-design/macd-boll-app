@@ -1927,11 +1927,55 @@ def _download_daily(code,start,end):
     code = normalize_code(code)
     return _download_hk_daily(code,start,end) if code.startswith("hk.") else _download_a_daily(code,start,end)
 
+def market_cache_flag(code,kind="daily"):
+    code=normalize_code(code)
+    if kind=="index":
+        return "ifind_idx_v1" if ifind_configured() else "3"
+    if kind=="weekly":
+        if ifind_configured():
+            return "ifind_hk_w_qfq_v1" if code.startswith("hk.") else "ifind_a_w_qfq_v1"
+        return "hk_w_qfq" if code.startswith("hk.") else "w2"
+    if ifind_configured():
+        return "ifind_hk_qfq_v1" if code.startswith("hk.") else "ifind_a_qfq_v1"
+    return "hk_qfq" if code.startswith("hk.") else "2"
+
+def prefetch_ifind_daily(codes,years=1):
+    if not ifind_configured():
+        return {"requested":0,"saved":0,"errors":[]}
+    clean=[normalize_code(x) for x in codes if normalize_code(x)]
+    if not clean:
+        return {"requested":0,"saved":0,"errors":[]}
+    end=datetime.now().strftime("%Y-%m-%d")
+    start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
+    need=[]
+    for code in clean:
+        flag=market_cache_flag(code,"daily")
+        cmin,cmax,last_checked=_cache_bounds(code,flag)
+        if not cmin or not cmax or cmin>start or _should_refresh_cache(last_checked,cmax):
+            need.append(code)
+    if not need:
+        return {"requested":0,"saved":0,"errors":[]}
+    saved=0
+    errors=[]
+    for pos in range(0,len(need),20):
+        batch=need[pos:pos+20]
+        try:
+            got=ifind_history_many(batch,start,end,interval="D",cps=2)
+            for code,df in got.items():
+                if df is not None and not df.empty:
+                    flag=market_cache_flag(code,"daily")
+                    _save_daily_cache(df,code,flag)
+                    _mark_cache_checked(code)
+                    saved+=1
+        except Exception as ex:
+            errors.append(str(ex))
+    return {"requested":len(need),"saved":saved,"errors":errors}
+
 def fetch_stock_daily(code,years=3):
     code=normalize_code(code)
     end=datetime.now().strftime("%Y-%m-%d")
     start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
-    cache_flag="hk_qfq" if code.startswith("hk.") else "2"
+    cache_flag=market_cache_flag(code,"daily")
     cache_min,cache_max,last_checked=_cache_bounds(code,cache_flag)
 
     def _cached():
@@ -2067,15 +2111,16 @@ def _download_index_daily(code,start,end):
 def fetch_benchmark_daily(years=5,code="sh.000300"):
     end=datetime.now().strftime("%Y-%m-%d")
     start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
-    cache_min,cache_max,last_checked=_cache_bounds(code,"3")
+    flag=market_cache_flag(code,"index")
+    cache_min,cache_max,last_checked=_cache_bounds(code,flag)
 
     def _cached():
-        return _read_daily_cache(code,start,end,"3")
+        return _read_daily_cache(code,start,end,flag)
 
     if not cache_min or not cache_max:
         try:
             fresh=_download_index_daily(code,start,end)
-            _save_daily_cache(fresh,code,"3")
+            _save_daily_cache(fresh,code,flag)
             _mark_cache_checked(code)
         except Exception:
             cached=_cached()
@@ -2087,7 +2132,7 @@ def fetch_benchmark_daily(years=5,code="sh.000300"):
             pre_end=(pd.Timestamp(cache_min)-pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             try:
                 older=_download_index_daily(code,start,pre_end)
-                _save_daily_cache(older,code,"3")
+                _save_daily_cache(older,code,flag)
             except Exception:
                 cached=_cached()
                 if len(cached)<60:
@@ -2097,7 +2142,7 @@ def fetch_benchmark_daily(years=5,code="sh.000300"):
             next_start=(pd.Timestamp(cache_max)+pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             try:
                 newer=_download_index_daily(code,next_start,end)
-                _save_daily_cache(newer,code,"3")
+                _save_daily_cache(newer,code,flag)
                 _mark_cache_checked(code)
             except Exception:
                 cached=_cached()
@@ -2371,7 +2416,7 @@ def fetch_stock_weekly(code,years=5):
     code=normalize_code(code)
     end=datetime.now().strftime("%Y-%m-%d")
     start=(pd.Timestamp.today()-pd.Timedelta(days=365*years+240)).strftime("%Y-%m-%d")
-    flag="hk_w_qfq" if code.startswith("hk.") else "w2"
+    flag=market_cache_flag(code,"weekly")
     cache_min,cache_max,last_checked=_cache_bounds(code,flag)
 
     if not cache_min or not cache_max:
