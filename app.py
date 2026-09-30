@@ -1443,16 +1443,27 @@ def hk_universe_snapshot():
     return out.reset_index(drop=True)
 
 def _a_name_matches(s):
-    rows = []
+    rows=[]
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            rs=bs.query_stock_basic(code_name=s)
+            if getattr(rs,"error_code","0")=="0":
+                df=_rs_to_df(rs)
+                if not df.empty and "code" in df.columns:
+                    name_col="code_name" if "code_name" in df.columns else ("name" if "name" in df.columns else None)
+                    for _,row in df.iterrows():
+                        name=str(row[name_col]).strip() if name_col else ""
+                        if name:
+                            rows.append((str(row["code"]),name))
+        except Exception:
+            pass
+    if rows:
+        return rows
     try:
-        rs = bs.query_stock_basic(code_name=s)
-        df = _rs_to_df(rs)
-        if not df.empty and "code" in df.columns:
-            name_col = "code_name" if "code_name" in df.columns else ("name" if "name" in df.columns else None)
-            for _,row in df.iterrows():
-                name = str(row[name_col]).strip() if name_col else ""
-                if name:
-                    rows.append((str(row["code"]),name))
+        pool=_ak_all_a_universe()
+        exact=pool[pool["code_name"].astype(str).str.strip()==str(s).strip()]
+        for _,row in exact.iterrows():
+            rows.append((str(row["code"]),str(row["code_name"])))
     except Exception:
         pass
     return rows
@@ -1528,24 +1539,35 @@ def resolve_symbol_input(value):
     raise ValueError(f"未找到股票：{s}。港股名称查询依赖港股股票池接口；若上游暂时不可用，可先输入港股代码，例如腾讯控股输入 0700 或 00700。")
 
 def stock_basic_name(code):
-    code = normalize_code(code)
+    code=normalize_code(code)
     if code.startswith("hk."):
         try:
-            hk = hk_universe_snapshot()
-            hit = hk[hk["code"] == code]
+            hk=hk_universe_snapshot()
+            hit=hk[hk["code"]==code]
             if not hit.empty:
                 return str(hit.iloc[0]["code_name"]).strip()
         except Exception:
             pass
         return display_code(code)
 
-    rs = bs.query_stock_basic(code=code)
-    df = _rs_to_df(rs)
-    if df.empty:
-        return display_code(code)
-    for col in ["code_name","name"]:
-        if col in df.columns and str(df.iloc[0][col]).strip():
-            return str(df.iloc[0][col]).strip()
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            rs=bs.query_stock_basic(code=code)
+            if getattr(rs,"error_code","0")=="0":
+                df=_rs_to_df(rs)
+                if not df.empty:
+                    for col in ["code_name","name"]:
+                        if col in df.columns and str(df.iloc[0][col]).strip():
+                            return str(df.iloc[0][col]).strip()
+        except Exception:
+            pass
+    try:
+        pool=_ak_all_a_universe()
+        hit=pool[pool["code"]==code]
+        if not hit.empty:
+            return str(hit.iloc[0]["code_name"]).strip()
+    except Exception:
+        pass
     return display_code(code)
 
 def sanitize_daily(df):
