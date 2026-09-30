@@ -4895,6 +4895,31 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 分析", "🔎 �
 with tab7:
     st.subheader("数据设置")
     st.info(f"当前策略规则版本：{RULE_VERSION}。为避免过拟合，EV核心规则进入观察期后不因短期盈亏或候选数量随意调整。")
+
+    st.subheader("多终端架构")
+    a1,a2,a3=st.columns(3)
+    a1.metric("当前运行端","Windows计算端" if RUNTIME_MODE=="windows" else ("云端访问端" if RUNTIME_MODE=="cloud" else "本地运行"))
+    a2.metric("核心数据", "共享PostgreSQL" if shared_db_enabled() else "本地SQLite")
+    a3.metric("行情缓存","本机独立缓存")
+    if shared_db_enabled():
+        st.success("✅ 已启用共享数据库架构：持仓、Forward Test、研究任务、策略实验和候选版本可在Windows与云端之间同步。行情K线和EV计算缓存仍各自保留在本机。")
+        ss1,ss2=st.columns(2)
+        if ss1.button("☁️ 立即同步核心数据",use_container_width=True):
+            out=sync_shared_light_safe(force=True)
+            if out.get("errors"):
+                st.warning("同步完成，但存在异常："+"；".join(out["errors"][:5]))
+            else:
+                st.success(f"同步完成：上传 {out.get('pushed',0)} 行 · 下载 {out.get('pulled',0)} 行。")
+        if ss2.button("🔌 测试共享数据库",use_container_width=True):
+            chk=shared_db_status()
+            if chk.get("enabled"):
+                st.success(chk.get("reason","PostgreSQL 已连接"))
+            else:
+                st.error(chk.get("reason","共享数据库未连接"))
+    else:
+        st.warning("当前代码已经支持Windows/云端共用同一个PostgreSQL，但还没有配置 SHARED_DATABASE_URL。未配置前，两端会各自使用本地SQLite。")
+        st.caption("配置完成后无需改代码：云端和Windows分别设置指向同一个PostgreSQL实例的连接地址即可。连接密码不会写入GitHub。")
+
     st.success("A股：BaoStock；港股：AKShare。两者均无需在本App配置行情Token。")
     st.info("A股与港股统一使用前复权日线，并由日线聚合周线；分析、选股、持仓和回测使用同一指标逻辑。")
     st.caption("港股市场环境以恒生指数为基准；A股以沪深300为基准。AKShare接口来自公开数据源，接口稳定性可能受上游网站变化影响。")
@@ -4910,7 +4935,10 @@ with tab7:
         clear_market_cache()
         st.success("行情缓存已清空。")
         st.rerun()
-    st.warning("当前缓存位于Render本机SQLite：重新部署/重建实例时可能被清空。持仓数据后续应迁移到持久数据库。")
+    if RUNTIME_MODE=="cloud":
+        st.warning("云端行情/EV缓存仍位于Render本机，重新部署时可能清空；这是设计行为，因为行情可以重新下载。核心业务数据在启用共享PostgreSQL后不会依赖这份缓存。")
+    else:
+        st.caption(f"本地数据库：{DB_PATH}。Windows行情缓存长期保存在本机，用于加速全市场扫描与回测。")
     st.markdown("**核心数据备份**")
     backup_pos=load_positions(False)
     backup_ft=load_forward_signals(5000)
@@ -4926,7 +4954,7 @@ with tab7:
         "forward_test_backup.csv","text/csv",use_container_width=True
     )
     st.caption("持仓截图识别使用已配置的DeepSeek视觉接口；截图只提取持仓字段，不参与技术评分。")
-    st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。")
+    st.markdown("iPhone：Safari打开网址 → 分享 → **添加到主屏幕**。Windows：使用仓库中的 **start_windows.bat** 启动同一套系统。")
 
 with tab6:
     st.subheader("这套系统怎么做决策")
