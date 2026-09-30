@@ -5271,119 +5271,317 @@ with tab6:
 
 with tab1:
     st.subheader("股票分析")
-    st.caption("一次只保留一个“当前分析结果”。分析下一只股票时会自动替换上一只；历史结果集中放在页面底部。")
+    st.caption("单股与批量分析共用同一套EV1.0规则。批量模式可从自选股/持仓/行情截图中识别多只A股或港股，并逐只生成具体操作策略。")
 
-    a1,a2 = st.columns([1.35,1])
-    with a1:
-        auto_code = st.text_input(
-            "股票代码或名称",
-            placeholder="例如 600519 / 贵州茅台 / 0700 / 腾讯控股",
-            key="auto_code"
+    single_tab,batch_tab=st.tabs(["📌 单股分析","🧺 批量分析"])
+
+    with single_tab:
+        a1,a2=st.columns([1.35,1])
+        with a1:
+            auto_code=st.text_input(
+                "股票代码或名称",
+                placeholder="例如 600519 / 贵州茅台 / 0700 / 腾讯控股",
+                key="auto_code"
+            )
+        with a2:
+            auto_horizon=st.selectbox(
+                "持有周期",["2–8周","2–6个月","6–18个月"],index=1,key="auto_horizon"
+            )
+
+        a3,a4=st.columns(2)
+        with a3:
+            auto_position=st.selectbox(
+                "当前仓位",["未持有","轻仓≤25%","中等25–50%","重仓>50%"],
+                key="auto_position"
+            )
+        with a4:
+            auto_fund=st.checkbox("基本面/估值已验证",value=False,key="auto_fund")
+
+        act1,act2=st.columns([2,1])
+        run_analysis=act1.button(
+            "⚡ 生成 / 替换当前分析",
+            type="primary",use_container_width=True,key="run_single_analysis"
         )
-    with a2:
-        auto_horizon = st.selectbox(
-            "持有周期",["2–8周","2–6个月","6–18个月"],index=1,key="auto_horizon"
+        clear_analysis=act2.button(
+            "🧹 清空当前结果",use_container_width=True,key="clear_single_analysis"
         )
 
-    a3,a4 = st.columns(2)
-    with a3:
-        auto_position = st.selectbox(
-            "当前仓位",["未持有","轻仓≤25%","中等25–50%","重仓>50%"],key="auto_position"
-        )
-    with a4:
-        auto_fund = st.checkbox("基本面/估值已验证",value=False,key="auto_fund")
+        if clear_analysis:
+            st.session_state.pop("last_report",None)
+            st.rerun()
 
-    act1,act2 = st.columns([2,1])
-    run_analysis = act1.button("⚡ 生成 / 替换当前分析",type="primary",use_container_width=True)
-    clear_analysis = act2.button("🧹 清空当前结果",use_container_width=True)
-
-    if clear_analysis:
-        st.session_state.pop("last_report",None)
-        st.rerun()
-
-    if run_analysis:
-        if not auto_code.strip():
-            st.error("请输入A股或港股代码/名称。")
-        else:
-            with st.spinner("正在获取行情并计算日线/周线指标..."):
-                try:
-                    bs_login()
-                    code,name = resolve_symbol_input(auto_code)
-                    df_auto = fetch_stock_daily(code,years=5)
-                    benchmark_df = fetch_benchmark_for_code(code,years=5)
-                    report = deterministic_report(
-                        code,name,df_auto,auto_position,auto_fund,benchmark_df
-                    )
-                    prev = previous(report["symbol"])
-                    if prev and prev.get("score") is not None:
-                        try:
-                            report["delta"] = report["score"]-float(prev.get("score"))
-                        except Exception:
-                            pass
-
-                    st.session_state["last_report"] = report
-                    xsave = {
-                        "data_quality":100,
-                        "daily":{
-                            "price":str(report["_df"].iloc[-1]["close"]),
-                            "boll_mid":str(report["_df"].iloc[-1]["boll_mid"]),
-                        },
-                        "key_support":report["support"],
-                        "key_resistance":report["resistance"],
-                    }
-                    meta = {
-                        "symbol":report["symbol"],"market":market_of_code(code),
-                        "horizon":auto_horizon,"position_state":auto_position,
-                        "rating":report["rating"],"state":report["state"],
-                        "stage":report["stage"],"confidence":100,
-                        "mode":f"{data_source_for_code(code)}自动数据",
-                        "weekly_used":True
-                    }
-                    metrics = (
-                        report["score"],report["trend"],report["momentum"],
-                        report["weekly_score"],report["confirm"],False,False
-                    )
-                    save_result(
-                        meta,xsave,metrics,
-                        json.dumps(
-                            {"source":data_source_for_code(code),"market":market_of_code(code)},
-                            ensure_ascii=False
-                        )
-                    )
-                    report.pop("_df",None)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"自动分析失败：{e}")
-                finally:
+        if run_analysis:
+            if not auto_code.strip():
+                st.error("请输入A股或港股代码/名称。")
+            else:
+                with st.spinner("正在获取行情并计算日线/周线、EV与操作策略..."):
                     try:
-                        bs.logout()
-                    except Exception:
-                        pass
+                        bs_login()
+                        code,name=resolve_symbol_input(auto_code)
+                        df_auto=fetch_stock_daily(code,years=5)
+                        benchmark_df=fetch_benchmark_for_code(code,years=5)
+                        report=deterministic_report(
+                            code,name,df_auto,auto_position,auto_fund,benchmark_df
+                        )
+                        prev=previous(report["symbol"])
+                        if prev and prev.get("score") is not None:
+                            try:
+                                report["delta"]=report["score"]-float(prev.get("score"))
+                            except Exception:
+                                pass
+                        persist_analysis_report(
+                            report,code,auto_horizon,auto_position
+                        )
+                        report.pop("_df",None)
+                        st.session_state["last_report"]=report
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"自动分析失败：{e}")
+                    finally:
+                        try: bs.logout()
+                        except Exception: pass
 
-    st.divider()
-    st.subheader("当前分析结果")
-    render_cockpit(st.session_state.get("last_report"))
+        st.divider()
+        st.subheader("当前分析结果")
+        render_cockpit(st.session_state.get("last_report"))
+
+    with batch_tab:
+        st.markdown("#### 1. 导入股票")
+        st.caption("可上传券商/行情App的自选股、持仓、排行或选股截图。截图只用于识别股票代码/名称，技术分析仍使用实时行情数据。")
+        batch_images=st.file_uploader(
+            "上传股票列表截图",
+            type=["png","jpg","jpeg","webp"],
+            accept_multiple_files=True,
+            key="batch_symbol_images"
+        )
+        bi1,bi2=st.columns([1.3,1])
+        recognize_batch=bi1.button(
+            "📷 识别截图中的股票",
+            type="primary",use_container_width=True,key="recognize_batch_symbols"
+        )
+        bi2.caption("支持多张截图；识别后可人工删除、修改或补充。")
+
+        if recognize_batch:
+            if not batch_images:
+                st.warning("请先上传至少一张截图。")
+            else:
+                with st.spinner("正在识别截图中的A股/港股..."):
+                    try:
+                        recognized=extract_batch_symbols_from_images(batch_images)
+                        if recognized.empty:
+                            st.warning("没有识别到可用股票，请换更清晰的截图或手工粘贴代码。")
+                        else:
+                            st.session_state["batch_symbols_df"]=recognized
+                            st.success(f"已识别 {len(recognized)} 只股票。")
+                    except Exception as e:
+                        st.error(f"截图识别失败：{e}")
+
+        manual_symbols=st.text_area(
+            "也可以直接粘贴股票代码/名称",
+            placeholder="每行一个，或用逗号分隔，例如：\n600519\n腾讯控股\n300750",
+            height=105,key="batch_manual_symbols"
+        )
+        if st.button("➕ 加入手工股票",use_container_width=True,key="add_manual_batch_symbols"):
+            tokens=[
+                x.strip() for x in re.split(r"[\n,，;；]+",manual_symbols or "")
+                if x.strip()
+            ]
+            if tokens:
+                old=st.session_state.get(
+                    "batch_symbols_df",
+                    pd.DataFrame(columns=["分析","代码或名称","名称","市场"])
+                )
+                add=pd.DataFrame([
+                    {"分析":True,"代码或名称":x,"名称":"","市场":""}
+                    for x in tokens
+                ])
+                merged=pd.concat([old,add],ignore_index=True)
+                merged["_key"]=merged["代码或名称"].astype(str).str.strip().str.upper()
+                merged=merged[merged["_key"].ne("")].drop_duplicates("_key").drop(columns="_key")
+                st.session_state["batch_symbols_df"]=merged.reset_index(drop=True)
+
+        symbols_df=st.session_state.get(
+            "batch_symbols_df",
+            pd.DataFrame(columns=["分析","代码或名称","名称","市场"])
+        )
+        if not symbols_df.empty:
+            edited_symbols=st.data_editor(
+                symbols_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="batch_symbols_editor",
+                column_config={
+                    "分析":st.column_config.CheckboxColumn("分析",default=True),
+                    "代码或名称":st.column_config.TextColumn("代码或名称",required=True),
+                    "名称":st.column_config.TextColumn("识别名称"),
+                    "市场":st.column_config.TextColumn("市场")
+                }
+            )
+            st.session_state["batch_symbols_df"]=edited_symbols
+
+            st.markdown("#### 2. 批量分析设置")
+            bc1,bc2,bc3,bc4=st.columns(4)
+            with bc1:
+                batch_horizon=st.selectbox(
+                    "持有周期",["2–8周","2–6个月","6–18个月"],index=1,
+                    key="batch_horizon"
+                )
+            with bc2:
+                batch_position=st.selectbox(
+                    "统一当前仓位",
+                    ["未持有","轻仓≤25%","中等25–50%","重仓>50%"],
+                    key="batch_position"
+                )
+            with bc3:
+                batch_fund=st.checkbox(
+                    "基本面/估值均已验证",value=False,key="batch_fund"
+                )
+            with bc4:
+                batch_limit=st.selectbox(
+                    "本次最多分析",[10,20,30],index=1,key="batch_analysis_limit"
+                )
+
+            ba1,ba2=st.columns([2,1])
+            run_batch=ba1.button(
+                "⚡ 批量生成分析 + 操作策略",
+                type="primary",use_container_width=True,key="run_batch_analysis"
+            )
+            clear_batch=ba2.button(
+                "🧹 清空批量结果",use_container_width=True,key="clear_batch_results"
+            )
+            if clear_batch:
+                st.session_state.pop("batch_reports",None)
+                st.rerun()
+
+            if run_batch:
+                selected=edited_symbols[
+                    edited_symbols["分析"].fillna(False).astype(bool)
+                ].copy()
+                selected=selected[
+                    selected["代码或名称"].astype(str).str.strip().ne("")
+                ].head(int(batch_limit))
+                if selected.empty:
+                    st.warning("请至少勾选一只股票。")
+                else:
+                    progress=st.progress(0.0,text="准备批量分析...")
+                    status=st.empty()
+                    reports=[]
+                    errors=[]
+                    benchmark_cache={}
+                    try:
+                        bs_login()
+                        for idx,(_,row) in enumerate(selected.iterrows(),start=1):
+                            raw=str(row.get("代码或名称","")).strip()
+                            status.caption(f"正在分析 {idx}/{len(selected)}：{raw}")
+                            try:
+                                code,name=resolve_symbol_input(raw)
+                                market=market_of_code(code)
+                                if market not in benchmark_cache:
+                                    benchmark_cache[market]=fetch_benchmark_for_code(code,years=5)
+                                df_auto=fetch_stock_daily(code,years=5)
+                                report=deterministic_report(
+                                    code,name,df_auto,batch_position,batch_fund,
+                                    benchmark_cache[market]
+                                )
+                                prev=previous(report["symbol"])
+                                if prev and prev.get("score") is not None:
+                                    try:
+                                        report["delta"]=report["score"]-float(prev.get("score"))
+                                    except Exception:
+                                        pass
+                                persist_analysis_report(
+                                    report,code,batch_horizon,batch_position
+                                )
+                                report.pop("_df",None)
+                                reports.append(report)
+                            except Exception as ex:
+                                errors.append(f"{raw}: {ex}")
+                            progress.progress(
+                                idx/len(selected),
+                                text=f"批量分析 {idx}/{len(selected)} · 成功 {len(reports)} · 失败 {len(errors)}"
+                            )
+                    finally:
+                        try: bs.logout()
+                        except Exception: pass
+
+                    st.session_state["batch_reports"]=reports
+                    st.session_state["batch_analysis_errors"]=errors
+                    if reports:
+                        st.success(f"完成 {len(reports)} 只股票分析。")
+                    if errors:
+                        st.warning("部分股票失败："+"；".join(errors[:6]))
+                    st.rerun()
+        else:
+            edited_symbols=pd.DataFrame()
+            st.info("请先上传截图识别股票，或直接粘贴股票代码/名称。")
+
+        reports=st.session_state.get("batch_reports") or []
+        if reports:
+            st.divider()
+            st.markdown("#### 3. 批量决策总览")
+            summary_rows=[]
+            for r in reports:
+                ev=r.get("ev") or {}
+                op=r.get("operation_strategy") or {}
+                summary_rows.append({
+                    "股票":r.get("symbol",""),
+                    "当前动作":op.get("action","—"),
+                    "技术分":r.get("score"),
+                    "买点分":r.get("buy_score"),
+                    "周线":r.get("weekly_score"),
+                    "RR":r.get("rr"),
+                    "净EV(R)":ev.get("EV_R"),
+                    "保守EV(R)":ev.get("保守EV_R"),
+                    "机会":r.get("opportunity_label"),
+                    "市场":f"{r.get('market_regime','')} {r.get('market_score',0):.0f}",
+                    "现价":r.get("latest_close"),
+                    "风险位":r.get("risk_price"),
+                    "压力位":r.get("target_price")
+                })
+            summary_df=pd.DataFrame(summary_rows)
+            st.dataframe(
+                summary_df,use_container_width=True,hide_index=True,
+                column_config={
+                    "技术分":st.column_config.NumberColumn(format="%.0f"),
+                    "买点分":st.column_config.NumberColumn(format="%.0f"),
+                    "周线":st.column_config.NumberColumn(format="%.0f"),
+                    "RR":st.column_config.NumberColumn(format="%.2f"),
+                    "净EV(R)":st.column_config.NumberColumn(format="%+.2f"),
+                    "保守EV(R)":st.column_config.NumberColumn(format="%+.2f"),
+                    "现价":st.column_config.NumberColumn(format="%.2f"),
+                    "风险位":st.column_config.NumberColumn(format="%.2f"),
+                    "压力位":st.column_config.NumberColumn(format="%.2f")
+                }
+            )
+
+            st.markdown("#### 4. 每只股票具体策略")
+            for r in reports:
+                op=r.get("operation_strategy") or {}
+                title=f"{op.get('action','—')}｜{r.get('symbol','')}"
+                with st.expander(title,expanded=False):
+                    render_cockpit(r)
 
     st.divider()
     st.subheader("最近分析")
-    recent = recent_analyses(12)
+    recent=recent_analyses(20)
     if recent.empty:
         st.caption("暂无历史分析。")
     else:
-        recent_show = recent.rename(columns={
+        recent_show=recent.rename(columns={
             "created_at":"时间","symbol":"股票","market":"市场","horizon":"周期",
             "position_state":"仓位","state":"状态","rating":"评级",
             "score":"技术分","trend_score":"趋势","momentum_score":"动能",
             "weekly_score":"周线","confirm_score":"量能"
         })
-        show_cols = [
+        show_cols=[
             "时间","股票","市场","状态","技术分","趋势","动能","周线","量能","周期","仓位"
         ]
         st.dataframe(
             recent_show[[x for x in show_cols if x in recent_show.columns]],
             use_container_width=True,hide_index=True
         )
-        st.caption("这里只显示最近12次数据驱动分析；清空“当前结果”不会删除这些历史记录。")
+        st.caption("单股与批量分析都会进入最近分析记录。")
 
 with tab2:
     st.subheader("自动选股")
