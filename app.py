@@ -5053,8 +5053,8 @@ def _background_screener_worker(job_id):
         _update_screener_job(job_id,status="running",error=None)
         universe=str(job["universe"])
         exclude_st=bool(int(job.get("exclude_st",1) or 0))
-        outer_batch=min(50,max(20,int(job.get("batch_size",50) or 50)))
-        micro_batch=10
+        outer_batch=min(100,max(20,int(job.get("batch_size",50) or 50)))
+        micro_batch=20 if ifind_configured() else 10
 
         use_bs_session=not ifind_configured()
         if use_bs_session:
@@ -5083,6 +5083,17 @@ def _background_screener_worker(job_id):
                 )
             ]
         pool=pool.drop_duplicates("code").reset_index(drop=True)
+
+        # 当前基本面/估值快照只在每个任务启动时读取一次，并按交易日缓存。
+        # 它只增强今日中长线排序，不进入历史EV，因此不会引入未来数据。
+        factor_map={}
+        if universe!="港股主板" and ifind_configured():
+            try:
+                factor_map=load_midlong_factor_snapshot(universe,force=False)
+            except Exception as ex:
+                print("FACTOR_SNAPSHOT_WARN",job_id,ex)
+                factor_map={}
+
         total=len(pool)
         cursor=min(int(job.get("cursor",0) or 0),total)
         _update_screener_job(
@@ -5134,7 +5145,7 @@ def _background_screener_worker(job_id):
                         try:
                             batch_result,batch_stats=screen_codes(
                                 codes,names,benchmark_df=benchmark_df,
-                                progress_callback=None
+                                progress_callback=None,factor_map=factor_map
                             )
                             last_err=None
                             break
