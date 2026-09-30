@@ -6577,10 +6577,27 @@ with tab7:
                 else:
                     st.error(chk.get("reason","共享数据库未连接"))
 
-    st.success("A股：BaoStock主源 + AKShare自动容灾；港股：AKShare。均无需在本App配置行情Token。")
-    st.info("如果BaoStock出现黑名单、登录失败、返回空数据或临时网络异常，A股日线、沪深300基准和股票池会自动尝试AKShare，不再直接让分析/选股失败。")
-    st.info("A股与港股统一使用前复权日线，并由日线聚合周线；分析、选股、持仓和回测使用同一指标逻辑。")
-    st.caption("港股市场环境以恒生指数为基准；A股以沪深300为基准。公开行情接口仍可能受上游网站变化影响，因此双源都失败时系统会明确报出两个数据源的错误。")
+    st.markdown("**📡 行情数据源优先级**")
+    if ifind_configured():
+        ifs=ifind_status(test_data=False)
+        if ifs.get("ok"):
+            st.success("✅ iFinD HTTP API 已配置：A股/港股日K与原生周K优先使用 iFinD；A股基准指数也优先使用 iFinD。")
+        else:
+            st.warning("iFinD 已配置但当前鉴权异常："+str(ifs.get("message","未知错误")))
+    else:
+        st.warning("尚未配置 iFinD Refresh Token；系统当前会继续使用 AKShare / BaoStock 容灾。")
+        st.caption("在 Render 环境变量中添加 IFIND_REFRESH_TOKEN；不要把 token 写进GitHub或聊天记录。")
+
+    if st.button("🔌 测试 iFinD 行情接口",use_container_width=True,key="ifind_test_btn"):
+        chk=ifind_status(test_data=True)
+        if chk.get("ok"):
+            st.success(chk.get("message","iFinD连接成功"))
+        else:
+            st.error(chk.get("message","iFinD连接失败"))
+
+    st.info("当前优先级：iFinD → AKShare → BaoStock。iFinD不可用时自动降级；BaoStock只作为最后兜底，避免再次因黑名单阻塞系统。")
+    st.info("周线口径：原生周K为主；日K聚合周K做交叉验证。一致性低时会在分析/选股结果中提示。")
+    st.caption("港股市场环境仍以恒生指数为基准；A股以沪深300为基准。首次启用iFinD会建立独立缓存，之后主要做增量更新。")
 
     st.subheader("本地行情缓存")
     cs = market_cache_stats()
@@ -6642,7 +6659,7 @@ with tab6:
 - **保守EV**：历史平均R减去统计误差形成保守下界；只有点估计为正不够。
 - **成本压力测试**：同时计算2倍交易成本/滑点下的EV，检验优势是否脆弱。
 - **OOS验证**：固定规则按时间顺序滚动验证，不用测试段反向调参数。
-- **周线**：硬性决策只使用已确认周线；未完成的当周K不参与选股阈值。
+- **周线**：原生周K作为主依据，日K聚合周K做交叉验证；硬性决策只使用已确认周线，未完成的当周K不参与选股阈值。
 - **流动性**：A股默认20日中位成交额≥5000万元，港股≥2000万元。
 - **回测**：收盘形成信号，下一交易日执行；止损考虑跳空，不假设一定能按风险位成交。
 - **持仓管理**：买入后“买点分”的意义下降，核心转为技术分及其变化。≥78强势持有、65–77持有、55–64谨慎持有、45–54减仓候选、<45退出候选；技术分较峰值快速回落、周线转弱或大盘逆风会降档。
