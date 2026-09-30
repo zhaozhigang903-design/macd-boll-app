@@ -17,6 +17,12 @@ import streamlit as st
 import baostock as bs
 import akshare as ak
 from openai import OpenAI
+from ifind_http import (
+    configured as ifind_configured,
+    status as ifind_status,
+    history_one as ifind_history_one,
+    history_many as ifind_history_many,
+)
 from shared_store import (
     enabled as shared_db_enabled,
     status as shared_db_status,
@@ -1335,7 +1341,9 @@ def benchmark_label_for_code(code):
     return "恒生指数" if market_of_code(code) == "港股" else "沪深300"
 
 def data_source_for_code(code):
-    return "AKShare" if market_of_code(code) == "港股" else "BaoStock→AKShare自动容灾"
+    if ifind_configured():
+        return "iFinD→AKShare→BaoStock"
+    return "AKShare" if market_of_code(code) == "港股" else "AKShare→BaoStock"
 
 def extract_a_share_code(*values):
     for value in values:
