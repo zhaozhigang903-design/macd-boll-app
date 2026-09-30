@@ -4294,6 +4294,257 @@ def save_forward_candidates(df):
     conn.close()
     sync_shared_light_safe(force=True)
 
+def _factor_query_for_universe(universe):
+    scope={
+        "上证50":"上证50成分股",
+        "沪深300":"沪深300成分股",
+        "中证500":"中证500成分股",
+        "全A股（沪深）":"A股",
+    }.get(str(universe),"A股")
+    return (
+        f"{scope}，非ST，显示股票代码、股票简称、ROE、营业收入同比增长率、"
+        "归母净利润同比增长率、资产负债率、市盈率TTM、市净率、股息率、"
+        "经营活动产生的现金流量净额"
+    )
+
+def _factor_col(df,keywords):
+    if df is None or df.empty:
+        return None
+    norm={str(c).lower().replace(" ",""):c for c in df.columns}
+    for key in keywords:
+        k=str(key).lower().replace(" ","")
+        for nk,orig in norm.items():
+            if k in nk:
+                return orig
+    return None
+
+def _num_factor(v,percent=False):
+    if v is None:
+        return np.nan
+    if isinstance(v,str):
+        s=v.strip().replace(",","")
+        if not s or s in ("--","—","None","nan"):
+            return np.nan
+        has_pct="%" in s
+        s=s.replace("%","")
+        try:
+            x=float(s)
+        except Exception:
+            return np.nan
+        if percent and not has_pct and abs(x)<=1.5:
+            x*=100.0
+        return x
+    try:
+        x=float(v)
+        if percent and np.isfinite(x) and abs(x)<=1.5:
+            x*=100.0
+        return x
+    except Exception:
+        return np.nan
+
+def _interp_score(x,points,default=50.0):
+    if pd.isna(x):
+        return float(default)
+    pts=sorted((float(a),float(b)) for a,b in points)
+    if x<=pts[0][0]:
+        return pts[0][1]
+    if x>=pts[-1][0]:
+        return pts[-1][1]
+    for (x0,y0),(x1,y1) in zip(pts[:-1],pts[1:]):
+        if x0<=x<=x1:
+            t=(x-x0)/(x1-x0) if x1!=x0 else 0
+            return y0+t*(y1-y0)
+    return float(default)
+
+def _fundamental_scores_from_row(row,columns):
+    def val(key,percent=False):
+        col=columns.get(key)
+        return _num_factor(row.get(col),percent=percent) if col else np.nan
+
+    roe=val("roe",True)
+    rev_g=val("rev_g",True)
+    np_g=val("np_g",True)
+    debt=val("debt",True)
+    pe=val("pe",False)
+    pb=val("pb",False)
+    div=val("div",True)
+    ocf=val("ocf",False)
+    name=str(row.get(columns.get("name"),"") or "")
+
+    roe_s=_interp_score(roe,[(-5,10),(0,25),(5,45),(10,65),(15,80),(20,90),(30,95)])
+    cash_s=70 if pd.notna(ocf) and ocf>0 else (35 if pd.notna(ocf) and ocf<0 else 50)
+    quality=float(np.mean([roe_s,cash_s]))
+
+    rev_s=_interp_score(rev_g,[(-30,10),(-10,35),(0,50),(10,65),(20,78),(40,90),(80,95)])
+    np_s=_interp_score(np_g,[(-50,8),(-20,25),(0,50),(15,68),(30,82),(60,92),(120,95)])
+    growth=float(np.mean([rev_s,np_s]))
+
+    if pd.isna(pe):
+        pe_s=50
+    elif pe<=0:
+        pe_s=25
+    elif pe<=10:
+        pe_s=70
+    elif pe<=25:
+        pe_s=88
+    elif pe<=40:
+        pe_s=72
+    elif pe<=60:
+        pe_s=52
+    elif pe<=100:
+        pe_s=32
+    else:
+        pe_s=18
+
+    if pd.isna(pb):
+        pb_s=50
+    elif pb<=0:
+        pb_s=30
+    elif pb<=1:
+        pb_s=82
+    elif pb<=3:
+        pb_s=75
+    elif pb<=6:
+        pb_s=58
+    elif pb<=10:
+        pb_s=40
+    else:
+        pb_s=25
+    div_s=_interp_score(div,[(0,45),(1,55),(3,72),(5,85),(8,80),(12,65)])
+    valuation=float(np.mean([pe_s,pb_s,div_s]))
+
+    financial_name=any(x in name for x in ["银行","保险","证券","信托"])
+    if financial_name:
+        health=60.0
+    else:
+        health=_interp_score(debt,[(20,92),(35,86),(50,75),(65,60),(75,48),(85,32),(95,18)])
+
+    category_values={
+        "quality":quality,"growth":growth,"valuation":valuation,"health":health
+    }
+    weights={"quality":0.35,"growth":0.30,"valuation":0.20,"health":0.15}
+    fundamental=sum(category_values[k]*weights[k] for k in weights)
+
+    raw_values=[roe,rev_g,np_g,debt,pe,pb,div,ocf]
+    coverage=sum(pd.notna(x) for x in raw_values)
+    return {
+        "基本面分":round(float(np.clip(fundamental,0,100)),1),
+        "质量分":round(float(np.clip(quality,0,100)),1),
+        "成长分":round(float(np.clip(growth,0,100)),1),
+        "估值分":round(float(np.clip(valuation,0,100)),1),
+        "财务健康分":round(float(np.clip(health,0,100)),1),
+        "基本面覆盖":int(coverage),
+        "ROE":roe,"营收同比":rev_g,"归母净利同比":np_g,
+        "资产负债率":debt,"PE_TTM":pe,"PB":pb,"股息率":div
+    }
+
+def load_midlong_factor_snapshot(universe,force=False):
+    """
+    Current-point-in-time factor snapshot for today's ranking only.
+    It is intentionally NOT injected into historical EV/backtests, avoiding look-ahead bias.
+    """
+    if str(universe)=="港股主板" or not ifind_configured():
+        return {}
+    today=bj_now().strftime("%Y-%m-%d")
+    source="iFinD-WenCai-v1"
+    if not force:
+        conn=sqlite3.connect(DB_PATH)
+        row=conn.execute(
+            """SELECT payload FROM factor_snapshot_cache
+               WHERE trade_date=? AND universe=? AND source=?""",
+            (today,str(universe),source)
+        ).fetchone()
+        conn.close()
+        if row:
+            try:
+                data=json.loads(row[0])
+                return {str(k):v for k,v in data.items()}
+            except Exception:
+                pass
+
+    try:
+        df=ifind_wencai(_factor_query_for_universe(universe))
+    except Exception as ex:
+        print("IFIND_FACTOR_SNAPSHOT_WARN",universe,ex)
+        return {}
+    if df is None or df.empty:
+        return {}
+
+    columns={
+        "code":_factor_col(df,["股票代码","证券代码","代码","thscode"]),
+        "name":_factor_col(df,["股票简称","证券简称","简称","名称"]),
+        "roe":_factor_col(df,["roe","净资产收益率"]),
+        "rev_g":_factor_col(df,["营业收入同比","营收同比","营业收入增长率"]),
+        "np_g":_factor_col(df,["归母净利润同比","净利润同比","归母净利润增长率"]),
+        "debt":_factor_col(df,["资产负债率"]),
+        "pe":_factor_col(df,["市盈率ttm","pe(ttm)","市盈率"]),
+        "pb":_factor_col(df,["市净率","pb"]),
+        "div":_factor_col(df,["股息率","股息"]),
+        "ocf":_factor_col(df,["经营活动产生的现金流量净额","经营活动现金流净额"]),
+    }
+    if columns["code"] is None:
+        return {}
+
+    result={}
+    for _,row in df.iterrows():
+        raw=str(row.get(columns["code"],"") or "").strip()
+        if not raw:
+            continue
+        code=normalize_code(raw)
+        if not code or market_of_code(code)!="A股":
+            continue
+        item=_fundamental_scores_from_row(row,columns)
+        if columns["name"]:
+            item["简称"]=str(row.get(columns["name"],"") or "")
+        result[code]=item
+
+    if result:
+        payload=json.dumps(result,ensure_ascii=False,separators=(",",":"))
+        conn=sqlite3.connect(DB_PATH)
+        conn.execute(
+            """INSERT OR REPLACE INTO factor_snapshot_cache(
+               trade_date,universe,source,payload,updated_at
+            ) VALUES(?,?,?,?,?)""",
+            (
+                today,str(universe),source,payload,
+                bj_now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        )
+        conn.commit(); conn.close()
+    return result
+
+def _ev_rank_score(ev):
+    lcb=ev.get("保守EV_R",np.nan) if isinstance(ev,dict) else np.nan
+    stress=ev.get("压力EV_R",np.nan) if isinstance(ev,dict) else np.nan
+    if pd.isna(lcb):
+        return 45.0
+    base=float(np.clip(50+80*float(lcb),10,95))
+    if pd.notna(stress) and float(stress)<=0:
+        base=min(base,45.0)
+    return round(base,1)
+
+def midlong_composite_score(
+    technical,buy_score,weekly,rs_score,market_score,ev,factor=None
+):
+    factor=factor or {}
+    fundamental=float(factor.get("基本面分",50) or 50)
+    coverage=int(factor.get("基本面覆盖",0) or 0)
+    ev_score=_ev_rank_score(ev)
+    # Fundamental data is a ranking overlay until historical point-in-time backtests validate it.
+    # If factor coverage is poor, shrink it toward neutral rather than penalizing the stock.
+    if coverage<3:
+        fundamental=50+0.35*(fundamental-50)
+    score=(
+        0.25*float(technical)+
+        0.12*float(buy_score)+
+        0.13*float(weekly if pd.notna(weekly) else 50)+
+        0.10*float(rs_score)+
+        0.08*float(market_score)+
+        0.20*float(fundamental)+
+        0.12*float(ev_score)
+    )
+    return round(float(np.clip(score,0,100)),1)
+
 def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     rows=[]
     name_map=name_map or {}
