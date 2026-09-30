@@ -7721,7 +7721,8 @@ with tab1:
 
 with tab2:
     st.subheader("自动选股")
-    st.caption("现在分成两条完全独立的任务线：**临时手动扫描** 和 **每日定时扫描**。两类任务各自保存进度、结果和历史，不再互相占用“当天任务名额”。手动扫描优先，运行时会暂挂每日任务；手动完成后每日任务自动续跑。")
+    st.caption("现在分成两条完全独立的任务线：**临时手动扫描** 和 **每日定时扫描**。速度层面采用“批量1年日K → 结构粗筛 → 批量原生周K → EV缓存/5年EV”的三级漏斗；中长线结果再叠加iFinD基本面、成长、估值和财务健康因子做综合排序。")
+    st.info("当前基本面因子只用于**今日候选排序增强**，暂不改变EV1.0的硬性入选门槛，也不灌入历史回测，避免在没有Point-in-Time财务数据前制造未来函数。后续会用历史时点财务数据回测后，再决定是否升级为EV1.1硬规则。")
 
     repair_stale_screener_jobs()
     settings=get_screener_settings()
@@ -7771,11 +7772,18 @@ with tab2:
             stats={}
         if stats:
             st.caption(
-                f"累计扫描 {stats.get('扫描',0)} · 结构初筛 {stats.get('快速初筛通过',0)} · "
-                f"EV计算 {stats.get('EV阶段',0)} · EV缓存 {stats.get('EV缓存命中',0)} · "
+                f"累计扫描 {stats.get('扫描',0)} · 粗筛 {stats.get('粗筛通过',0)} · "
+                f"原生周K确认 {stats.get('快速初筛通过',0)} · EV计算 {stats.get('EV阶段',0)} · "
+                f"EV缓存 {stats.get('EV缓存命中',0)} · 基本面覆盖 {stats.get('基本面覆盖',0)} · "
                 f"优先 {stats.get('优先机会',0)} · 观察 {stats.get('候选观察',0)} · "
                 f"数据异常 {stats.get('数据异常',0)}"
             )
+            if stats.get("iFinD日K预取") or stats.get("iFinD周K预取") or stats.get("iFinD5年预取"):
+                st.caption(
+                    f"iFinD批量预取：1年日K {stats.get('iFinD日K预取',0)} · "
+                    f"原生周K {stats.get('iFinD周K预取',0)} · "
+                    f"5年EV历史 {stats.get('iFinD5年预取',0)}"
+                )
 
         if job.get("error") and status in ("paused","queued","running"):
             st.warning(f"最近异常：{job['error']}")
