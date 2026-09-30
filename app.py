@@ -4042,6 +4042,15 @@ def screen_codes(codes,name_map=None,benchmark_df=None,progress_callback=None):
     }
     total_codes=len(codes)
 
+    if ifind_configured() and total_codes:
+        try:
+            pf=prefetch_ifind_daily(codes,years=1)
+            stats["iFinD批量预取"]=int(pf.get("saved",0) or 0)
+            stats["iFinD预取异常"]=len(pf.get("errors",[]) or [])
+        except Exception:
+            stats["iFinD批量预取"]=0
+            stats["iFinD预取异常"]=1
+
     def tick(i,code,name,stage):
         if progress_callback is not None:
             try:
