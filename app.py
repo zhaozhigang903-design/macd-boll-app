@@ -39,7 +39,7 @@ DATA_DIR = Path(os.getenv("MACD_DATA_DIR", str(_default_data_dir))).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = Path(os.getenv("MACD_LOCAL_DB_PATH", str(DATA_DIR / "analysis_history.db"))).expanduser()
 
-RULE_VERSION = "EV1.0-2026-09-30"
+RULE_VERSION = "EV1.1-WEEKLY-NATIVE-2026-09-30"
 _SCREENER_THREADS = {}
 _SCREENER_THREADS_LOCK = threading.Lock()
 _BAOSTOCK_SESSION_LOCK = threading.RLock()
@@ -2861,18 +2861,69 @@ def relative_strength(stock_df, benchmark_df):
         score += 60*ex60
     return int(clamp(score)), ex20, ex60
 
-def build_score_series(df):
-    d=add_indicators(df)
-    w=weekly_from_daily(df,completed_only=True)
-    if d.empty or w.empty:
+def confirmed_native_weekly(weekly_df,latest_daily):
+    if weekly_df is None or weekly_df.empty:
         return pd.DataFrame()
+    w=weekly_df.copy().sort_values("trade_date").reset_index(drop=True)
+    w["trade_date"]=pd.to_datetime(w["trade_date"],errors="coerce")
+    w=w.dropna(subset=["trade_date","close"])
+    if w.empty:
+        return w
+    latest_daily=pd.Timestamp(latest_daily).normalize()
+    latest_period=latest_daily.to_period("W-FRI")
+    row_periods=w["trade_date"].dt.to_period("W-FRI")
+    # 周一至周四若数据源返回了本周临时周K，仍视为未确认并剔除。
+    if latest_daily.weekday()!=4:
+        w=w[row_periods<latest_period]
+    else:
+        w=w[row_periods<=latest_period]
+    return w.reset_index(drop=True)
+
+def build_score_series(df,weekly_df=None,code=None):
+    d=add_indicators(df)
+    if d.empty:
+        return pd.DataFrame()
+
+    code=normalize_code(code or (str(d.iloc[-1].get("code","")) if "code" in d.columns else ""))
+    agg_w=weekly_from_daily(df,completed_only=True)
+
+    native_w=weekly_df
+    if native_w is None:
+        try:
+            native_w=fetch_stock_weekly(code,years=max(3,int(np.ceil(len(d)/240))+1)) if code else pd.DataFrame()
+        except Exception:
+            native_w=pd.DataFrame()
+    if native_w is not None and not native_w.empty:
+        native_w=confirmed_native_weekly(native_w,d["trade_date"].max())
+
+    # 原生周K为主；只有原生周K不可用时才回退到日K聚合周K。
+    w=native_w if native_w is not None and not native_w.empty else agg_w
+    if w is None or w.empty:
+        return pd.DataFrame()
+    if "boll_mid" not in w.columns:
+        w=add_indicators(w)
+
     w2=w[["trade_date","boll_mid","boll_slope","close","dif","dea"]].copy()
     w2.columns=["w_date","w_boll_mid","w_boll_slope","w_close","w_dif","w_dea"]
     m=pd.merge_asof(
         d.sort_values("trade_date"),w2.sort_values("w_date"),
         left_on="trade_date",right_on="w_date",direction="backward"
     )
-    scores=[]; weekly_scores=[]; buy_scores=[]; rr_list=[]; stops=[]; targets=[]
+
+    # 聚合周K只用于交叉验证，不参与主评分。
+    if agg_w is not None and not agg_w.empty:
+        aw=agg_w[["trade_date","boll_mid","boll_slope","close","dif","dea"]].copy()
+        aw.columns=["wa_date","wa_boll_mid","wa_boll_slope","wa_close","wa_dif","wa_dea"]
+        m=pd.merge_asof(
+            m.sort_values("trade_date"),aw.sort_values("wa_date"),
+            left_on="trade_date",right_on="wa_date",direction="backward"
+        )
+    else:
+        for col in ["wa_date","wa_boll_mid","wa_boll_slope","wa_close","wa_dif","wa_dea"]:
+            m[col]=np.nan
+
+    scores=[]; weekly_scores=[]; weekly_agg_scores=[]; weekly_gaps=[]
+    buy_scores=[]; rr_list=[]; stops=[]; targets=[]
     for i,row in m.iterrows():
         r=row.to_dict()
         r["macd_prev"]=m.iloc[i-1]["macd"] if i>0 else np.nan
@@ -2882,12 +2933,29 @@ def build_score_series(df):
                 "boll_slope":row.get("w_boll_slope"),"close":row.get("w_close"),
                 "boll_mid":row.get("w_boll_mid"),"dif":row.get("w_dif"),"dea":row.get("w_dea")
             }
+        war=None
+        if pd.notna(row.get("wa_date")):
+            war={
+                "boll_slope":row.get("wa_boll_slope"),"close":row.get("wa_close"),
+                "boll_mid":row.get("wa_boll_mid"),"dif":row.get("wa_dif"),"dea":row.get("wa_dea")
+            }
+
         metric=numeric_score(r,wr)
+        agg_metric=numeric_score(r,war) if war is not None else (None,None,None,None,None)
         bp,rr,stop,target=entry_quality(r)
-        scores.append(metric[0]); weekly_scores.append(metric[3] if metric[3] is not None else np.nan)
+        ws=metric[3] if metric[3] is not None else np.nan
+        was=agg_metric[3] if agg_metric[3] is not None else np.nan
+        scores.append(metric[0])
+        weekly_scores.append(ws)
+        weekly_agg_scores.append(was)
+        weekly_gaps.append(abs(float(ws)-float(was)) if pd.notna(ws) and pd.notna(was) else np.nan)
         buy_scores.append(bp); rr_list.append(rr); stops.append(stop); targets.append(target)
+
     m["score"]=scores
     m["weekly_score"]=weekly_scores
+    m["weekly_agg_score"]=weekly_agg_scores
+    m["weekly_score_gap"]=weekly_gaps
+    m["weekly_source"]="原生周K" if native_w is not None and not native_w.empty else "日K聚合兜底"
     m["buy_score"]=buy_scores
     m["rr"]=rr_list
     m["stop_ref"]=stops
@@ -3110,8 +3178,9 @@ def trade_cost_profile(code):
         return 15.0,8.0
     return 8.0,5.0
 
-def prepare_strategy_frame(df,benchmark_df):
-    m=build_score_series(df)
+def prepare_strategy_frame(df,benchmark_df,code=None,weekly_df=None):
+    code=normalize_code(code or (str(df.iloc[-1].get("code","")) if df is not None and not df.empty and "code" in df.columns else ""))
+    m=build_score_series(df,weekly_df=weekly_df,code=code)
     if m.empty:
         return m
     bm=market_score_series(benchmark_df)
@@ -3176,7 +3245,7 @@ def holding_exit_condition(row,peak_score):
     )
 
 def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0):
-    m=prepare_strategy_frame(df,benchmark_df)
+    m=prepare_strategy_frame(df,benchmark_df,code=code)
     if m.empty or len(m)<180:
         return pd.DataFrame(),m
 
@@ -5575,7 +5644,7 @@ def run_strategy_experiment_batch(experiment_id,batch_size=5,progress_callback=N
             df=fetch_stock_daily(code,years=years)
             if len(df)<180:
                 raise RuntimeError("有效历史少于180个交易日")
-            prepared=prepare_strategy_frame(df,benchmark)
+            prepared=prepare_strategy_frame(df,benchmark,code=code)
             if prepared.empty:
                 raise RuntimeError("策略指标无法构建")
 
@@ -5808,7 +5877,7 @@ def _evaluate_forward_signal_row(sig):
     signal_date=pd.Timestamp(sig["signal_date"])
     df=fetch_stock_daily(code,years=5)
     benchmark=fetch_benchmark_for_code(code,years=5)
-    m=prepare_strategy_frame(df,benchmark)
+    m=prepare_strategy_frame(df,benchmark,code=code)
     if m.empty:
         return "tracking",np.nan,None
 
