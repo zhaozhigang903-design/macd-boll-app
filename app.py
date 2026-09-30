@@ -1808,10 +1808,26 @@ def _download_a_daily_ak(code,start,end):
     raise RuntimeError("AKShare A股历史行情失败："+"；".join(errors[-3:]))
 
 def _download_a_daily(code,start,end):
-    if start > end:
+    if start>end:
         return pd.DataFrame()
+    errors=[]
 
-    bs_error=None
+    if ifind_configured():
+        try:
+            df=ifind_history_one(code,start,end,interval="D",cps=2)
+            df=sanitize_daily(df)
+            if not df.empty:
+                return df
+        except Exception as ex:
+            errors.append(f"iFinD:{ex}")
+
+    try:
+        df=_download_a_daily_ak(code,start,end)
+        if df is not None and not df.empty:
+            return df
+    except Exception as ex:
+        errors.append(f"AKShare:{ex}")
+
     if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
         try:
             fields="date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus,isST"
@@ -1833,14 +1849,9 @@ def _download_a_daily(code,start,end):
                 if not df.empty:
                     return df.sort_values("trade_date").reset_index(drop=True)
         except Exception as ex:
-            bs_error=ex
+            errors.append(f"BaoStock:{ex}")
 
-    try:
-        return _download_a_daily_ak(code,start,end)
-    except Exception as ak_ex:
-        raise RuntimeError(
-            f"A股历史行情双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
-        )
+    raise RuntimeError("A股历史行情多源失败："+"；".join(errors[-3:]))
 
 def _normalize_hk_history(raw,code):
     if raw is None or raw.empty:
@@ -1872,33 +1883,45 @@ def _normalize_hk_history(raw,code):
     return df[["trade_date","code","open","high","low","close","vol","amount","pctChg","turn","tradestatus","isST"]].sort_values("trade_date").reset_index(drop=True)
 
 def _download_hk_daily(code,start,end):
-    if start > end:
+    if start>end:
         return pd.DataFrame()
-    symbol = display_code(code).zfill(5)
-    s = start.replace("-","")
-    e = end.replace("-","")
-    last_error = None
+    errors=[]
+
+    if ifind_configured():
+        try:
+            df=ifind_history_one(code,start,end,interval="D",cps=2)
+            df=sanitize_daily(df)
+            if not df.empty:
+                return df
+        except Exception as ex:
+            errors.append(f"iFinD:{ex}")
+
+    symbol=display_code(code).zfill(5)
+    s0=start.replace("-","")
+    e0=end.replace("-","")
     try:
-        raw = ak.stock_hk_hist(
-            symbol=symbol,period="daily",start_date=s,end_date=e,adjust="qfq"
+        raw=ak.stock_hk_hist(
+            symbol=symbol,period="daily",start_date=s0,end_date=e0,adjust="qfq"
         )
-        df = _normalize_hk_history(raw,code)
+        df=_normalize_hk_history(raw,code)
         if not df.empty:
             return df
     except Exception as ex:
-        last_error = ex
+        errors.append(f"东财港股:{ex}")
     try:
-        raw = ak.stock_hk_daily(symbol=symbol,adjust="qfq")
-        df = _normalize_hk_history(raw,code)
+        raw=ak.stock_hk_daily(symbol=symbol,adjust="qfq")
+        df=_normalize_hk_history(raw,code)
         if not df.empty:
-            mask = (
-                (df["trade_date"] >= pd.Timestamp(start)) &
-                (df["trade_date"] <= pd.Timestamp(end))
+            mask=(
+                (df["trade_date"]>=pd.Timestamp(start))&
+                (df["trade_date"]<=pd.Timestamp(end))
             )
-            return df.loc[mask].reset_index(drop=True)
+            out=df.loc[mask].reset_index(drop=True)
+            if not out.empty:
+                return out
     except Exception as ex:
-        last_error = ex
-    raise RuntimeError(f"港股历史行情获取失败：{last_error}")
+        errors.append(f"新浪港股:{ex}")
+    raise RuntimeError("港股历史行情多源失败："+"；".join(errors[-3:]))
 
 def _download_daily(code,start,end):
     code = normalize_code(code)
@@ -1996,9 +2019,26 @@ def _download_index_daily_ak(code,start,end):
     raise RuntimeError("AKShare指数历史失败："+"；".join(errors[-2:]))
 
 def _download_index_daily(code,start,end):
-    if start > end:
+    if start>end:
         return pd.DataFrame()
-    bs_error=None
+    errors=[]
+
+    if ifind_configured():
+        try:
+            df=ifind_history_one(code,start,end,interval="D",cps=1)
+            df=sanitize_daily(df)
+            if not df.empty:
+                return df
+        except Exception as ex:
+            errors.append(f"iFinD指数:{ex}")
+
+    try:
+        df=_download_index_daily_ak(code,start,end)
+        if df is not None and not df.empty:
+            return df
+    except Exception as ex:
+        errors.append(f"AKShare指数:{ex}")
+
     if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
         try:
             fields="date,code,open,high,low,close,preclose,volume,amount,pctChg"
@@ -2015,19 +2055,14 @@ def _download_index_daily(code,start,end):
                         df[col]=pd.to_numeric(df[col],errors="coerce")
                 df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
                 df["turn"]=np.nan
-                df["tradestatus"]="1"
-                df["isST"]=""
+                df["tradestatus"]="1"; df["isST"]=""
                 df=sanitize_daily(df)
                 if not df.empty:
                     return df.sort_values("trade_date").reset_index(drop=True)
         except Exception as ex:
-            bs_error=ex
-    try:
-        return _download_index_daily_ak(code,start,end)
-    except Exception as ak_ex:
-        raise RuntimeError(
-            f"指数历史双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
-        )
+            errors.append(f"BaoStock指数:{ex}")
+
+    raise RuntimeError("指数历史多源失败："+"；".join(errors[-3:]))
 
 def fetch_benchmark_daily(years=5,code="sh.000300"):
     end=datetime.now().strftime("%Y-%m-%d")
@@ -2259,7 +2294,24 @@ def _download_a_weekly_ak(code,start,end):
 def _download_a_weekly(code,start,end):
     if start>end:
         return pd.DataFrame()
-    bs_error=None
+    errors=[]
+
+    if ifind_configured():
+        try:
+            df=ifind_history_one(code,start,end,interval="W",cps=2)
+            df=sanitize_daily(df)
+            if not df.empty:
+                return df
+        except Exception as ex:
+            errors.append(f"iFinD原生周K:{ex}")
+
+    try:
+        df=_download_a_weekly_ak(code,start,end)
+        if df is not None and not df.empty:
+            return df
+    except Exception as ex:
+        errors.append(f"AKShare周K:{ex}")
+
     if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
         try:
             fields="date,code,open,high,low,close,volume,amount,pctChg,turn"
@@ -2280,22 +2332,27 @@ def _download_a_weekly(code,start,end):
                 if not df.empty:
                     return df.sort_values("trade_date").reset_index(drop=True)
         except Exception as ex:
-            bs_error=ex
-    try:
-        return _download_a_weekly_ak(code,start,end)
-    except Exception as ak_ex:
-        raise RuntimeError(
-            f"A股周K双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
-        )
+            errors.append(f"BaoStock周K:{ex}")
+
+    raise RuntimeError("A股原生周K多源失败："+"；".join(errors[-3:]))
 
 def _download_hk_weekly(code,start,end):
-    symbol=display_code(code).zfill(5)
-    s=str(start).replace("-","")
-    e=str(end).replace("-","")
     errors=[]
+    if ifind_configured():
+        try:
+            df=ifind_history_one(code,start,end,interval="W",cps=2)
+            df=sanitize_daily(df)
+            if not df.empty:
+                return df
+        except Exception as ex:
+            errors.append(f"iFinD原生周K:{ex}")
+
+    symbol=display_code(code).zfill(5)
+    s0=str(start).replace("-","")
+    e0=str(end).replace("-","")
     try:
         raw=ak.stock_hk_hist(
-            symbol=symbol,period="weekly",start_date=s,end_date=e,adjust="qfq"
+            symbol=symbol,period="weekly",start_date=s0,end_date=e0,adjust="qfq"
         )
         df=_normalize_hk_history(raw,code)
         if not df.empty:
@@ -2308,7 +2365,7 @@ def _download_hk_weekly(code,start,end):
             return weekly_from_daily(daily,completed_only=True,with_indicators=False)
     except Exception as ex:
         errors.append(f"港股日K聚合兜底:{ex}")
-    raise RuntimeError("港股周K获取失败："+"；".join(errors[-2:]))
+    raise RuntimeError("港股周K获取失败："+"；".join(errors[-3:]))
 
 def fetch_stock_weekly(code,years=5):
     code=normalize_code(code)
