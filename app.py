@@ -2473,17 +2473,22 @@ def persist_analysis_report(report,code,horizon,position_state):
     )
 
 def latest_trade_date():
-    end = pd.Timestamp.today().strftime("%Y-%m-%d")
-    start = (pd.Timestamp.today()-pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    rs = bs.query_trade_dates(start_date=start,end_date=end)
-    df = _rs_to_df(rs)
-    if df.empty:
-        return end
-    if "is_trading_day" in df.columns:
-        df = df[df["is_trading_day"].astype(str)=="1"]
-    if df.empty:
-        return end
-    return str(df["calendar_date"].max())
+    end=pd.Timestamp.today().strftime("%Y-%m-%d")
+    start=(pd.Timestamp.today()-pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            rs=bs.query_trade_dates(start_date=start,end_date=end)
+            if getattr(rs,"error_code","0")=="0":
+                df=_rs_to_df(rs)
+                if not df.empty:
+                    if "is_trading_day" in df.columns:
+                        df=df[df["is_trading_day"].astype(str)=="1"]
+                    if not df.empty and "calendar_date" in df.columns:
+                        return str(df["calendar_date"].max())
+        except Exception:
+            pass
+    # 容灾时无需依赖BaoStock交易日历；行情接口会自然过滤非交易日。
+    return end
 
 def _retry_df_call(label,fn,retries=3,delay=1.2):
     last=None
@@ -2499,47 +2504,108 @@ def _retry_df_call(label,fn,retries=3,delay=1.2):
             time.sleep(float(delay)*attempt)
     raise RuntimeError(f"{label}连续{retries}次失败：{last}")
 
+def _normalize_a_universe(raw):
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["code","code_name"])
+    df=raw.copy()
+    code_candidates=[
+        "code","代码","证券代码","成分券代码","品种代码","股票代码"
+    ]
+    name_candidates=[
+        "code_name","name","名称","证券简称","成分券名称","品种名称","股票简称"
+    ]
+    code_col=next((x for x in code_candidates if x in df.columns),None)
+    name_col=next((x for x in name_candidates if x in df.columns),None)
+    if not code_col:
+        return pd.DataFrame(columns=["code","code_name"])
+    codes=df[code_col].astype(str).str.extract(r"(\d{6})",expand=False)
+    out=pd.DataFrame({"raw_code":codes})
+    out["code_name"]=df[name_col].astype(str).str.strip() if name_col else codes
+    out=out[out["raw_code"].notna()].copy()
+    out["code"]=out["raw_code"].map(
+        lambda x: ("sh."+x) if str(x).startswith(("5","6","9")) else ("sz."+x)
+    )
+    out=out[out["raw_code"].astype(str).str.startswith(("0","3","6"))]
+    return out[["code","code_name"]].drop_duplicates("code").reset_index(drop=True)
+
+def _ak_all_a_universe():
+    errors=[]
+    getters=[
+        ("A股代码表",lambda: ak.stock_info_a_code_name()),
+        ("A股实时表",lambda: ak.stock_zh_a_spot_em())
+    ]
+    for label,getter in getters:
+        try:
+            out=_normalize_a_universe(getter())
+            if not out.empty:
+                return out
+        except Exception as ex:
+            errors.append(f"{label}:{ex}")
+    raise RuntimeError("AKShare全A股票池失败："+"；".join(errors[-2:]))
+
+def _ak_index_universe(index_code):
+    errors=[]
+    getters=[]
+    if hasattr(ak,"index_stock_cons"):
+        getters.append(("指数成分",lambda: ak.index_stock_cons(symbol=index_code)))
+    if hasattr(ak,"index_stock_cons_csindex"):
+        getters.append(("中证指数成分",lambda: ak.index_stock_cons_csindex(symbol=index_code)))
+    if hasattr(ak,"index_stock_cons_weight_csindex"):
+        getters.append(("中证指数权重",lambda: ak.index_stock_cons_weight_csindex(symbol=index_code)))
+    for label,getter in getters:
+        try:
+            out=_normalize_a_universe(getter())
+            if not out.empty:
+                return out
+        except Exception as ex:
+            errors.append(f"{label}:{ex}")
+    raise RuntimeError(f"AKShare指数{index_code}成分失败："+"；".join(errors[-3:]))
+
 def fetch_universe(kind):
-    if kind == "港股主板":
+    if kind=="港股主板":
         hk=_retry_df_call("港股主板股票池",lambda: hk_universe_snapshot().copy(),retries=3)
-        needed=[x for x in ["code","code_name"] if x in hk.columns]
-        if len(needed)<2:
+        if not all(x in hk.columns for x in ["code","code_name"]):
             raise RuntimeError("港股股票池字段异常")
         return hk[["code","code_name"]].drop_duplicates("code").reset_index(drop=True)
 
-    def _bs_table(query_fn,label):
-        def _one():
-            rs=query_fn()
+    bs_error=None
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            if kind=="沪深300":
+                rs=bs.query_hs300_stocks()
+            elif kind=="中证500":
+                rs=bs.query_zz500_stocks()
+            elif kind=="上证50":
+                rs=bs.query_sz50_stocks()
+            else:
+                rs=bs.query_all_stock(day=latest_trade_date())
             if getattr(rs,"error_code","0")!="0":
                 raise RuntimeError(getattr(rs,"error_msg","BaoStock返回错误"))
-            return _rs_to_df(rs)
-        return _retry_df_call(label,_one,retries=3)
+            df=_rs_to_df(rs)
+            if not df.empty:
+                out=_normalize_a_universe(df)
+                if kind=="全A股（沪深）" and "tradeStatus" in df.columns:
+                    active_codes=set(
+                        df.loc[df["tradeStatus"].astype(str)=="1","code"].astype(str)
+                    )
+                    out=out[out["code"].isin(active_codes)]
+                if not out.empty:
+                    return out.reset_index(drop=True)
+        except Exception as ex:
+            bs_error=ex
 
-    if kind == "沪深300":
-        df=_bs_table(lambda: bs.query_hs300_stocks(),"沪深300股票池")
-    elif kind == "中证500":
-        df=_bs_table(lambda: bs.query_zz500_stocks(),"中证500股票池")
-    elif kind == "上证50":
-        df=_bs_table(lambda: bs.query_sz50_stocks(),"上证50股票池")
-    else:
-        day=latest_trade_date()
-        df=_bs_table(lambda: bs.query_all_stock(day=day),f"{day}全A股股票池")
-        if not df.empty:
-            code_col="code" if "code" in df.columns else (df.columns[0] if len(df.columns) else None)
-            if not code_col:
-                raise RuntimeError("全A股股票池字段为空")
-            df=df[df[code_col].astype(str).str.match(r"^(sh\.6|sz\.[03])")]
-            if "tradeStatus" in df.columns:
-                df=df[df["tradeStatus"].astype(str)=="1"]
-
-    if df is None or df.empty or len(df.columns)==0:
-        raise RuntimeError(f"{kind}股票池为空")
-    code_col="code" if "code" in df.columns else df.columns[0]
-    name_col="code_name" if "code_name" in df.columns else ("codeName" if "codeName" in df.columns else None)
-    out=pd.DataFrame({"code":df[code_col].astype(str)})
-    out["code_name"]=df[name_col].astype(str) if name_col else out["code"]
-    out=out[out["code"].astype(str).str.len()>0]
-    return out.drop_duplicates("code").reset_index(drop=True)
+    try:
+        if kind=="沪深300":
+            return _ak_index_universe("000300")
+        if kind=="中证500":
+            return _ak_index_universe("000905")
+        if kind=="上证50":
+            return _ak_index_universe("000016")
+        return _ak_all_a_universe()
+    except Exception as ak_ex:
+        raise RuntimeError(
+            f"{kind}股票池双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
+        )
 
 def market_score_from_row(r):
     close = r.get("close",np.nan)
