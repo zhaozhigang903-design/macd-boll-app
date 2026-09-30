@@ -5827,9 +5827,10 @@ with tab7:
         st.warning("当前代码已经支持Windows/云端共用同一个PostgreSQL，但还没有配置 SHARED_DATABASE_URL。未配置前，两端会各自使用本地SQLite。")
         st.caption("配置完成后无需改代码：云端和Windows分别设置指向同一个PostgreSQL实例的连接地址即可。连接密码不会写入GitHub。")
 
-    st.success("A股：BaoStock；港股：AKShare。两者均无需在本App配置行情Token。")
+    st.success("A股：BaoStock主源 + AKShare自动容灾；港股：AKShare。均无需在本App配置行情Token。")
+    st.info("如果BaoStock出现黑名单、登录失败、返回空数据或临时网络异常，A股日线、沪深300基准和股票池会自动尝试AKShare，不再直接让分析/选股失败。")
     st.info("A股与港股统一使用前复权日线，并由日线聚合周线；分析、选股、持仓和回测使用同一指标逻辑。")
-    st.caption("港股市场环境以恒生指数为基准；A股以沪深300为基准。AKShare接口来自公开数据源，接口稳定性可能受上游网站变化影响。")
+    st.caption("港股市场环境以恒生指数为基准；A股以沪深300为基准。公开行情接口仍可能受上游网站变化影响，因此双源都失败时系统会明确报出两个数据源的错误。")
 
     st.subheader("本地行情缓存")
     cs = market_cache_stats()
