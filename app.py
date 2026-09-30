@@ -2296,36 +2296,60 @@ def latest_trade_date():
         return end
     return str(df["calendar_date"].max())
 
+def _retry_df_call(label,fn,retries=3,delay=1.2):
+    last=None
+    for attempt in range(1,int(retries)+1):
+        try:
+            out=fn()
+            if out is not None and not out.empty:
+                return out
+            last=RuntimeError(f"{label}返回空数据")
+        except Exception as e:
+            last=e
+        if attempt<int(retries):
+            time.sleep(float(delay)*attempt)
+    raise RuntimeError(f"{label}连续{retries}次失败：{last}")
+
 def fetch_universe(kind):
     if kind == "港股主板":
-        hk = hk_universe_snapshot()
+        hk=_retry_df_call("港股主板股票池",lambda: hk_universe_snapshot().copy(),retries=3)
+        needed=[x for x in ["code","code_name"] if x in hk.columns]
+        if len(needed)<2:
+            raise RuntimeError("港股股票池字段异常")
         return hk[["code","code_name"]].drop_duplicates("code").reset_index(drop=True)
 
-    if kind == "沪深300":
-        rs = bs.query_hs300_stocks()
-        df = _rs_to_df(rs)
-    elif kind == "中证500":
-        rs = bs.query_zz500_stocks()
-        df = _rs_to_df(rs)
-    elif kind == "上证50":
-        rs = bs.query_sz50_stocks()
-        df = _rs_to_df(rs)
-    else:
-        day = latest_trade_date()
-        rs = bs.query_all_stock(day=day)
-        df = _rs_to_df(rs)
-        if not df.empty:
-            code_col = "code" if "code" in df.columns else df.columns[0]
-            df = df[df[code_col].astype(str).str.match(r"^(sh\.6|sz\.[03])")]
-            if "tradeStatus" in df.columns:
-                df = df[df["tradeStatus"].astype(str)=="1"]
+    def _bs_table(query_fn,label):
+        def _one():
+            rs=query_fn()
+            if getattr(rs,"error_code","0")!="0":
+                raise RuntimeError(getattr(rs,"error_msg","BaoStock返回错误"))
+            return _rs_to_df(rs)
+        return _retry_df_call(label,_one,retries=3)
 
-    if df.empty:
-        return pd.DataFrame(columns=["code","code_name"])
-    code_col = "code" if "code" in df.columns else df.columns[0]
-    name_col = "code_name" if "code_name" in df.columns else ("codeName" if "codeName" in df.columns else None)
-    out = pd.DataFrame({"code":df[code_col].astype(str)})
-    out["code_name"] = df[name_col].astype(str) if name_col else out["code"]
+    if kind == "沪深300":
+        df=_bs_table(lambda: bs.query_hs300_stocks(),"沪深300股票池")
+    elif kind == "中证500":
+        df=_bs_table(lambda: bs.query_zz500_stocks(),"中证500股票池")
+    elif kind == "上证50":
+        df=_bs_table(lambda: bs.query_sz50_stocks(),"上证50股票池")
+    else:
+        day=latest_trade_date()
+        df=_bs_table(lambda: bs.query_all_stock(day=day),f"{day}全A股股票池")
+        if not df.empty:
+            code_col="code" if "code" in df.columns else (df.columns[0] if len(df.columns) else None)
+            if not code_col:
+                raise RuntimeError("全A股股票池字段为空")
+            df=df[df[code_col].astype(str).str.match(r"^(sh\.6|sz\.[03])")]
+            if "tradeStatus" in df.columns:
+                df=df[df["tradeStatus"].astype(str)=="1"]
+
+    if df is None or df.empty or len(df.columns)==0:
+        raise RuntimeError(f"{kind}股票池为空")
+    code_col="code" if "code" in df.columns else df.columns[0]
+    name_col="code_name" if "code_name" in df.columns else ("codeName" if "codeName" in df.columns else None)
+    out=pd.DataFrame({"code":df[code_col].astype(str)})
+    out["code_name"]=df[name_col].astype(str) if name_col else out["code"]
+    out=out[out["code"].astype(str).str.len()>0]
     return out.drop_duplicates("code").reset_index(drop=True)
 
 def market_score_from_row(r):
