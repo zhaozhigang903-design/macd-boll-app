@@ -1583,6 +1583,17 @@ def resolve_symbol_input(value):
 
 def stock_basic_name(code):
     code=normalize_code(code)
+
+    # 精确代码优先走iFinD基础数据，只请求一个名称，避免为了取名称下载整个A/H股票池。
+    if ifind_configured():
+        try:
+            names=ifind_basic_names([code])
+            name=names.get(code)
+            if name:
+                return str(name).strip()
+        except Exception:
+            pass
+
     if code.startswith("hk."):
         try:
             hk=hk_universe_snapshot()
@@ -1604,6 +1615,8 @@ def stock_basic_name(code):
                             return str(df.iloc[0][col]).strip()
         except Exception:
             pass
+
+    # AKShare全市场名称表是慢路径，仅在iFinD/BaoStock都不可用时才调用。
     try:
         pool=_ak_all_a_universe()
         hit=pool[pool["code"]==code]
@@ -1612,6 +1625,7 @@ def stock_basic_name(code):
     except Exception:
         pass
     return display_code(code)
+
 
 def sanitize_daily(df):
     if df is None or df.empty:
