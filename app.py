@@ -1989,6 +1989,76 @@ def prefetch_ifind_daily(codes,years=1):
             errors.append(str(ex))
     return {"requested":len(need),"saved":saved,"errors":errors}
 
+def prefetch_ifind_analysis_bundle(code,daily_years=2,weekly_years=3):
+    """Warm stock daily + A-share benchmark daily + native weekly in at most two parallel iFinD calls."""
+    if not ifind_configured():
+        return {"daily_saved":0,"weekly_saved":0,"errors":[]}
+
+    code=normalize_code(code)
+    end=datetime.now().strftime("%Y-%m-%d")
+    dstart=(pd.Timestamp.today()-pd.Timedelta(days=365*int(daily_years)+180)).strftime("%Y-%m-%d")
+    wstart=(pd.Timestamp.today()-pd.Timedelta(days=365*int(weekly_years)+240)).strftime("%Y-%m-%d")
+    errors=[]
+    daily_saved=0
+    weekly_saved=0
+
+    need_daily=[]
+    stock_flag=market_cache_flag(code,"daily")
+    smin,smax,slast=_cache_bounds(code,stock_flag)
+    if not smin or not smax or smin>dstart or _should_refresh_cache(slast,smax):
+        need_daily.append((code,"daily"))
+
+    if market_of_code(code)=="A股":
+        bench="sh.000300"
+        bflag=market_cache_flag(bench,"index")
+        bmin,bmax,blast=_cache_bounds(bench,bflag)
+        if not bmin or not bmax or bmin>dstart or _should_refresh_cache(blast,bmax):
+            need_daily.append((bench,"index"))
+
+    wflag=market_cache_flag(code,"weekly")
+    wmin,wmax,_=_cache_bounds(code,wflag)
+    current_week_start=(
+        pd.Timestamp.today().normalize()-pd.Timedelta(days=pd.Timestamp.today().weekday())
+    ).strftime("%Y-%m-%d")
+    need_weekly=(not wmin or not wmax or wmin>wstart or str(wmax)<current_week_start)
+
+    def _daily_job():
+        if not need_daily:
+            return {}
+        codes=[x[0] for x in need_daily]
+        return ifind_history_many(codes,dstart,end,interval="D",cps=2)
+
+    def _weekly_job():
+        if not need_weekly:
+            return pd.DataFrame()
+        return ifind_history_one(code,wstart,end,interval="W",cps=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fd=pool.submit(_daily_job)
+        fw=pool.submit(_weekly_job)
+        try:
+            got=fd.result()
+            for dcode,kind in need_daily:
+                df=got.get(dcode)
+                if df is None or df.empty:
+                    continue
+                flag=market_cache_flag(dcode,"index" if kind=="index" else "daily")
+                _save_daily_cache(df,dcode,flag)
+                _mark_cache_checked(dcode)
+                daily_saved+=1
+        except Exception as ex:
+            errors.append(f"日K预取:{ex}")
+        try:
+            wdf=fw.result()
+            if wdf is not None and not wdf.empty:
+                _save_daily_cache(wdf,code,wflag)
+                weekly_saved=1
+        except Exception as ex:
+            errors.append(f"周K预取:{ex}")
+
+    return {"daily_saved":daily_saved,"weekly_saved":weekly_saved,"errors":errors}
+
+
 def fetch_stock_daily(code,years=3):
     code=normalize_code(code)
     end=datetime.now().strftime("%Y-%m-%d")
@@ -3486,8 +3556,11 @@ def holding_exit_condition(row,peak_score):
         (market_score<25 and score<60)
     )
 
-def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0,benchmark_features=None):
-    m=prepare_strategy_frame(df,benchmark_df,code=code,benchmark_features=benchmark_features)
+def simulate_structural_trades(df,benchmark_df,code,cost_mult=1.0,benchmark_features=None,weekly_df=None):
+    m=prepare_strategy_frame(
+        df,benchmark_df,code=code,weekly_df=weekly_df,
+        benchmark_features=benchmark_features
+    )
     if m.empty or len(m)<180:
         return pd.DataFrame(),m
 
@@ -3939,14 +4012,15 @@ def save_cached_ev(df,benchmark_df,code,ev):
     conn.commit()
     conn.close()
 
-def realized_trade_ev(df,benchmark_df,code,use_cache=True,benchmark_features=None):
+def realized_trade_ev(df,benchmark_df,code,use_cache=True,benchmark_features=None,weekly_df=None):
     if use_cache:
         cached=get_cached_ev(df,benchmark_df,code)
         if cached is not None:
             return cached,pd.DataFrame(),True
 
     trades,_=simulate_structural_trades(
-        df,benchmark_df,code,cost_mult=1.0,benchmark_features=benchmark_features
+        df,benchmark_df,code,cost_mult=1.0,
+        benchmark_features=benchmark_features,weekly_df=weekly_df
     )
     stress=reprice_trades_for_cost(trades,code,cost_mult=2.0)
     base=summarize_ev(trades)
