@@ -1672,24 +1672,96 @@ def _should_refresh_cache(last_checked,cache_max):
     return now.hour>=8 and age>=2
 
 
+def _normalize_a_history(raw,code):
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df=raw.copy()
+    rename={
+        "日期":"trade_date","date":"trade_date",
+        "开盘":"open","open":"open",
+        "最高":"high","high":"high",
+        "最低":"low","low":"low",
+        "收盘":"close","close":"close",
+        "成交量":"vol","volume":"vol",
+        "成交额":"amount","amount":"amount",
+        "涨跌幅":"pctChg","换手率":"turn"
+    }
+    df=df.rename(columns={k:v for k,v in rename.items() if k in df.columns})
+    needed=["trade_date","open","high","low","close","vol"]
+    if any(x not in df.columns for x in needed):
+        return pd.DataFrame()
+    for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+        if col not in df.columns:
+            df[col]=np.nan
+        df[col]=pd.to_numeric(df[col],errors="coerce")
+    df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
+    df["code"]=code
+    df["tradestatus"]="1"
+    df["isST"]=""
+    df=df.dropna(subset=["trade_date","close"])
+    cols=["trade_date","code","open","high","low","close","vol","amount","pctChg","turn","tradestatus","isST"]
+    return sanitize_daily(df[cols]).sort_values("trade_date").reset_index(drop=True)
+
+def _download_a_daily_ak(code,start,end):
+    symbol=display_code(code)
+    s=str(start).replace("-","")
+    e=str(end).replace("-","")
+    errors=[]
+    getters=[
+        ("东财A股历史",lambda: ak.stock_zh_a_hist(
+            symbol=symbol,period="daily",start_date=s,end_date=e,adjust="qfq"
+        )),
+        ("新浪A股历史",lambda: ak.stock_zh_a_daily(
+            symbol=("sh"+symbol if code.startswith("sh.") else "sz"+symbol),
+            start_date=start,end_date=end,adjust="qfq"
+        ))
+    ]
+    for label,getter in getters:
+        try:
+            df=_normalize_a_history(getter(),code)
+            if not df.empty:
+                mask=(df["trade_date"]>=pd.Timestamp(start))&(df["trade_date"]<=pd.Timestamp(end))
+                out=df.loc[mask].reset_index(drop=True)
+                if not out.empty:
+                    return out
+        except Exception as ex:
+            errors.append(f"{label}:{ex}")
+    raise RuntimeError("AKShare A股历史行情失败："+"；".join(errors[-2:]))
+
 def _download_a_daily(code,start,end):
     if start > end:
         return pd.DataFrame()
-    fields = "date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus,isST"
-    rs = bs.query_history_k_data_plus(
-        code,fields,start_date=start,end_date=end,frequency="d",adjustflag="2"
-    )
-    df = _rs_to_df(rs)
-    if df.empty:
-        return df
-    df = df.rename(columns={"date":"trade_date","volume":"vol"})
-    for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col],errors="coerce")
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    if "tradestatus" in df.columns:
-        df = df[df["tradestatus"].astype(str)=="1"]
-    return df.sort_values("trade_date").reset_index(drop=True)
+
+    bs_error=None
+    if int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)>0:
+        try:
+            fields="date,code,open,high,low,close,volume,amount,pctChg,turn,tradestatus,isST"
+            rs=bs.query_history_k_data_plus(
+                code,fields,start_date=start,end_date=end,frequency="d",adjustflag="2"
+            )
+            if getattr(rs,"error_code","0")!="0":
+                raise RuntimeError(getattr(rs,"error_msg","BaoStock返回错误"))
+            df=_rs_to_df(rs)
+            if not df.empty:
+                df=df.rename(columns={"date":"trade_date","volume":"vol"})
+                for col in ["open","high","low","close","vol","amount","pctChg","turn"]:
+                    if col in df.columns:
+                        df[col]=pd.to_numeric(df[col],errors="coerce")
+                df["trade_date"]=pd.to_datetime(df["trade_date"],errors="coerce")
+                if "tradestatus" in df.columns:
+                    df=df[df["tradestatus"].astype(str)=="1"]
+                df=sanitize_daily(df)
+                if not df.empty:
+                    return df.sort_values("trade_date").reset_index(drop=True)
+        except Exception as ex:
+            bs_error=ex
+
+    try:
+        return _download_a_daily_ak(code,start,end)
+    except Exception as ak_ex:
+        raise RuntimeError(
+            f"A股历史行情双源失败；BaoStock={bs_error or getattr(_BAOSTOCK_SESSION_OWNER,'last_error','未登录')}；AKShare={ak_ex}"
+        )
 
 def _normalize_hk_history(raw,code):
     if raw is None or raw.empty:
