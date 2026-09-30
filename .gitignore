@@ -3,3 +3,7 @@ analysis_history.db
 __pycache__/
 *.pyc
 .env
+.venv/
+windows_config.bat
+*.sqlite
+*.sqlite3
