@@ -42,6 +42,8 @@ DB_PATH = Path(os.getenv("MACD_LOCAL_DB_PATH", str(DATA_DIR / "analysis_history.
 RULE_VERSION = "EV1.0-2026-09-30"
 _SCREENER_THREADS = {}
 _SCREENER_THREADS_LOCK = threading.Lock()
+_BAOSTOCK_SESSION_LOCK = threading.RLock()
+_BAOSTOCK_SESSION_OWNER = threading.local()
 
 st.set_page_config(
     page_title="中长线技术决策引擎",
@@ -1318,11 +1320,51 @@ def display_code(code):
     s = str(code or "")
     return s.split(".")[-1].upper() if "." in s else s.upper()
 
-def bs_login():
-    lg = bs.login()
-    if lg.error_code != "0":
-        raise RuntimeError("BaoStock登录失败：" + lg.error_msg)
-    return lg
+def bs_login(retries=3):
+    # BaoStock使用全局socket，会话并不支持同一进程多线程并发登录。
+    # 用进程级RLock把“登录→查询→登出”串行化，避免后台选股与前台分析互相挤掉会话。
+    depth=int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)
+    if depth>0:
+        _BAOSTOCK_SESSION_OWNER.depth=depth+1
+        return None
+
+    acquired=_BAOSTOCK_SESSION_LOCK.acquire(timeout=120)
+    if not acquired:
+        raise RuntimeError("BaoStock当前正被后台任务占用，请稍后重试。")
+
+    last_msg=""
+    try:
+        for attempt in range(1,int(retries)+1):
+            lg=bs.login()
+            if getattr(lg,"error_code","-1")=="0":
+                _BAOSTOCK_SESSION_OWNER.depth=1
+                return lg
+            last_msg=str(getattr(lg,"error_msg","未知错误"))
+            # 黑名单通常由短时间并发/频繁登录触发，先退避再试。
+            if attempt<int(retries):
+                time.sleep(2.0*attempt)
+        raise RuntimeError("BaoStock登录失败："+last_msg)
+    except Exception:
+        _BAOSTOCK_SESSION_LOCK.release()
+        raise
+
+def bs_logout_safe():
+    depth=int(getattr(_BAOSTOCK_SESSION_OWNER,"depth",0) or 0)
+    if depth<=0:
+        return
+    if depth>1:
+        _BAOSTOCK_SESSION_OWNER.depth=depth-1
+        return
+    try:
+        bs_logout_safe()
+    except Exception:
+        pass
+    finally:
+        _BAOSTOCK_SESSION_OWNER.depth=0
+        try:
+            _BAOSTOCK_SESSION_LOCK.release()
+        except Exception:
+            pass
 
 def _normalize_hk_name(v):
     s = str(v or "").strip()
@@ -3498,24 +3540,30 @@ def _background_screener_worker(job_id):
         return
     try:
         _update_screener_job(job_id,status="running",error=None)
-        bs_login()
         universe=str(job["universe"])
         exclude_st=bool(int(job.get("exclude_st",1) or 0))
-        batch_size=max(20,int(job.get("batch_size",100) or 100))
+        # 后台批次故意较小，让前台分析能在批次间取得BaoStock会话。
+        batch_size=min(50,max(20,int(job.get("batch_size",50) or 50)))
 
-        if universe=="港股主板":
-            benchmark_df=_retry_df_call(
-                "恒生指数",lambda: fetch_hk_benchmark_daily(years=5),retries=3
-            )
-            benchmark_name="恒生指数"
-        else:
-            benchmark_df=_retry_df_call(
-                "沪深300指数",lambda: fetch_benchmark_daily(years=5),retries=3
-            )
-            benchmark_name="沪深300"
+        # 准备股票池/基准后立即释放BaoStock，不长期霸占连接。
+        bs_login()
+        try:
+            if universe=="港股主板":
+                benchmark_df=_retry_df_call(
+                    "恒生指数",lambda: fetch_hk_benchmark_daily(years=5),retries=3
+                )
+                benchmark_name="恒生指数"
+            else:
+                benchmark_df=_retry_df_call(
+                    "沪深300指数",lambda: fetch_benchmark_daily(years=5),retries=3
+                )
+                benchmark_name="沪深300"
 
-        mkt_score,mkt_regime=market_environment(benchmark_df)
-        pool=fetch_universe(universe)
+            mkt_score,mkt_regime=market_environment(benchmark_df)
+            pool=fetch_universe(universe)
+        finally:
+            bs_logout_safe()
+
         if exclude_st and universe!="港股主板" and not pool.empty:
             pool=pool[
                 ~pool["code_name"].astype(str).str.upper().str.contains(
@@ -3534,7 +3582,6 @@ def _background_screener_worker(job_id):
             "扫描":0,"快速初筛通过":0,"优先机会":0,"候选观察":0,
             "EV阶段":0,"EV缓存命中":0,"流动性不足":0,"数据异常":0
         }
-
         old_stats=job.get("stats_json")
         if old_stats:
             try:
@@ -3547,21 +3594,25 @@ def _background_screener_worker(job_id):
             batch=pool.iloc[cursor:end]
             codes=batch["code"].tolist()
             names=dict(zip(batch["code"],batch["code_name"]))
-
-            # 单批最多重试2次。个股异常由screen_codes内部跳过，网络/股票池级异常才重试。
             last_err=None
             batch_result=None
             batch_stats=None
+
             for attempt in range(2):
                 try:
-                    batch_result,batch_stats=screen_codes(
-                        codes,names,benchmark_df=benchmark_df,progress_callback=None
-                    )
+                    bs_login()
+                    try:
+                        batch_result,batch_stats=screen_codes(
+                            codes,names,benchmark_df=benchmark_df,progress_callback=None
+                        )
+                    finally:
+                        bs_logout_safe()
                     last_err=None
                     break
-                except Exception as e:
-                    last_err=e
+                except Exception as ex:
+                    last_err=ex
                     time.sleep(2.0*(attempt+1))
+
             if last_err is not None:
                 raise RuntimeError(f"扫描 {cursor}-{end} 批次失败：{last_err}")
 
@@ -3575,16 +3626,17 @@ def _background_screener_worker(job_id):
                 stats_json=json.dumps(agg_stats,ensure_ascii=False),
                 status=("completed" if cursor>=total else "running")
             )
+            # 主动让出CPU/会话窗口，前台批量分析可插队。
+            time.sleep(0.4)
 
         _update_screener_job(job_id,status="completed",cursor=total,error=None)
-    except Exception as e:
-        err=f"{type(e).__name__}: {e}"
+    except Exception as ex:
+        err=f"{type(ex).__name__}: {ex}"
         print("BACKGROUND_SCREENER_ERROR",job_id,err)
         print(traceback.format_exc())
         _update_screener_job(job_id,status="paused",error=err)
     finally:
-        try: bs.logout()
-        except Exception: pass
+        bs_logout_safe()
         with _SCREENER_THREADS_LOCK:
             _SCREENER_THREADS.pop(job_id,None)
 
@@ -5704,7 +5756,7 @@ with tab1:
                     except Exception as e:
                         st.error(f"自动分析失败：{e}")
                     finally:
-                        try: bs.logout()
+                        try: bs_logout_safe()
                         except Exception: pass
 
         st.divider()
@@ -5868,7 +5920,7 @@ with tab1:
                                 text=f"批量分析 {idx}/{len(selected)} · 成功 {len(reports)} · 失败 {len(errors)}"
                             )
                     finally:
-                        try: bs.logout()
+                        try: bs_logout_safe()
                         except Exception: pass
 
                     st.session_state["batch_reports"]=reports
@@ -6120,7 +6172,7 @@ with tab2:
                     except Exception as e:
                         st.error(f"加入持仓失败：{e}")
                     finally:
-                        try: bs.logout()
+                        try: bs_logout_safe()
                         except Exception: pass
 
             st.download_button(
@@ -6197,7 +6249,7 @@ with tab3:
                     except Exception as e:
                         st.error(f"保存失败：{e}")
                     finally:
-                        try: bs.logout()
+                        try: bs_logout_safe()
                         except Exception: pass
 
     st.divider()
@@ -6214,7 +6266,7 @@ with tab3:
             except Exception as e:
                 st.error(f"持仓更新失败：{e}")
             finally:
-                try: bs.logout()
+                try: bs_logout_safe()
                 except Exception: pass
 
     edit_df = editable_positions_frame()
@@ -6250,7 +6302,7 @@ with tab3:
             except Exception as e:
                 st.error(f"保存持仓修改失败：{e}")
             finally:
-                try: bs.logout()
+                try: bs_logout_safe()
                 except Exception: pass
 
         active_now = load_positions(True)
@@ -6327,7 +6379,7 @@ with tab4:
                 except Exception as e:
                     st.error(f"回测失败：{e}")
                 finally:
-                    try: bs.logout()
+                    try: bs_logout_safe()
                     except Exception: pass
 
     m = st.session_state.get("bt_metrics")
@@ -6387,7 +6439,7 @@ with tab4:
             except Exception as e:
                 st.error(f"Forward Test更新失败：{e}")
             finally:
-                try: bs.logout()
+                try: bs_logout_safe()
                 except Exception: pass
 
     fsum,fdf=forward_test_summary()
@@ -6441,7 +6493,7 @@ with tab8:
             except Exception as e:
                 st.error(f"创建研究任务失败：{e}")
             finally:
-                try: bs.logout()
+                try: bs_logout_safe()
                 except Exception: pass
 
     runs=load_research_runs(30)
@@ -6521,7 +6573,7 @@ with tab8:
                 except Exception as e:
                     st.error(f"研究批次失败：{e}")
                 finally:
-                    try: bs.logout()
+                    try: bs_logout_safe()
                     except Exception: pass
 
         summary_key=f"research_summary_bundle::{selected_run}"
@@ -6783,7 +6835,7 @@ with tab8:
                     except Exception as e:
                         st.error(f"策略实验运行失败：{e}")
                     finally:
-                        try: bs.logout()
+                        try: bs_logout_safe()
                         except Exception: pass
 
             exp_table,candidate=strategy_experiment_summary(selected_exp)
