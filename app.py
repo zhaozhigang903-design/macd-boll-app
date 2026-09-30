@@ -1986,12 +1986,14 @@ def market_cache_flag(code,kind="daily"):
         return "ifind_hk_qfq_v1" if code.startswith("hk.") else "ifind_a_qfq_v1"
     return "hk_qfq" if code.startswith("hk.") else "2"
 
-def prefetch_ifind_daily(codes,years=1):
+def prefetch_ifind_daily(codes,years=1,batch_size=None):
     if not ifind_configured():
         return {"requested":0,"saved":0,"errors":[]}
     clean=[normalize_code(x) for x in codes if normalize_code(x)]
+    clean=list(dict.fromkeys(clean))
     if not clean:
         return {"requested":0,"saved":0,"errors":[]}
+    years=max(1,int(years))
     end=bj_now().strftime("%Y-%m-%d")
     start=(bj_ts()-pd.Timedelta(days=365*years+180)).strftime("%Y-%m-%d")
     need=[]
@@ -2002,10 +2004,17 @@ def prefetch_ifind_daily(codes,years=1):
             need.append(code)
     if not need:
         return {"requested":0,"saved":0,"errors":[]}
+
+    # iFinD历史行情单次有数据量上限。1年批量20只效率高；
+    # 5年历史按3只一批，避免超量/超时后反复重试。
+    if batch_size is None:
+        batch_size=20 if years<=1 else (8 if years<=2 else 3)
+    batch_size=max(1,int(batch_size))
+
     saved=0
     errors=[]
-    for pos in range(0,len(need),20):
-        batch=need[pos:pos+20]
+    for pos in range(0,len(need),batch_size):
+        batch=need[pos:pos+batch_size]
         try:
             got=ifind_history_many(batch,start,end,interval="D",cps=2)
             for code,df in got.items():
