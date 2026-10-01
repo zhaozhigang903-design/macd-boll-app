@@ -19,3 +19,19 @@
 读取范围只包含项目宪法、PRD、路线图及接管指导；对话提到此前四文档已完成，但未取得其正文。本目录不宣称完整恢复原始设计包。示例股票评分、阈值、权重、仓位和性能目标不能直接用于生产。应用架构现状以审计为准，目标技术选型以确认后的设计为准。
 
 阅读顺序：审计→迁移计划→决策表→宪法→六份设计文档。正式批准后需将草案状态改为确定版本，并解决跨文档冲突，历史对话只作出处。
+
+## 2026-10-01 运行基线与开发交接补充
+
+新增只读准备材料：
+- PHASE01_RUNTIME_BASELINE.md：D盘运行基线及证据限制。
+- DATA_CONTRACT_READINESS.md：真实行情差异与配置说明。
+- DATA_CONTRACT_DRAFT.md：行情时点、单位、复权与来源草案。
+- SCHEMA_AND_BACKUP_COVERAGE.md：当前20表字段、11表同步与15表核心恢复覆盖。
+- CODEX_DEVELOPMENT_HANDOFF.md：后续Codex开发入口。
+- TASKS_DATA_ENGINE_V1.md：四个顺序实施任务及禁止边界。
+- ACCEPTANCE_MATRIX.md：逐项离线/联调验收，尚未实施。
+- DEVELOPMENT_READINESS.md：隔离开发、因子实施与生产切换分开的门槛。
+- PRODUCTION_DATA_PRESERVATION.md：真实数据保全与恢复方案。
+
+首批纯数据模块可以在后续明确授权后开始D盘隔离开发。iFind真实权限、生产备份恢复、因子公式/权重尚未验收或确认，不将其宣称为全部已完成。
+优先从CODEX_DEVELOPMENT_HANDOFF.md进入；旧路线图与决策表保留出处，最新状态以DEVELOPMENT_READINESS.md和各专项证据为准。
